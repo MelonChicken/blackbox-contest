@@ -10,8 +10,8 @@ DATA = ROOT / 'data'
 MODEL = ROOT / 'model'
 
 ## 디바이스 설정
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-EPOCHS = int(os.getenv('EPOCHS', '1'))
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+EPOCHS = 10
 
 ## 입력 크기 설정
 SIZE = 224

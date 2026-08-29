@@ -1,13 +1,8 @@
 # 1. Configuration
 
 # 1.1. 관련 패키지 임포트
-from pathlib import Path
-import os, random, shutil
-import cv2, numpy as np, pandas as pd, torch
-from PIL import Image
-from torch import nn, Tensor
-from torchvision.models import resnet18, ResNet18_Weights
-from torchvision.models.video import mvit_v2_s
+import pandas as pd, torch
+from torch import nn
 from src.config import (
     DATA,
     MODEL,

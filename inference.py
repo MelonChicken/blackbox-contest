@@ -158,6 +158,8 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from src.config import S1_MEAN, S1_STD
+from src.models.stage1 import Stage1MViT
 
 
 VIDEO_EXT = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".3gp", ".3gpp", ".wmv"}
@@ -173,45 +175,87 @@ def _video_paths(root: Path):
     return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXT)
 
 
-def _clip_ids(path: Path, n: int, slot: int, slots: int):
+def _clip_ids(path: Path, n: int, slot: int = 0, slots: int = 1):
     cap = cv2.VideoCapture(str(path))
-    total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+
+    total = max(
+        1,
+        int(
+            cap.get(
+                cv2.CAP_PROP_FRAME_COUNT
+            )
+        ),
+    )
+
     cap.release()
-    center = (slot + 0.5) * total / slots
-    start = max(0, min(total - n, round(center - n / 2)))
-    return np.linspace(start, min(total - 1, start + n - 1), n).round().astype(int)
+
+    return np.linspace(
+        0,
+        total - 1,
+        n,
+    ).round().astype(int)
 
 
-def _decode_stage1_clip(path: Path, size: int, frame_ids):
-    cap = cv2.VideoCapture(str(path))
+def _decode_stage1_clip(
+    path: Path,
+    size: int,
+    frame_ids,
+):
+    cap = cv2.VideoCapture(
+        str(path)
+    )
+
     out = []
-    wanted = [int(x) for x in frame_ids]
-    cap.set(cv2.CAP_PROP_POS_FRAMES, wanted[0])
-    pos = wanted[0]
-    for idx in wanted:
-        ok = False
-        bgr = None
-        while pos <= idx:
-            ok, bgr = cap.read()
-            pos += 1
-            if not ok:
-                break
+
+    for idx in frame_ids:
+
+        cap.set(
+            cv2.CAP_PROP_POS_FRAMES,
+            int(idx),
+        )
+
+        ok, bgr = cap.read()
+
         if not ok or bgr is None:
             continue
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
-        scale = size / min(h, w)
-        nh, nw = max(size, round(h * scale)), max(size, round(w * scale))
-        rgb = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
-        y, x = (nh - size) // 2, (nw - size) // 2
-        out.append(rgb[y : y + size, x : x + size])
+
+        rgb = cv2.cvtColor(
+            bgr,
+            cv2.COLOR_BGR2RGB,
+        )
+
+        rgb = cv2.resize(
+            rgb,
+            (size, size),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+        out.append(rgb)
+
     cap.release()
+
     if not out:
-        raise ValueError(f"cannot decode video: {path.name}")
-    while len(out) < len(wanted):
-        out.append(out[-1])
-    x = torch.from_numpy(np.stack(out)).permute(3, 0, 1, 2).float() / 255.0
-    return (x - S1_MEAN) / S1_STD
+        raise ValueError(
+            f"cannot decode video: {path.name}"
+        )
+
+    while len(out) < len(frame_ids):
+        out.append(
+            out[-1]
+        )
+
+    x = (
+        torch.from_numpy(
+            np.stack(out)
+        )
+        .permute(3, 0, 1, 2)
+        .float()
+        / 255.0
+    )
+
+    return (
+        x - S1_MEAN
+    ) / S1_STD
 
 
 class Stage1Clips(Dataset):
@@ -245,7 +289,7 @@ def predict_stage1(data_dir, model_dir):
     model.to(device).eval()
 
     videos = _video_paths(Path(data_dir) / "videos")
-    slots = 3
+    slots = 1
     dataset = Stage1Clips(videos, slots, size, frames)
     loader = DataLoader(dataset, batch_size=4, num_workers=4, pin_memory=True)
     scores = [[] for _ in videos]
@@ -264,6 +308,7 @@ def predict_stage1(data_dir, model_dir):
     del model
     torch.cuda.empty_cache()
     return pd.DataFrame(rows, columns=["ID", "answer"])
+
 
 
 # ---- src/inference/stage2.py ----

@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = ROOT / "model"
 REQUIREMENTS = ROOT / "requirements.txt"
 INFERENCE_OUT = ROOT / "inference.py"

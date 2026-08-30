@@ -1,3 +1,30 @@
-data/
-model/
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
 .venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Dataset
+data/
+*.mp4
+*.avi
+*.mov
+
+# Models / checkpoints
+model/
+*.pt
+*.pth
+
+# Outputs
+outputs/
+runs/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -64,7 +64,7 @@ DLC_STAGE1_PROCESSED = STAGE1_PROCESSED / "dlc2021"
 DLC_STAGE1_MANIFEST = DLC_STAGE1_PROCESSED / "manifest"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-EPOCHS = 1
+EPOCHS = 5
 TRAIN_SOURCE_LIMIT = 4000
 
 SIZE = 224

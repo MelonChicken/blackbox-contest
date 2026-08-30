@@ -9,18 +9,22 @@ __pycache__/
 # IDE
 .idea/
 .vscode/
+.env/
+
 
 # Dataset
 data/
 *.mp4
 *.avi
 *.mov
+*.png
+*.zip
 
 # Models / checkpoints
 model/
 *.pt
 *.pth
-
+test.*
 # Outputs
 outputs/
 runs/

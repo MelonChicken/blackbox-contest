@@ -20,6 +20,7 @@ data/
 *.png
 *.zip
 
+_submissions_archive/
 # Models / checkpoints
 model/
 *.pt
@@ -33,3 +34,4 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+train_requirements.txt

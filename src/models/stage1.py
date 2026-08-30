@@ -2,7 +2,10 @@
 
 # 1.1. 관련 패키지 임포트
 from torch import nn
-from torchvision.models.video import mvit_v2_s
+from torchvision.models.video import (
+    mvit_v2_s,
+    MViT_V2_S_Weights,
+)
 
 
 class Stage1MViT(nn.Module):
@@ -15,7 +18,8 @@ class Stage1MViT(nn.Module):
         # nn.Module의 초기화를 수행
         super().__init__()
         # Torchvision의 MViTv2-Small 모델을 생성
-        self.net = mvit_v2_s(weights=None)
+        weights = MViT_V2_S_Weights.KINETICS400_V1
+        self.net = mvit_v2_s(weights=weights)
         # 기본 MViT의 classification head 변경 (우리는 이진 분류를 원하니 out_features를 2로 조정한다)
         self.net.head[1] = nn.Linear(self.net.head[1].in_features, 2)
 

@@ -14,20 +14,23 @@ class AIHubStage1Dataset(Dataset):
     AI-Hub 교통사고 블랙박스 영상을 이용한
     Stage 1 ORIGINAL / RERECORDED Dataset.
 
-    하나의 source video로부터 두 sample을 만든다.
+    하나의 source video를 한 번만 decode한 뒤
 
-    ORIGINAL:
-        label = 0
-        원본 블랙박스 영상
+        ORIGINAL   label = 0
+        RERECORDED label = 1
 
-    RERECORDED:
-        label = 1
-        원본 영상에 synthetic recapture augmentation 적용
+    두 sample을 동시에 생성한다.
 
-    반환 shape:
-        [C, T, H, W]
+    __getitem__ 반환:
+
+        clips:
+            [2, C, T, H, W]
+
+        labels:
+            [2]
 
     기본값:
+
         C = 3
         T = 16
         H = 224
@@ -48,28 +51,12 @@ class AIHubStage1Dataset(Dataset):
         # 1. 기본 설정
         # ------------------------------
 
-        # AI-Hub 데이터 root
-        #
-        # ex)
-        # data/stage1/aihub597
         self.root = Path(root)
-
-        # manifest CSV
-        #
-        # ex)
-        # manifest/train.csv
-        # manifest/val.csv
         self.manifest = Path(manifest)
 
-        # MViT 입력 frame 수
         self.frames = frames
-
-        # MViT 입력 spatial size
         self.size = size
-
-        # Train / Validation 여부
         self.train = train
-
 
         # ------------------------------
         # 2. Manifest 로드
@@ -90,15 +77,9 @@ class AIHubStage1Dataset(Dataset):
                 "'video_path' column."
             )
 
-
         # ------------------------------
-        # 3. Normalization 설정
+        # 3. Normalization
         # ------------------------------
-
-        # torch.tensor()가 아니라
-        # as_tensor()를 사용하여
-        # mean/std가 이미 Tensor인 경우에도
-        # 불필요한 copy warning이 발생하지 않게 한다.
 
         self.mean = torch.as_tensor(
             mean,
@@ -120,31 +101,25 @@ class AIHubStage1Dataset(Dataset):
             1,
         )
 
-
         # ------------------------------
         # 4. Synthetic recapture
         # ------------------------------
 
-        self.recapture = (
-            RecaptureTransform()
-        )
-
+        self.recapture = RecaptureTransform()
 
     def __len__(self):
         """
-        원본 영상 하나에서
+        이제 Dataset의 index 하나는
+        sample 하나가 아니라 source video 하나를 의미한다.
 
-        ORIGINAL   1개
-        RERECORDED 1개
+        따라서:
 
-        두 sample을 만든다.
-
-        따라서 Dataset 길이는
-        manifest의 source video 수 × 2.
+            len(dataset)
+            =
+            source video 수
         """
 
-        return len(self.df) * 2
-
+        return len(self.df)
 
     def _load_clip(
         self,
@@ -152,15 +127,7 @@ class AIHubStage1Dataset(Dataset):
     ):
         """
         전체 영상을 메모리에 올리지 않고
-        필요한 frame만 선택적으로 읽는다.
-
-        기존 torchvision.io.read_video()는
-        전체 영상을 decode한 뒤 메모리에 적재하기 때문에
-        고해상도 블랙박스 영상에서 RAM 부족이 발생할 수 있다.
-
-        이 함수에서는 OpenCV VideoCapture를 이용해
-        전체 영상에서 균등하게 self.frames개의 위치를
-        선택하여 필요한 frame만 읽는다.
+        균등한 위치의 self.frames개 frame만 읽는다.
 
         반환:
             Tensor [T, C, H, W]
@@ -182,7 +149,6 @@ class AIHubStage1Dataset(Dataset):
                 f"{video_path}"
             )
 
-
         try:
             # --------------------------
             # 전체 frame 수
@@ -200,19 +166,9 @@ class AIHubStage1Dataset(Dataset):
                     f"{video_path}"
                 )
 
-
             # --------------------------
             # Sampling 위치 생성
             # --------------------------
-
-            # 전체 영상을 self.frames개 구간으로
-            # 균등하게 sampling한다.
-            #
-            # 예:
-            #
-            # 1000 frames
-            # →
-            # 0, 66, 133, ..., 999
 
             indices = torch.linspace(
                 0,
@@ -220,17 +176,14 @@ class AIHubStage1Dataset(Dataset):
                 steps=self.frames,
             ).round().long().tolist()
 
-
             frames = []
 
-
             # --------------------------
-            # 선택된 frame만 decode
+            # 선택된 frame decode
             # --------------------------
 
             for frame_index in indices:
 
-                # 필요한 frame 위치로 이동
                 cap.set(
                     cv2.CAP_PROP_POS_FRAMES,
                     frame_index,
@@ -245,29 +198,18 @@ class AIHubStage1Dataset(Dataset):
                         f"from {video_path}"
                     )
 
-
                 # ----------------------
-                # BGR → RGB
+                # BGR -> RGB
                 # ----------------------
-
-                # OpenCV는 BGR 순서로 영상을 읽지만
-                # PyTorch 모델은 RGB를 사용한다.
 
                 frame = cv2.cvtColor(
                     frame,
                     cv2.COLOR_BGR2RGB,
                 )
 
-
                 # ----------------------
                 # Resize
                 # ----------------------
-
-                # 고해상도 frame을
-                # 즉시 MViT 입력 크기로 줄인다.
-                #
-                # 따라서 원본 해상도 frame을
-                # 메모리에 계속 보관하지 않는다.
 
                 frame = cv2.resize(
                     frame,
@@ -280,14 +222,13 @@ class AIHubStage1Dataset(Dataset):
                     ),
                 )
 
-
                 # ----------------------
-                # numpy → Tensor
+                # numpy -> Tensor
+                #
+                # [H,W,C]
+                # ->
+                # [C,H,W]
                 # ----------------------
-
-                # [H, W, C]
-                # →
-                # [C, H, W]
 
                 frame = torch.from_numpy(
                     frame
@@ -297,9 +238,8 @@ class AIHubStage1Dataset(Dataset):
                     1,
                 ).contiguous()
 
-
                 # uint8 [0,255]
-                # →
+                # ->
                 # float32 [0,1]
 
                 frame = (
@@ -307,23 +247,13 @@ class AIHubStage1Dataset(Dataset):
                     / 255.0
                 )
 
-
                 frames.append(
                     frame
                 )
 
-
             # --------------------------
-            # Frame stack
-            # --------------------------
-
-            # list:
-            # T × [C,H,W]
-            #
-            # →
-            #
-            # Tensor:
             # [T,C,H,W]
+            # --------------------------
 
             clip = torch.stack(
                 frames,
@@ -332,12 +262,8 @@ class AIHubStage1Dataset(Dataset):
 
             return clip
 
-
         finally:
-            # 오류가 발생하더라도
-            # VideoCapture resource를 해제한다.
             cap.release()
-
 
     def _normalize(
         self,
@@ -346,82 +272,43 @@ class AIHubStage1Dataset(Dataset):
         """
         clip:
             [T,C,H,W]
-
-        Stage 1 mean/std normalization.
         """
 
         return (
             clip - self.mean
         ) / self.std
 
-
     def __getitem__(
         self,
         index,
     ):
         """
-        Dataset index를 source video와
-        Stage 1 label로 변환한다.
+        Source video 하나를 한 번만 decode하고
 
-        예:
+        ORIGINAL
+        RERECORDED
 
-        index = 0
-            source_index = 0
-            label = 0
-            → video 0 ORIGINAL
+        두 sample을 동시에 반환한다.
 
-        index = 1
-            source_index = 0
-            label = 1
-            → video 0 RERECORDED
+        Returns
+        -------
+        clips:
+            [2,C,T,H,W]
 
-        index = 2
-            source_index = 1
-            label = 0
-            → video 1 ORIGINAL
-
-        index = 3
-            source_index = 1
-            label = 1
-            → video 1 RERECORDED
+        labels:
+            [2]
+            [0,1]
         """
 
         # ------------------------------
-        # 1. Source video 선택
+        # 1. Source video
         # ------------------------------
 
-        source_index = (
-            index // 2
-        )
-
-
-        # ------------------------------
-        # 2. Label 결정
-        # ------------------------------
-
-        # 짝수 index
-        # → ORIGINAL
-        #
-        # 홀수 index
-        # → RERECORDED
-
-        label = (
-            index % 2
-        )
-
-
-        # ------------------------------
-        # 3. Manifest row
-        # ------------------------------
+        source_index = index
 
         row = self.df.iloc[
             source_index
         ]
-
-
-        # ------------------------------
-        # 4. 실제 video path
-        # ------------------------------
 
         video_path = (
             self.root
@@ -434,87 +321,105 @@ class AIHubStage1Dataset(Dataset):
                 f"{video_path}"
             )
 
-
         # ------------------------------
-        # 5. Video clip 로드
+        # 2. Video decode
+        #
+        # 여기서 단 한 번만 수행
         # ------------------------------
 
-        # 전체 영상을 읽지 않고
-        # 필요한 16 frame만 읽는다.
-        #
-        # output:
-        #
         # [T,C,H,W]
-        #
-        # ex)
-        #
-        # [16,3,224,224]
+        # range [0,1]
 
         clip = self._load_clip(
             video_path
         )
 
-
         # ------------------------------
-        # 6. RERECORDED 생성
-        # ------------------------------
-
-        if label == 1:
-
-            if self.train:
-                # Training에서는 매번
-                # 다른 synthetic artifact를 생성한다.
-                seed = None
-
-            else:
-                # Validation에서는 동일 source에 대해
-                # 항상 동일한 synthetic artifact를 사용한다.
-                #
-                # Validation Macro-F1이 augmentation
-                # randomness로 흔들리는 것을 방지한다.
-                seed = source_index
-
-
-            clip = self.recapture(
-                clip,
-                seed=seed,
-            )
-
-
-        # ------------------------------
-        # 7. Normalize
+        # 3. ORIGINAL
         # ------------------------------
 
-        clip = self._normalize(
-            clip
+        original = clip.clone()
+
+        # ------------------------------
+        # 4. RERECORDED
+        # ------------------------------
+
+        rerecorded = clip.clone()
+
+        if self.train:
+
+            # Training에서는 매 epoch마다
+            # 새로운 synthetic artifact
+            seed = None
+
+        else:
+
+            # Validation에서는 항상
+            # 동일한 synthetic artifact
+            seed = source_index
+
+        rerecorded = self.recapture(
+            rerecorded,
+            seed=seed,
         )
 
+        # ------------------------------
+        # 5. Normalize
+        # ------------------------------
+
+        original = self._normalize(
+            original
+        )
+
+        rerecorded = self._normalize(
+            rerecorded
+        )
 
         # ------------------------------
-        # 8. MViT input shape
-        # ------------------------------
-
-        # 현재:
+        # 6. MViT input shape
         #
         # [T,C,H,W]
-        #
-        # MViT 입력:
-        #
+        # ->
         # [C,T,H,W]
+        # ------------------------------
 
-        clip = clip.permute(
+        original = original.permute(
             1,
             0,
             2,
             3,
         ).contiguous()
 
+        rerecorded = rerecorded.permute(
+            1,
+            0,
+            2,
+            3,
+        ).contiguous()
 
         # ------------------------------
-        # 9. 반환
+        # 7. Pair 생성
         # ------------------------------
+
+        # [2,C,T,H,W]
+
+        clips = torch.stack(
+            [
+                original,
+                rerecorded,
+            ],
+            dim=0,
+        )
+
+        # ORIGINAL   = 0
+        # RERECORDED = 1
+
+        labels = torch.tensor(
+            [0, 1],
+            dtype=torch.long,
+        )
 
         return (
-            clip,
-            label,
+            clips,
+            labels,
         )

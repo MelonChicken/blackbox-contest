@@ -3,20 +3,25 @@
 import argparse
 import py_compile
 import re
+import sys
 import zipfile
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
-MODEL_DIR = ROOT / "model"
-REQUIREMENTS = ROOT / "requirements.txt"
-INFERENCE_OUT = ROOT / "inference.py"
-SUBMIT_ZIP = ROOT / "submit.zip"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.config import MODEL, PROJECT_ROOT, STAGE1_MODEL, STAGE2_MODEL, STAGE3_MODEL
+
+MODEL_DIR = MODEL
+REQUIREMENTS = PROJECT_ROOT / "requirements.txt"
+INFERENCE_OUT = PROJECT_ROOT / "inference.py"
+SUBMIT_ZIP = PROJECT_ROOT / "submit.zip"
 REQUIRED_CHECKPOINTS = [
-    MODEL_DIR / "stage1" / "best.pt",
-    MODEL_DIR / "stage2" / "best.pt",
-    MODEL_DIR / "stage2" / "resnet18-f37072fd.pth",
-    MODEL_DIR / "stage3" / "best.pt",
+    STAGE1_MODEL / "best.pt",
+    STAGE2_MODEL / "best.pt",
+    STAGE2_MODEL / "resnet18-f37072fd.pth",
+    STAGE3_MODEL / "best.pt",
 ]
 ROOT_ZIP_ENTRIES = {"model/", "inference.py", "requirements.txt"}
 
@@ -32,7 +37,7 @@ def validate_inference(path: Path) -> None:
 
 
 def validate_inputs() -> None:
-    missing = [str(path.relative_to(ROOT)) for path in REQUIRED_CHECKPOINTS if not path.is_file()]
+    missing = [str(path.relative_to(PROJECT_ROOT)) for path in REQUIRED_CHECKPOINTS if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"missing model checkpoint(s): {missing}")
     if not REQUIREMENTS.is_file():
@@ -55,7 +60,7 @@ def build_zip() -> Path:
         zf.write(INFERENCE_OUT, "inference.py")
         zf.write(REQUIREMENTS, "requirements.txt")
         for path in _iter_model_files():
-            zf.write(path, path.relative_to(ROOT).as_posix())
+            zf.write(path, path.relative_to(PROJECT_ROOT).as_posix())
     validate_zip(SUBMIT_ZIP)
     return SUBMIT_ZIP
 
@@ -89,10 +94,10 @@ def main() -> None:
     parser.parse_args()
 
     validate_inference(INFERENCE_OUT)
-    print(f"validated: {INFERENCE_OUT.relative_to(ROOT)}")
+    print(f"validated: {INFERENCE_OUT.relative_to(PROJECT_ROOT)}")
     validate_inputs()
     zip_path = build_zip()
-    print(f"generated: {zip_path.relative_to(ROOT)}")
+    print(f"generated: {zip_path.relative_to(PROJECT_ROOT)}")
 
 
 if __name__ == "__main__":

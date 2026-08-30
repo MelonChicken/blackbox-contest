@@ -11,13 +11,19 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.config import DATA, MODEL
+from src.config import (
+    PROJECT_ROOT,
+    STAGE1_MODEL,
+    DLC_STAGE1_RAW,
+    STAGE2_MODEL,
+    STAGE2_RAW,
+    STAGE3_MODEL,
+    STAGE3_RAW,
+)
 from src.inference import predict_stage1, predict_stage2, predict_stage3
 
-MODEL_DIR = MODEL
-DATA_DIR = DATA
-SMOKE_DIR = ROOT / "sample_evaluation_data"
-OUTPUT_DIR = ROOT / "output"
+SMOKE_DIR = PROJECT_ROOT / "sample_evaluation_data"
+OUTPUT_DIR = PROJECT_ROOT / "output"
 
 EXPECTED_COLUMNS = {
     "stage1": ["ID", "answer"],
@@ -34,12 +40,12 @@ def _copy_public_samples() -> Path:
     (SMOKE_DIR / "stage3" / "videos").mkdir(parents=True)
 
     for label, folder in [("O", "original"), ("R", "rerecorded")]:
-        source_dir = DATA_DIR / "stage1" / folder
+        source_dir = DLC_DLC_STAGE1_RAW / folder
         for index, path in enumerate(sorted(source_dir.glob("*")), 1):
             target = SMOKE_DIR / "stage1" / "videos" / f"SAMPLE_S1_{label}_{index:03d}{path.suffix.lower()}"
             shutil.copy2(path, target)
 
-    for index, video_path in enumerate(sorted((DATA_DIR / "stage2" / "videos").glob("*")), 1):
+    for index, video_path in enumerate(sorted((STAGE2_RAW / "videos").glob("*")), 1):
         frame_dir = SMOKE_DIR / "stage2" / "images" / f"SAMPLE_S2_{index:03d}"
         frame_dir.mkdir()
         capture = cv2.VideoCapture(str(video_path))
@@ -52,7 +58,7 @@ def _copy_public_samples() -> Path:
             frame_index += 1
         capture.release()
 
-    for path in sorted((DATA_DIR / "stage3" / "videos").glob("*")):
+    for path in sorted((STAGE3_RAW / "videos").glob("*")):
         shutil.copy2(path, SMOKE_DIR / "stage3" / "videos" / path.name)
     return SMOKE_DIR
 
@@ -73,9 +79,9 @@ def main() -> None:
 
     data_root = _copy_public_samples() if args.create_sample else args.data_root
     predictions = {
-        "stage1": predict_stage1(data_root / "stage1", MODEL_DIR / "stage1"),
-        "stage2": predict_stage2(data_root / "stage2", MODEL_DIR / "stage2"),
-        "stage3": predict_stage3(data_root / "stage3", MODEL_DIR / "stage3"),
+        "stage1": predict_stage1(data_root / "stage1", STAGE1_MODEL),
+        "stage2": predict_stage2(data_root / "stage2", STAGE2_MODEL),
+        "stage3": predict_stage3(data_root / "stage3", STAGE3_MODEL),
     }
     for stage, frame in predictions.items():
         _check_columns(stage, frame)

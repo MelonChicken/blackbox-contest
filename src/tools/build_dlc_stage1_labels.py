@@ -1,9 +1,9 @@
 import pandas as pd
 from pathlib import Path
 
-from src.config import STAGE1_DATA
+from src.config import DLC_STAGE1_PROCESSED, DLC_STAGE1_RAW
 
-DLC_STAGE1_DATA = STAGE1_DATA / "dlc2021"
+DLC_STAGE1_DATA = DLC_STAGE1_RAW
 
 VIDEO_EXTENSIONS = {
     ".mp4",
@@ -48,7 +48,8 @@ def main():
     print(df["label"].value_counts())
     print(df.head())
 
-    output = DLC_STAGE1_DATA / "labels.csv"
+    output = DLC_STAGE1_PROCESSED / "labels.csv"
+    output.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output, index=False)
 
     print(f"Saved: {output}")

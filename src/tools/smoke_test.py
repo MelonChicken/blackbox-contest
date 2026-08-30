@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import shutil
@@ -7,14 +7,15 @@ from pathlib import Path
 
 import cv2
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.config import DATA, MODEL
 from src.inference import predict_stage1, predict_stage2, predict_stage3
 
-MODEL_DIR = ROOT / "model"
-DATA_DIR = ROOT / "data"
+MODEL_DIR = MODEL
+DATA_DIR = DATA
 SMOKE_DIR = ROOT / "sample_evaluation_data"
 OUTPUT_DIR = ROOT / "output"
 

@@ -1,9 +1,9 @@
-from pathlib import Path
 import pandas as pd
+from pathlib import Path
 
-from src.config import DATA
+from src.config import STAGE1_DATA
 
-DATA = DATA / 'stage1' / 'dlc2021'
+DLC_STAGE1_DATA = STAGE1_DATA / "dlc2021"
 
 VIDEO_EXTENSIONS = {
     ".mp4",
@@ -25,24 +25,20 @@ def find_videos(root: Path):
 def main():
     rows = []
 
-    # ORIGINAL = 0
-    original_root = DATA / "original" / "clips_video"
-
+    original_root = DLC_STAGE1_DATA / "original" / "clips_video"
     for path in find_videos(original_root):
         rows.append(
             {
-                "path": str(path.relative_to(DATA)),
+                "path": str(path.relative_to(DLC_STAGE1_DATA)),
                 "label": 0,
             }
         )
 
-    # RERECORDED = 1
-    recaptured_root = DATA / "recaptured" / "clips_video"
-
+    recaptured_root = DLC_STAGE1_DATA / "recaptured" / "clips_video"
     for path in find_videos(recaptured_root):
         rows.append(
             {
-                "path": str(path.relative_to(DATA)),
+                "path": str(path.relative_to(DLC_STAGE1_DATA)),
                 "label": 1,
             }
         )
@@ -52,7 +48,7 @@ def main():
     print(df["label"].value_counts())
     print(df.head())
 
-    output = DATA / "labels.csv"
+    output = DLC_STAGE1_DATA / "labels.csv"
     df.to_csv(output, index=False)
 
     print(f"Saved: {output}")

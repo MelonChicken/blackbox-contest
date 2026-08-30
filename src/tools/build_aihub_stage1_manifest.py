@@ -1,33 +1,21 @@
 import json
+import sys
 from pathlib import Path
 
 import pandas as pd
 
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.config import AIHUB_STAGE1_MANIFEST, AIHUB_STAGE1_RAW, PROJECT_ROOT
 
 # --------------------------------------------------
 # Path
 # --------------------------------------------------
 
-PROJECT_ROOT = (
-    Path(__file__)
-    .resolve()
-    .parents[2]
-)
-
-ROOT = (
-    PROJECT_ROOT
-    / "data"
-    / "stage1"
-    / "aihub597"
-)
-
-RAW_ROOT = ROOT / "raw"
-
-MANIFEST_ROOT = (
-    ROOT
-    / "manifest"
-)
-
+RAW_ROOT = AIHUB_STAGE1_RAW
+MANIFEST_ROOT = AIHUB_STAGE1_MANIFEST
 VIDEO_EXTENSIONS = {
     ".mp4",
     ".avi",
@@ -38,8 +26,8 @@ VIDEO_EXTENSIONS = {
 
 def detect_split(path: Path):
     """
-    AI-Hub의 공식 Training / Validation 구조를
-    그대로 사용한다.
+    AI-Hub??怨듭떇 Training / Validation 援ъ“瑜?
+    洹몃?濡??ъ슜?쒕떎.
 
     1.Training   -> train
     2.Validation -> val
@@ -60,8 +48,8 @@ def load_metadata(
     json_path: Path,
 ):
     """
-    AI-Hub label JSON에서
-    video metadata를 읽는다.
+    AI-Hub label JSON?먯꽌
+    video metadata瑜??쎈뒗??
     """
 
     with json_path.open(
@@ -109,7 +97,7 @@ def main():
 
 
     # --------------------------------------------------
-    # 1. JSON 탐색
+    # 1. JSON ?먯깋
     # --------------------------------------------------
 
     json_paths = list(
@@ -121,13 +109,13 @@ def main():
     )
 
 
-    # 같은 stem의 JSON을 찾기 위한 index
+    # 媛숈? stem??JSON??李얘린 ?꾪븳 index
     json_index = {}
 
     for path in json_paths:
 
-        # 혹시 같은 파일명이 여러 split에 있을 경우를 대비해
-        # split도 같이 key로 사용
+        # ?뱀떆 媛숈? ?뚯씪紐낆씠 ?щ윭 split???덉쓣 寃쎌슦瑜??鍮꾪빐
+        # split??媛숈씠 key濡??ъ슜
         split = detect_split(path)
 
         if split is None:
@@ -142,7 +130,7 @@ def main():
 
 
     # --------------------------------------------------
-    # 2. Video 탐색
+    # 2. Video ?먯깋
     # --------------------------------------------------
 
     video_paths = [
@@ -161,7 +149,7 @@ def main():
 
 
     # --------------------------------------------------
-    # 3. MP4 ↔ JSON matching
+    # 3. MP4 ??JSON matching
     # --------------------------------------------------
 
     records = []
@@ -212,7 +200,7 @@ def main():
 
 
         # ------------------------------------------
-        # 블랙박스만 사용
+        # 釉붾옓諛뺤뒪留??ъ슜
         # ------------------------------------------
 
         filming_way = (
@@ -237,13 +225,13 @@ def main():
 
                 "video_path": str(
                     video_path.relative_to(
-                        ROOT
+                        RAW_ROOT
                     )
                 ),
 
                 "label_path": str(
                     json_path.relative_to(
-                        ROOT
+                        RAW_ROOT
                     )
                 ),
 
@@ -263,7 +251,7 @@ def main():
 
 
     # --------------------------------------------------
-    # 4. DataFrame 생성
+    # 4. DataFrame ?앹꽦
     # --------------------------------------------------
 
     df = pd.DataFrame(
@@ -277,7 +265,7 @@ def main():
 
 
     # --------------------------------------------------
-    # 5. AI-Hub 공식 split 사용
+    # 5. AI-Hub 怨듭떇 split ?ъ슜
     # --------------------------------------------------
 
     train_df = (
@@ -296,7 +284,7 @@ def main():
 
 
     # --------------------------------------------------
-    # 6. Manifest 저장
+    # 6. Manifest ???
     # --------------------------------------------------
 
     train_df.to_csv(
@@ -315,7 +303,7 @@ def main():
 
 
     # --------------------------------------------------
-    # 7. 결과 출력
+    # 7. 寃곌낵 異쒕젰
     # --------------------------------------------------
 
     print()

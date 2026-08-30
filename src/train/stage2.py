@@ -4,7 +4,7 @@ from PIL import Image
 from torch import nn
 from torchvision.models import ResNet18_Weights, resnet18
 
-from src.config import DEVICE, EPOCHS, SEED, STAGE2_DATA, STAGE2_MODEL
+from src.config import DEVICE, EPOCHS, SEED, STAGE2_MODEL, STAGE2_RAW
 from src.models import Stage2Temporal
 from src.utils import set_seed, video_frames
 
@@ -24,7 +24,7 @@ def fit_stage2():
     out = STAGE2_MODEL
     out.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_csv(STAGE2_DATA / "labels.csv")
+    df = pd.read_csv(STAGE2_RAW / "labels.csv")
     backbone = _resnet_backbone()
 
     torch.save(backbone.state_dict(), out / "resnet18-f37072fd.pth")
@@ -37,7 +37,7 @@ def fit_stage2():
 
     with torch.inference_mode():
         for row in df.itertuples():
-            frames = video_frames(STAGE2_DATA / row.path)
+            frames = video_frames(STAGE2_RAW / row.path)
             batches = []
 
             for start in range(0, len(frames), 64):

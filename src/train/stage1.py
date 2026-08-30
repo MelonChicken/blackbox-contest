@@ -24,7 +24,6 @@ from src.utils import set_seed
 
 # ?⑤벏??configuration 嚥≪뮆諭?
 from src.config import (
-    MODEL,
     STAGE1_MODEL,
     AIHUB_STAGE1_RAW,
     AIHUB_STAGE1_MANIFEST,

@@ -22,16 +22,46 @@ else:
 DATA = DATA_ROOT
 MODEL = PROJECT_ROOT / "model"
 
-STAGE1_DATA = DATA / "stage1"
-STAGE2_DATA = DATA / "stage2"
-STAGE3_DATA = DATA / "stage3"
-
 STAGE1_MODEL = MODEL / "stage1"
 STAGE2_MODEL = MODEL / "stage2"
 STAGE3_MODEL = MODEL / "stage3"
+# ============================================================
+# Data directories
+# ============================================================
 
-AIHUB_STAGE1_RAW = DATA_ROOT / "raw" / "aihub597"
-AIHUB_STAGE1_MANIFEST = DATA_ROOT / "processed" / "stage1" / "aihub597" / "manifest"
+RAW_DATA = DATA / "raw"
+PROCESSED_DATA = DATA / "processed"
+
+
+# Stage 1
+STAGE1_RAW = RAW_DATA / "stage1"
+STAGE1_PROCESSED = PROCESSED_DATA / "stage1"
+
+# Stage 2
+STAGE2_RAW = RAW_DATA / "stage2"
+STAGE2_PROCESSED = PROCESSED_DATA / "stage2"
+
+# Stage 3
+STAGE3_RAW = RAW_DATA / "stage3"
+STAGE3_PROCESSED = PROCESSED_DATA / "stage3"
+
+# Backward-compatible aliases for stage raw data roots.
+STAGE1_DATA = STAGE1_RAW
+STAGE2_DATA = STAGE2_RAW
+STAGE3_DATA = STAGE3_RAW
+
+
+# ============================================================
+# Stage 1 datasets
+# ============================================================
+
+AIHUB_STAGE1_RAW = STAGE1_RAW / "aihub597"
+AIHUB_STAGE1_PROCESSED = STAGE1_PROCESSED / "aihub597"
+AIHUB_STAGE1_MANIFEST = AIHUB_STAGE1_PROCESSED / "manifest"
+
+DLC_STAGE1_RAW = STAGE1_RAW / "dlc2021"
+DLC_STAGE1_PROCESSED = STAGE1_PROCESSED / "dlc2021"
+DLC_STAGE1_MANIFEST = DLC_STAGE1_PROCESSED / "manifest"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 EPOCHS = 1

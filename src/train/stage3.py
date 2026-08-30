@@ -2,7 +2,7 @@ import pandas as pd
 import torch
 from torch import nn
 
-from src.config import DEVICE, EPOCHS, S3_MEAN, S3_STD, SEED, STAGE3_DATA, STAGE3_MODEL
+from src.config import DEVICE, EPOCHS, S3_MEAN, S3_STD, SEED, STAGE3_MODEL, STAGE3_RAW
 from src.models import Stage3MViT
 from src.utils import clip, set_seed
 
@@ -13,7 +13,7 @@ def fit_stage3():
     out = STAGE3_MODEL
     out.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_csv(STAGE3_DATA / "labels.csv")
+    df = pd.read_csv(STAGE3_RAW / "labels.csv")
     amap = {"ACCELERATING": 0, "DECELERATING": 1, "CONSTANT": 2, "STOPPED": 3}
     smap = {"LEFT": 0, "STRAIGHT": 1, "RIGHT": 2}
 
@@ -23,7 +23,7 @@ def fit_stage3():
     for _ in range(EPOCHS):
         model.train()
         for row in df.itertuples():
-            x, _ = clip(STAGE3_DATA / "videos" / f"{row.ID}.mp4", 16, int(row.frame_index))
+            x, _ = clip(STAGE3_RAW / "videos" / f"{row.ID}.mp4", 16, int(row.frame_index))
             x = (x - S3_MEAN[:, None, :, :]) / S3_STD[:, None, :, :]
             accel, steer = model(x[None].to(DEVICE))
             loss = nn.functional.cross_entropy(

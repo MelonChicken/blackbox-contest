@@ -2,7 +2,7 @@
 
 # 1.1. 관련 패키지 임포트
 from torch import nn
-from torchvision.models.video import mvit_v2_s
+from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights
 
 
 class Stage3MViT(nn.Module):
@@ -15,7 +15,7 @@ class Stage3MViT(nn.Module):
         super().__init__()
 
         # Torchvision의 MViTv2-Small 모델을 생성
-        self.backbone = mvit_v2_s(weights=None)
+        self.backbone = mvit_v2_s(weights=MViT_V2_S_Weights.KINETICS400_V1)
 
         # MViT가 최종적으로 생성하는 representation의 dimension 확인
         dim = self.backbone.head[1].in_features

@@ -1,6 +1,6 @@
 # 1. Configuration
 
-# 1.1. ?온?????텕筌왖 ?袁る７??
+# 1.1. 라이브러리와 학습 구성 불러오기
 from collections import Counter
 
 import torch
@@ -13,16 +13,16 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
-# AI-Hub ?됰뗀?볢쳸類ㅻ뮞 ?怨멸맒??Stage 1 ??덈뮸 ?怨쀬뵠?怨뺤쨮 ??볥궗??롫뮉 Dataset
+# AI-Hub Stage 1 ORIGINAL/RERECORDED 학습용 Dataset
 from src.datasets.aihubDataset import AIHubStage1Dataset
 
-# Stage 1 筌뤴뫀??嚥≪뮆諭?
+# Stage 1 모델
 from src.models import Stage1MViT
 
-# ??뺣쑁 ??뺣굡 ?⑥쥙????袁る립 ??λ땾
+# 재현 가능한 실험을 위한 seed 설정 유틸리티
 from src.utils import set_seed
 
-# ?⑤벏??configuration 嚥≪뮆諭?
+# 프로젝트 configuration 불러오기
 from src.config import (
     STAGE1_MODEL,
     AIHUB_STAGE1_RAW,
@@ -37,13 +37,13 @@ from src.config import (
 )
 
 
-# ??뺣쑁 ??뺣굡???⑥쥙???뤿연
-# ??덉뵬??鈺곌퀗援?癒?퐣 ??쎈퓮???????????덈즲嚥???뺣뼄.
+# 재현 가능한 학습을 위해 난수 seed를 고정한다.
+# DataLoader worker와 torch 연산의 무작위성을 동일하게 맞춘다.
 set_seed(SEED)
 
 
 # --------------------------------------------------
-# Stage 1 AI-Hub ?怨쀬뵠??野껋럥以?
+# Stage 1 AI-Hub 학습 경로 설정
 # --------------------------------------------------
 
 STAGE1_RAW = AIHUB_STAGE1_RAW
@@ -63,26 +63,26 @@ VAL_MANIFEST = (
 
 def fit_stage1():
     """
-    AI-Hub ?대???????됰뗀?볢쳸類ㅻ뮞 ?怨멸맒????곸뒠??뤿연
+    AI-Hub Stage 1 ORIGINAL/RERECORDED 학습 코드.
 
     ORIGINAL:
-        AI-Hub ?癒?궚 ?怨멸맒
+        AI-Hub 원본 영상 샘플.
 
     RERECORDED:
-        ?癒?궚 ?怨멸맒??synthetic recapture augmentation ?怨몄뒠
+        원본 영상에 synthetic recapture augmentation을 적용한 샘플.
 
-    ???????? ?브쑬履??롫뮉 Stage 1 筌뤴뫀?????덈뮸??뺣뼄.
+    ORIGINAL과 synthetic RERECORDED를 구분하도록 Stage 1 모델을 학습한다.
 
-    Dataset?? source video ??롪돌????甕곕뜄彛?decode????
+    Dataset index 하나는 source video 하나를 의미한다.
 
         ORIGINAL
         RERECORDED
 
-    ??sample????덈뻻????밴쉐??뺣뼄.
+    source 하나에서 ORIGINAL과 synthetic RERECORDED 2개 sample을 생성한다.
     """
 
     # ------------------------------
-    # 1. 筌뤴뫀??????野껋럥以???밴쉐
+    # 1. 모델 저장 경로 생성
     # ------------------------------
 
     out = STAGE1_MODEL
@@ -94,7 +94,7 @@ def fit_stage1():
 
 
     # ------------------------------
-    # 2. AI-Hub Dataset ??밴쉐
+    # 2. AI-Hub Dataset 생성
     # ------------------------------
 
     train_dataset = AIHubStage1Dataset(
@@ -126,21 +126,21 @@ def fit_stage1():
 
 
     # ------------------------------
-    # 3. Train source video ??쀫립
+    # 3. Train source video 수 제한
     # ------------------------------
     #
-    # ??덉쨮??Dataset?癒?퐣??
+    # AIHubStage1Dataset에서
     #
     # len(dataset)
     #
-    # ?癒?퍥揶쎛 source video ??륁뵠??
+    # len(dataset)은 source video 개수를 의미한다.
     #
-    # Dataset item ??롪돌??
+    # Dataset item 하나는
     #
     # ORIGINAL
     # RERECORDED
     #
-    # ??sample????ｍ뜞 獄쏆꼹???뺣뼄.
+    # 두 sample을 함께 반환한다.
     # ------------------------------
 
     num_train_sources = len(train_dataset)
@@ -153,7 +153,7 @@ def fit_stage1():
         generator = torch.Generator()
         generator.manual_seed(SEED)
 
-        # source video 疫꿸퀣? ??뺣쑁 ?醫뤾문
+        # source video 단위로 재현 가능하게 샘플링한다.
         selected_sources = torch.randperm(
             num_train_sources,
             generator=generator,
@@ -166,7 +166,7 @@ def fit_stage1():
 
 
     # ------------------------------
-    # 4. Dataset ?類ｋ궖 ?곗뮆??
+    # 4. Dataset 규모 확인
     # ------------------------------
 
     print("=== Stage 1 Dataset ===")
@@ -203,26 +203,26 @@ def fit_stage1():
 
 
     # ------------------------------
-    # 5. DataLoader ??밴쉐
+    # 5. DataLoader 생성
     # ------------------------------
     #
-    # 筌띲끉??餓λ쵐??
+    # 여기서 batch_size는
     #
-    # batch_size????곸젫 clip ??? ?袁⑤빍??
-    # source video ??롫뼄.
+    # 실제 clip sample 개수가 아니라
+    # source video 개수이다.
     #
-    # BATCH_SIZE = 2??겹늺
+    # BATCH_SIZE = 2라면
     #
-    # source 2揶?
-    # ??
-    # ORIGINAL/RERECORDED 2揶?
+    # source 2개
+    # x
+    # ORIGINAL/RERECORDED 2개
     #
-    # ??쇱젫 GPU batch = 4
+    # 실제 MViT batch = 4
     #
-    # num_workers=4 / prefetch=2??
-    # ?袁⑹삺 ??뺤쒔 ?怨뱀넺?癒?퐣????쇰뻻 筌롫뗀?덄뵳?CPU
-    # ?얜챷?ｅ첎? 獄쏆뮇源??揶쎛?關苑????됱몵沃샕嚥?
-    # ?怨쀪퐨 癰귣똻??怨몄몵嚥???뽰삂??뺣뼄.
+    # BATCH_SIZE는 source batch size이며
+    # 실제 MViT batch는 BATCH_SIZE * 2이다.
+    # DataLoader는 [B,2,C,T,H,W]와 [B,2]를 반환한다.
+    # 학습 루프에서 각각 [B*2,C,T,H,W], [B*2]로 펼친다.
     # ------------------------------
 
     train_loader = DataLoader(
@@ -260,18 +260,18 @@ def fit_stage1():
 
 
     # ------------------------------
-    # 6. Stage 1 筌뤴뫀????밴쉐
+    # 6. Stage 1 모델 생성
     # ------------------------------
 
-    # Kinetics-400??곗쨮 ?????덈뮸??
-    # MViTv2-S 疫꿸퀡而?Stage 1 筌뤴뫀??
+    # Kinetics-400 pretrained MViTv2-S 기반 Stage 1 모델
+    # ORIGINAL/RERECORDED 2-class 분류를 수행한다.
     model = Stage1MViT()
 
     model = model.to(DEVICE)
 
 
     # ------------------------------
-    # 7. Optimizer ??쇱젟
+    # 7. Optimizer 설정
     # ------------------------------
 
     opt = torch.optim.AdamW(
@@ -288,7 +288,7 @@ def fit_stage1():
 
 
     # ------------------------------
-    # 9. Epoch ??μ맄 ??덈뮸
+    # 9. Epoch 학습 루프
     # ------------------------------
 
     for epoch in range(EPOCHS):
@@ -308,7 +308,7 @@ def fit_stage1():
             desc=f"Epoch {epoch + 1}/{EPOCHS} Train",
         ):
 
-            # Dataset ??롪돌??獄쏆꼹??
+            # Dataset item 하나의 x/y shape
             #
             # x:
             # [2, C, T, H, W]
@@ -316,7 +316,7 @@ def fit_stage1():
             # y:
             # [2]
             #
-            # DataLoader ??꾩뜎:
+            # DataLoader batch shape
             #
             # x:
             # [B, 2, C, T, H, W]
@@ -324,7 +324,7 @@ def fit_stage1():
             # y:
             # [B, 2]
             #
-            # MViT???節딅┛ ?袁る퉸:
+            # MViT 입력 shape으로 펼친다.
             #
             # [B, 2, C, T, H, W]
             # ->
@@ -343,7 +343,7 @@ def fit_stage1():
 
 
             # ----------------------
-            # GPU ??猷?
+            # GPU 전송
             # ----------------------
 
             x = x.to(
@@ -358,7 +358,7 @@ def fit_stage1():
 
 
             # ----------------------
-            # Gradient ?λ뜃由??
+            # Gradient 초기화
             # ----------------------
 
             opt.zero_grad()
@@ -396,11 +396,11 @@ def fit_stage1():
 
 
             # ----------------------
-            # Train loss 筌욌쵌??
+            # Train loss 누적
             # ----------------------
 
-            # flatten ??꾩뜎???嚥?
-            # ??쇱젫 clip 揶쏆뮇??
+            # flatten 이후 y 길이가 실제 clip sample 개수이다.
+            # source batch가 아니라 MViT 입력 batch 기준으로 누적한다.
             batch_size = y.size(0)
 
             running_loss += (
@@ -452,7 +452,7 @@ def fit_stage1():
 
 
                 # ------------------
-                # GPU ??猷?
+                # GPU 전송
                 # ------------------
 
                 x = x.to(
@@ -477,8 +477,8 @@ def fit_stage1():
                 )
 
 
-                # y???袁⑹춦 CPU????됱몵沃샕嚥?
-                # 獄쏅뗀以?list嚥?癰궰??묐립??
+                # y는 CPU tensor이므로 그대로 list로 변환하고,
+                # pred는 CPU로 옮긴 뒤 list로 변환한다.
 
                 y_true.extend(
                     y.tolist()
@@ -501,7 +501,7 @@ def fit_stage1():
 
 
         # ------------------------------
-        # Validation ?怨멸쉭 野껉퀗??
+        # Validation Macro-F1, prediction distribution, confusion matrix
         # ------------------------------
 
         print(
@@ -527,7 +527,7 @@ def fit_stage1():
 
 
         # ------------------------------
-        # Epoch 野껉퀗??
+        # Epoch 결과 출력
         # ------------------------------
 
         print(
@@ -539,7 +539,7 @@ def fit_stage1():
 
 
         # ------------------------------
-        # Best checkpoint ????
+        # Best checkpoint 저장
         # ------------------------------
 
         if macro_f1 > best_f1:
@@ -547,10 +547,10 @@ def fit_stage1():
             best_f1 = macro_f1
 
 
-            # inference.py?癒?퐣??
-            # Stage1MViT wrapper揶쎛 ?袁⑤빍??
-            # mvit_v2_s 癰귣챷猿??筌욊낯??weight??
-            # load???嚥?model.net?????館釉??
+            # inference.py에서는 Stage1MViT wrapper가 아니라
+            # 내부 mvit_v2_s 네트워크 weight를 직접 load하므로
+            # best checkpoint에는 model.net.state_dict(), size, frames,
+            # val_macro_f1를 저장한다.
 
             torch.save(
                 {
@@ -579,7 +579,7 @@ def fit_stage1():
 
 
     # ------------------------------
-    # 10. ??덈뮸 ?ル굝利?
+    # 10. 학습 종료
     # ------------------------------
 
     print()

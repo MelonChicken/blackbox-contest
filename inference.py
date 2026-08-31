@@ -7,21 +7,37 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
+import torchvision.transforms.functional as TF
+
 from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models import ResNet18_Weights, resnet18
 from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights
+from torchvision.transforms import InterpolationMode
+
 
 # ============================================================
 # Configuration
 # ============================================================
 
-S1_MEAN = torch.tensor([0.45, 0.45, 0.45])[:, None, None, None]
-S1_STD = torch.tensor([0.225, 0.225, 0.225])[:, None, None, None]
+S1_MEAN = torch.tensor(
+    [0.45, 0.45, 0.45]
+)[:, None, None, None]
 
-S3_MEAN = torch.tensor([0.45, 0.45, 0.45])[:, None, None]
-S3_STD = torch.tensor([0.225, 0.225, 0.225])[:, None, None]
+S1_STD = torch.tensor(
+    [0.225, 0.225, 0.225]
+)[:, None, None, None]
+
+
+S3_MEAN = torch.tensor(
+    [0.45, 0.45, 0.45]
+)[:, None, None]
+
+S3_STD = torch.tensor(
+    [0.225, 0.225, 0.225]
+)[:, None, None]
+
 
 VIDEO_EXT = {
     ".mp4",
@@ -34,6 +50,7 @@ VIDEO_EXT = {
     ".wmv",
 }
 
+
 ACCEL = [
     "ACCELERATING",
     "DECELERATING",
@@ -41,11 +58,13 @@ ACCEL = [
     "STOPPED",
 ]
 
+
 STEER = [
     "LEFT",
     "STRAIGHT",
     "RIGHT",
 ]
+
 
 cv2.setNumThreads(1)
 
@@ -56,16 +75,23 @@ cv2.setNumThreads(1)
 
 def _device() -> torch.device:
     if not torch.cuda.is_available():
-        raise RuntimeError("DACON inference requires a CUDA GPU.")
+        raise RuntimeError(
+            "DACON inference requires a CUDA GPU."
+        )
 
     return torch.device("cuda")
 
 
-def _video_paths(root: Path):
+def _video_paths(
+    root: Path,
+):
     return sorted(
         p
         for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() in VIDEO_EXT
+        if (
+            p.is_file()
+            and p.suffix.lower() in VIDEO_EXT
+        )
     )
 
 
@@ -75,20 +101,30 @@ def _video_paths(root: Path):
 
 class Stage1MViT(nn.Module):
     """
-    영상 전체를 하나의 2-class 문제로 분류하는 모델 클래스
-    Stage 1의 ORIGINAL / RERECORDED 이진 분류 모델
+    Stage 1 ORIGINAL / RERECORDED
+    binary classification model.
     """
 
     def __init__(self):
-        # nn.Module의 초기화를 수행
         super().__init__()
-        # Torchvision의 MViTv2-Small 모델을 생성
-        self.net = mvit_v2_s(weights=None)
-        # 기본 MViT의 classification head 변경 (우리는 이진 분류를 원하니 out_features를 2로 조정한다)
-        self.net.head[1] = nn.Linear(self.net.head[1].in_features, 2)
 
-    # 입력 x를 MViT에 그대로 넣으면 두 클래스에 대한 logit이 나온다. 이후에 추론에서 softmax를 통해 probability롷 전환한다.
-    def forward(self, x): return self.net(x)
+        # Evaluation environment에서는 internet을 사용할 수 없고
+        # checkpoint가 전체 network state를 포함하므로
+        # pretrained weights를 여기서 다시 불러올 필요가 없다.
+        self.net = mvit_v2_s(
+            weights=None
+        )
+
+        self.net.head[1] = nn.Linear(
+            self.net.head[1].in_features,
+            2,
+        )
+
+    def forward(
+        self,
+        x,
+    ):
+        return self.net(x)
 
 
 class Stage2Temporal(nn.Module):
@@ -109,29 +145,66 @@ class Stage2Temporal(nn.Module):
             dropout=0.15,
         )
 
-        self.tc = nn.Linear(384, 1)
-        self.te = nn.Linear(384, 1)
-
-        self.scene = nn.Sequential(
-            nn.Linear(768, 192),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(192, 4),
+        self.tc = nn.Linear(
+            384,
+            1,
         )
 
-    def logits(self, x):
+        self.te = nn.Linear(
+            384,
+            1,
+        )
+
+        self.scene = nn.Sequential(
+            nn.Linear(
+                768,
+                192,
+            ),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(
+                192,
+                4,
+            ),
+        )
+
+    def logits(
+        self,
+        x,
+    ):
         h, _ = self.r(x)
 
-        collision = self.tc(h).squeeze(-1)
-        entry = self.te(h).squeeze(-1)
+        collision = (
+            self.tc(h)
+            .squeeze(-1)
+        )
 
-        return collision, entry, h
+        entry = (
+            self.te(h)
+            .squeeze(-1)
+        )
 
-    def forward(self, x):
-        collision, entry, h = self.logits(x)
+        return (
+            collision,
+            entry,
+            h,
+        )
 
-        ci = collision.argmax(1)
-        ei = entry.argmax(1)
+    def forward(
+        self,
+        x,
+    ):
+        collision, entry, h = (
+            self.logits(x)
+        )
+
+        ci = collision.argmax(
+            1
+        )
+
+        ei = entry.argmax(
+            1
+        )
 
         b = torch.arange(
             len(h),
@@ -148,7 +221,11 @@ class Stage2Temporal(nn.Module):
             )
         )
 
-        return ci, ei, scene
+        return (
+            ci,
+            ei,
+            scene,
+        )
 
 
 class Stage3MViT(nn.Module):
@@ -160,16 +237,34 @@ class Stage3MViT(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.backbone = mvit_v2_s(weights=MViT_V2_S_Weights.KINETICS400_V1)
+        self.backbone = mvit_v2_s(
+            weights=MViT_V2_S_Weights.KINETICS400_V1
+        )
 
-        dim = self.backbone.head[1].in_features
+        dim = (
+            self.backbone
+            .head[1]
+            .in_features
+        )
 
-        self.backbone.head = nn.Identity()
+        self.backbone.head = (
+            nn.Identity()
+        )
 
-        self.accel = nn.Linear(dim, 4)
-        self.steer = nn.Linear(dim, 3)
+        self.accel = nn.Linear(
+            dim,
+            4,
+        )
 
-    def forward(self, x):
+        self.steer = nn.Linear(
+            dim,
+            3,
+        )
+
+    def forward(
+        self,
+        x,
+    ):
         z = self.backbone(x)
 
         return (
@@ -188,77 +283,215 @@ def _clip_ids(
     slot: int = 0,
     slots: int = 1,
 ):
-    cap = cv2.VideoCapture(str(path))
+    """
+    AIHubStage1Dataset과 동일하게
+    영상 전체에서 n개의 frame을 균등 sampling한다.
+    """
 
-    total = max(
-        1,
-        int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+    cap = cv2.VideoCapture(
+        str(path)
     )
 
-    cap.release()
+    if not cap.isOpened():
+        raise ValueError(
+            f"cannot open video: {path.name}"
+        )
 
+    try:
+        total = int(
+            cap.get(
+                cv2.CAP_PROP_FRAME_COUNT
+            )
+        )
+
+    finally:
+        cap.release()
+
+    if total <= 0:
+        raise ValueError(
+            f"invalid frame count: {path.name}"
+        )
+
+    # Training Dataset과 동일하게
+    # torch.linspace + round 사용
     return (
-        np.linspace(
+        torch.linspace(
             0,
             total - 1,
-            n,
+            steps=n,
         )
         .round()
-        .astype(int)
+        .long()
+        .tolist()
     )
 
 
 def _decode_stage1_clip(
     path: Path,
     size: int,
+    recapture_size: int,
     frame_ids,
 ):
-    cap = cv2.VideoCapture(str(path))
+    """
+    Stage 1 inference preprocessing.
 
-    out = []
+    AIHubStage1Dataset의 validation ORIGINAL path와
+    동일한 spatial preprocessing을 사용한다.
 
-    for idx in frame_ids:
-        cap.set(
-            cv2.CAP_PROP_POS_FRAMES,
-            int(idx),
+        video decode
+            ↓
+        BGR -> RGB
+            ↓
+        cv2 resize -> recapture_size (기본 320)
+            ↓
+        Tensor [T,C,H,W]
+            ↓
+        torchvision bilinear + antialias
+            ↓
+        model size (기본 224)
+            ↓
+        [C,T,H,W]
+            ↓
+        normalization
+    """
+
+    cap = cv2.VideoCapture(
+        str(path)
+    )
+
+    if not cap.isOpened():
+        raise ValueError(
+            f"cannot open video: {path.name}"
         )
 
-        ok, bgr = cap.read()
+    frames = []
 
-        if not ok or bgr is None:
-            continue
+    try:
+        for idx in frame_ids:
 
-        rgb = cv2.cvtColor(
-            bgr,
-            cv2.COLOR_BGR2RGB,
-        )
+            cap.set(
+                cv2.CAP_PROP_POS_FRAMES,
+                int(idx),
+            )
 
-        rgb = cv2.resize(
-            rgb,
-            (size, size),
-            interpolation=cv2.INTER_LINEAR,
-        )
+            ok, bgr = cap.read()
 
-        out.append(rgb)
+            if (
+                not ok
+                or bgr is None
+            ):
+                continue
 
-    cap.release()
+            # ------------------------------
+            # BGR -> RGB
+            # ------------------------------
 
-    if not out:
+            rgb = cv2.cvtColor(
+                bgr,
+                cv2.COLOR_BGR2RGB,
+            )
+
+            # ------------------------------
+            # Shared intermediate resize
+            #
+            # Training / validation의 ORIGINAL과 동일
+            # ------------------------------
+
+            rgb = cv2.resize(
+                rgb,
+                (
+                    recapture_size,
+                    recapture_size,
+                ),
+                interpolation=(
+                    cv2.INTER_LINEAR
+                ),
+            )
+
+            # [H,W,C]
+            # ->
+            # [C,H,W]
+
+            frame = (
+                torch.from_numpy(
+                    rgb
+                )
+                .permute(
+                    2,
+                    0,
+                    1,
+                )
+                .contiguous()
+                .float()
+                / 255.0
+            )
+
+            frames.append(
+                frame
+            )
+
+    finally:
+        cap.release()
+
+    if not frames:
         raise ValueError(
             f"cannot decode video: {path.name}"
         )
 
-    while len(out) < len(frame_ids):
-        out.append(out[-1])
+    # 일부 selected frame이 decode되지 않은 경우
+    # 마지막 정상 frame으로 필요한 clip 길이를 채운다.
+    while len(frames) < len(frame_ids):
 
-    x = (
-        torch.from_numpy(
-            np.stack(out)
+        frames.append(
+            frames[-1].clone()
         )
-        .permute(3, 0, 1, 2)
-        .float()
-        / 255.0
+
+    # ------------------------------
+    # [T,C,320,320]
+    # ------------------------------
+
+    clip = torch.stack(
+        frames,
+        dim=0,
     )
+
+    # ------------------------------
+    # Dataset._resize_to_model_size()
+    # 와 동일한 resize
+    #
+    # [T,C,320,320]
+    # ->
+    # [T,C,224,224]
+    # ------------------------------
+
+    clip = TF.resize(
+        clip,
+        [
+            size,
+            size,
+        ],
+        interpolation=(
+            InterpolationMode.BILINEAR
+        ),
+        antialias=True,
+    )
+
+    # ------------------------------
+    # [T,C,H,W]
+    # ->
+    # [C,T,H,W]
+    # ------------------------------
+
+    x = clip.permute(
+        1,
+        0,
+        2,
+        3,
+    ).contiguous()
+
+    # ------------------------------
+    # Normalize
+    # ------------------------------
 
     return (
         x - S1_MEAN
@@ -266,17 +499,25 @@ def _decode_stage1_clip(
 
 
 class Stage1Clips(Dataset):
+    """
+    Stage 1 inference dataset.
+    """
+
     def __init__(
         self,
         videos,
         slots,
         size,
         frames,
+        recapture_size,
     ):
         self.videos = videos
         self.slots = slots
         self.size = size
         self.frames = frames
+        self.recapture_size = (
+            recapture_size
+        )
 
     def __len__(self):
         return (
@@ -284,11 +525,23 @@ class Stage1Clips(Dataset):
             * self.slots
         )
 
-    def __getitem__(self, index):
-        video_index = index // self.slots
-        slot = index % self.slots
+    def __getitem__(
+        self,
+        index,
+    ):
+        video_index = (
+            index
+            // self.slots
+        )
 
-        path = self.videos[video_index]
+        slot = (
+            index
+            % self.slots
+        )
+
+        path = self.videos[
+            video_index
+        ]
 
         try:
             frame_ids = _clip_ids(
@@ -299,14 +552,18 @@ class Stage1Clips(Dataset):
             )
 
             x = _decode_stage1_clip(
-                path,
-                self.size,
-                frame_ids,
+                path=path,
+                size=self.size,
+                recapture_size=(
+                    self.recapture_size
+                ),
+                frame_ids=frame_ids,
             )
 
             valid = 1
 
         except Exception:
+
             x = torch.zeros(
                 3,
                 self.frames,
@@ -329,14 +586,41 @@ def predict_stage1(
 ):
     device = _device()
 
+    # ------------------------------
+    # Checkpoint
+    # ------------------------------
+
     checkpoint = torch.load(
-        Path(model_dir) / "best.pt",
+        Path(model_dir)
+        / "best.pt",
         map_location="cpu",
         weights_only=False,
     )
 
-    size = int(checkpoint["size"])
-    frames = int(checkpoint["frames"])
+    size = int(
+        checkpoint["size"]
+    )
+
+    frames = int(
+        checkpoint["frames"]
+    )
+
+    # 새 checkpoint:
+    #     recapture_size = 320
+    #
+    # 기존 checkpoint:
+    #     key가 없으므로 size를 사용해
+    #     기존 source -> 224 preprocessing과 호환
+    recapture_size = int(
+        checkpoint.get(
+            "recapture_size",
+            size,
+        )
+    )
+
+    # ------------------------------
+    # Model
+    # ------------------------------
 
     model = Stage1MViT()
 
@@ -344,10 +628,17 @@ def predict_stage1(
         checkpoint["model"]
     )
 
-    model.to(device).eval()
+    model.to(
+        device
+    ).eval()
+
+    # ------------------------------
+    # Videos
+    # ------------------------------
 
     videos = _video_paths(
-        Path(data_dir) / "videos"
+        Path(data_dir)
+        / "videos"
     )
 
     slots = 1
@@ -357,6 +648,9 @@ def predict_stage1(
         slots=slots,
         size=size,
         frames=frames,
+        recapture_size=(
+            recapture_size
+        ),
     )
 
     loader = DataLoader(
@@ -371,8 +665,17 @@ def predict_stage1(
         for _ in videos
     ]
 
+    # ------------------------------
+    # Inference
+    # ------------------------------
+
     with torch.inference_mode():
-        for clips, video_indices, valid in loader:
+
+        for (
+            clips,
+            video_indices,
+            valid,
+        ) in loader:
 
             clips = clips.to(
                 device,
@@ -383,31 +686,56 @@ def predict_stage1(
                 device_type="cuda",
                 dtype=torch.float16,
             ):
-                logits = model(clips)
+
+                logits = model(
+                    clips
+                )
 
                 prob = torch.softmax(
                     logits,
                     dim=1,
                 )[:, 1]
 
-            for idx, value, ok in zip(
+            for (
+                idx,
+                value,
+                ok,
+            ) in zip(
                 video_indices.tolist(),
-                prob.float().cpu().tolist(),
+                prob.float()
+                .cpu()
+                .tolist(),
                 valid.tolist(),
             ):
+
                 if ok:
                     scores[idx].append(
                         float(value)
                     )
 
+    # ------------------------------
+    # Prediction
+    # ------------------------------
+
     rows = []
 
-    for path, values in zip(
+    for (
+        path,
+        values,
+    ) in zip(
         videos,
         scores,
     ):
+
+        # 정상적으로 decode된 prediction이 존재하면
+        # probability 평균을 사용한다.
+        #
+        # 완전히 decode할 수 없는 영상의 fallback은
+        # 현재 기존 정책을 유지한다.
         probability = (
-            float(np.mean(values))
+            float(
+                np.mean(values)
+            )
             if values
             else 1.0
         )
@@ -420,12 +748,16 @@ def predict_stage1(
 
         rows.append(
             {
-                "ID": path.stem,
-                "answer": answer,
+                "ID":
+                    path.stem,
+
+                "answer":
+                    answer,
             }
         )
 
     del model
+
     torch.cuda.empty_cache()
 
     return pd.DataFrame(
@@ -450,29 +782,42 @@ class Stage2Frames(Dataset):
         self.paths = paths
         self.transform = transform
 
-    def __len__(self):
-        return len(self.paths)
+    def __len__(
+        self,
+    ):
+        return len(
+            self.paths
+        )
 
-    def __getitem__(self, index):
+    def __getitem__(
+        self,
+        index,
+    ):
         with Image.open(
             self.paths[index]
         ) as image:
 
-            image = image.convert("RGB")
+            image = image.convert(
+                "RGB"
+            )
 
             return self.transform(
                 image
             )
 
 
-def _frame_number(path: Path):
+def _frame_number(
+    path: Path,
+):
     match = re.search(
         r"(\d+)$",
         path.stem,
     )
 
     return (
-        int(match.group(1))
+        int(
+            match.group(1)
+        )
         if match
         else 0
     )
@@ -484,7 +829,9 @@ def predict_stage2(
 ):
     device = _device()
 
-    model_dir = Path(model_dir)
+    model_dir = Path(
+        model_dir
+    )
 
     transform = (
         ResNet18_Weights
@@ -501,7 +848,8 @@ def predict_stage2(
     )
 
     backbone_state = torch.load(
-        model_dir / "resnet18-f37072fd.pth",
+        model_dir
+        / "resnet18-f37072fd.pth",
         map_location="cpu",
         weights_only=True,
     )
@@ -512,7 +860,9 @@ def predict_stage2(
 
     backbone.fc = nn.Identity()
 
-    backbone.to(device).eval()
+    backbone.to(
+        device
+    ).eval()
 
     # ------------------------
     # Temporal model
@@ -520,17 +870,24 @@ def predict_stage2(
 
     temporal = Stage2Temporal()
 
-    temporal_checkpoint = torch.load(
-        model_dir / "best.pt",
-        map_location="cpu",
-        weights_only=False,
+    temporal_checkpoint = (
+        torch.load(
+            model_dir
+            / "best.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
     )
 
     temporal.load_state_dict(
-        temporal_checkpoint["model"]
+        temporal_checkpoint[
+            "model"
+        ]
     )
 
-    temporal.to(device).eval()
+    temporal.to(
+        device
+    ).eval()
 
     # ------------------------
     # Data
@@ -556,13 +913,16 @@ def predict_stage2(
             paths = sorted(
                 (
                     p
-                    for p in folder.iterdir()
-                    if p.suffix.lower()
-                    in {
-                        ".jpg",
-                        ".jpeg",
-                        ".png",
-                    }
+                    for p
+                    in folder.iterdir()
+                    if (
+                        p.suffix.lower()
+                        in {
+                            ".jpg",
+                            ".jpeg",
+                            ".png",
+                        }
+                    )
                 ),
                 key=_frame_number,
             )
@@ -593,6 +953,7 @@ def predict_stage2(
                     device_type="cuda",
                     dtype=torch.float16,
                 ):
+
                     feature = backbone(
                         images
                     )
@@ -604,18 +965,27 @@ def predict_stage2(
                 )
 
             sequence = (
-                torch.cat(features)
+                torch.cat(
+                    features
+                )
                 [None]
                 .to(device)
             )
 
-            collision_idx, entry_idx, scene = (
-                temporal(sequence)
+            (
+                collision_idx,
+                entry_idx,
+                scene,
+            ) = temporal(
+                sequence
             )
 
             frame_numbers = [
-                _frame_number(path)
-                for path in paths
+                _frame_number(
+                    path
+                )
+                for path
+                in paths
             ]
 
             collision_idx = int(
@@ -627,13 +997,19 @@ def predict_stage2(
             )
 
             evasion_space = int(
-                scene[:, :2]
+                scene[
+                    :,
+                    :2,
+                ]
                 .argmax(1)
                 .item()
             )
 
             entry_side_idx = int(
-                scene[:, 2:]
+                scene[
+                    :,
+                    2:,
+                ]
                 .argmax(1)
                 .item()
             )
@@ -646,17 +1022,22 @@ def predict_stage2(
 
             rows.append(
                 {
-                    "ID": folder.name,
+                    "ID":
+                        folder.name,
+
                     "collision_frame":
                         frame_numbers[
                             collision_idx
                         ],
+
                     "entry_frame":
                         frame_numbers[
                             entry_idx
                         ],
+
                     "evasion_space":
                         evasion_space,
+
                     "entry_side":
                         entry_side,
                 }
@@ -693,7 +1074,10 @@ def _stage3_frames(
     frames = []
 
     while True:
-        ok, bgr = capture.read()
+
+        ok, bgr = (
+            capture.read()
+        )
 
         if not ok:
             break
@@ -707,28 +1091,43 @@ def _stage3_frames(
             rgb
         )
 
-        width, height = image.size
+        width, height = (
+            image.size
+        )
 
         scale = (
             256
-            / min(width, height)
+            / min(
+                width,
+                height,
+            )
         )
 
         image = image.resize(
             (
-                round(width * scale),
-                round(height * scale),
+                round(
+                    width
+                    * scale
+                ),
+                round(
+                    height
+                    * scale
+                ),
             )
         )
 
-        width, height = image.size
+        width, height = (
+            image.size
+        )
 
         x = (
-            width - 224
+            width
+            - 224
         ) // 2
 
         y = (
-            height - 224
+            height
+            - 224
         ) // 2
 
         image = image.crop(
@@ -751,7 +1150,9 @@ def _stage3_frames(
                 0,
                 1,
             )
-            .to(torch.uint8)
+            .to(
+                torch.uint8
+            )
         )
 
         frames.append(
@@ -762,7 +1163,8 @@ def _stage3_frames(
 
     if not frames:
         raise ValueError(
-            f"cannot decode video: {path.name}"
+            f"cannot decode video: "
+            f"{path.name}"
         )
 
     return torch.stack(
@@ -777,7 +1179,8 @@ def predict_stage3(
     device = _device()
 
     checkpoint = torch.load(
-        Path(model_dir) / "best.pt",
+        Path(model_dir)
+        / "best.pt",
         map_location="cpu",
         weights_only=False,
     )
@@ -788,7 +1191,9 @@ def predict_stage3(
         checkpoint["model"]
     )
 
-    model.to(device).eval()
+    model.to(
+        device
+    ).eval()
 
     videos = _video_paths(
         Path(data_dir)
@@ -801,11 +1206,15 @@ def predict_stage3(
 
         for path in videos:
 
-            frames = _stage3_frames(
-                path
+            frames = (
+                _stage3_frames(
+                    path
+                )
             )
 
-            count = len(frames)
+            count = len(
+                frames
+            )
 
             centers = np.arange(
                 count
@@ -821,23 +1230,32 @@ def predict_stage3(
             ):
 
                 center = centers[
-                    start:start + 8
+                    start:
+                    start + 8
                 ]
 
                 indices = np.clip(
-                    center[:, None]
-                    - 8
-                    + np.arange(16)[None, :],
+                    (
+                        center[:, None]
+                        - 8
+                        + np.arange(
+                            16
+                        )[None, :]
+                    ),
                     0,
                     count - 1,
                 )
 
-                indices = torch.from_numpy(
-                    indices
+                indices = (
+                    torch.from_numpy(
+                        indices
+                    )
                 )
 
                 clips = (
-                    frames[indices]
+                    frames[
+                        indices
+                    ]
                     .permute(
                         0,
                         2,
@@ -875,8 +1293,12 @@ def predict_stage3(
                     device_type="cuda",
                     dtype=torch.float16,
                 ):
-                    accel_logits, steer_logits = (
-                        model(clips)
+
+                    (
+                        accel_logits,
+                        steer_logits,
+                    ) = model(
+                        clips
                     )
 
                 accel_predictions.extend(
@@ -893,9 +1315,12 @@ def predict_stage3(
                     .tolist()
                 )
 
-            for sample_index, (
-                accel,
-                steer,
+            for (
+                sample_index,
+                (
+                    accel,
+                    steer,
+                ),
             ) in enumerate(
                 zip(
                     accel_predictions,
@@ -907,12 +1332,19 @@ def predict_stage3(
                     {
                         "ID":
                             path.stem,
+
                         "sample_index":
                             sample_index,
+
                         "accel_label":
-                            ACCEL[accel],
+                            ACCEL[
+                                accel
+                            ],
+
                         "steer_label":
-                            STEER[steer],
+                            STEER[
+                                steer
+                            ],
                     }
                 )
 

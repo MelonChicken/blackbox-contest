@@ -103,6 +103,7 @@ def fit_stage1():
 
         frames=16,
         size=224,
+        recapture_size=320,
 
         mean=S1_MEAN,
         std=S1_STD,
@@ -110,13 +111,13 @@ def fit_stage1():
         train=True,
     )
 
-
     val_dataset = AIHubStage1Dataset(
         root=STAGE1_RAW,
         manifest=VAL_MANIFEST,
 
         frames=16,
         size=224,
+        recapture_size=320,
 
         mean=S1_MEAN,
         std=S1_STD,
@@ -562,6 +563,9 @@ def fit_stage1():
 
                     "frames":
                         16,
+
+                    "recapture_size":
+                        320,
 
                     "val_macro_f1":
                         macro_f1,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from pathlib import Path
 
@@ -21,22 +22,24 @@ class CommonVideoTransform:
 
     이 transform은 재촬영 여부를 나타내는 feature가 아니다.
 
-    따라서 학습 시 두 class에 독립적으로 적용하여
+    따라서 학습 시 두 class에 동일한 확률 분포로 독립 적용하여
 
         blur -> RERECORDED
         resize degradation -> RERECORDED
         gamma shift -> RERECORDED
 
-    같은 shortcut을 학습하지 못하도록 한다.
+    와 같은 class shortcut을 학습하기 어렵게 한다.
 
     Input
     -----
     clip:
-        float Tensor [T, C, H, W], range [0, 1]
+        float Tensor [T, C, H, W]
+        range [0, 1]
 
     Output
     ------
-    float Tensor [T, C, H, W], range [0, 1]
+    float Tensor [T, C, H, W]
+        range [0, 1]
     """
 
     def __call__(
@@ -79,6 +82,11 @@ class CommonVideoTransform:
         clip: torch.Tensor,
         rng: random.Random,
     ) -> torch.Tensor:
+        """
+        일반적인 밝기 / camera response 차이를
+        약한 gamma 변화로 근사한다.
+        """
+
         gamma = rng.uniform(
             0.92,
             1.08,
@@ -95,6 +103,11 @@ class CommonVideoTransform:
         clip: torch.Tensor,
         rng: random.Random,
     ) -> torch.Tensor:
+        """
+        재촬영 여부와 무관하게 발생할 수 있는
+        약한 blur를 적용한다.
+        """
+
         sigma = rng.uniform(
             0.20,
             0.70,
@@ -117,6 +130,11 @@ class CommonVideoTransform:
         clip: torch.Tensor,
         rng: random.Random,
     ) -> torch.Tensor:
+        """
+        일반적인 resize / encoding 과정에서도 나타날 수 있는
+        약한 resampling degradation을 적용한다.
+        """
+
         _, _, h, w = clip.shape
 
         scale = rng.uniform(
@@ -166,22 +184,51 @@ class AIHubStage1Dataset(Dataset):
     AI-Hub 교통사고 블랙박스 영상을 이용한
     Stage 1 ORIGINAL / RERECORDED Dataset.
 
-    source video 하나를 한 번 decode한 뒤
+    하나의 source video에서
 
         ORIGINAL   label = 0
         RERECORDED label = 1
 
     두 sample을 생성한다.
 
-    ORIGINAL은 실제 inference와 동일하게
-    선택된 frame을 바로 model input size로 resize한다.
+    핵심 원칙
+    ---------
+    ORIGINAL과 RERECORDED는 반드시 동일한 spatial preprocessing
+    경로에서 출발한다.
 
-    RERECORDED는 더 큰 intermediate resolution에서
-    synthetic screen-recapture process를 적용한 뒤
-    model input size로 resize한다.
+        decoded source
+              |
+              v
+        intermediate resize
+             320
+              |
+         shared base clip
+           /       \\
+          /         \\
+    ORIGINAL     RERECORDED
+                    |
+             RecaptureTransform
+          \\         /
+           \\       /
+              |
+        동일한 320 -> 224 resize
+              |
+       common augmentation
+              |
+          normalization
 
-    학습 시에는 blur, resize degradation, static gamma처럼
-    재촬영에 고유하지 않은 artifact를 두 class 모두에
+    이렇게 함으로써
+
+        source -> 224
+
+    와
+
+        source -> 320 -> 224
+
+    의 resize-path 차이가 label shortcut이 되는 것을 방지한다.
+
+    학습 중에는 blur, ordinary resampling, static gamma처럼
+    재촬영에 고유하지 않은 특징을 두 class에 동일한 분포로
     독립적으로 적용한다.
 
     Returns
@@ -218,8 +265,11 @@ class AIHubStage1Dataset(Dataset):
         self.size = size
         self.train = train
 
-        # 재촬영 simulation을 수행할
-        # intermediate spatial resolution
+        # Synthetic recapture를 적용할
+        # intermediate spatial resolution.
+        #
+        # ORIGINAL과 RERECORDED 모두
+        # 동일한 intermediate resolution을 거친다.
         self.recapture_size = max(
             recapture_size,
             size,
@@ -248,6 +298,14 @@ class AIHubStage1Dataset(Dataset):
         # ------------------------------
         # 3. Normalization
         # ------------------------------
+        #
+        # clip shape이 normalize 시점에는
+        # [T, C, H, W]이므로
+        #
+        # [1, 3, 1, 1]
+        #
+        # 형태로 broadcasting한다.
+        # ------------------------------
 
         self.mean = torch.as_tensor(
             mean,
@@ -272,9 +330,15 @@ class AIHubStage1Dataset(Dataset):
         # ------------------------------
         # 4. Augmentation
         # ------------------------------
+        #
+        # Validation이 training과 완전히 동일한
+        # synthetic parameter distribution만 평가하지 않도록
+        # 별도의 holdout profile을 사용한다.
+        #
+        # 단, 이것은 실제 physical recapture validation을
+        # 대체하지 않는다.
+        # ------------------------------
 
-        # train과 validation에서 재촬영 generator의
-        # parameter distribution을 완전히 동일하게 두지 않는다.
         recapture_profile = (
             "train"
             if self.train
@@ -289,8 +353,15 @@ class AIHubStage1Dataset(Dataset):
 
     def __len__(self):
         """
-        Dataset index 하나는 sample 하나가 아니라
+        Dataset index 하나는 individual sample이 아니라
         source video 하나를 의미한다.
+
+        source 하나에서
+
+            ORIGINAL
+            RERECORDED
+
+        두 sample이 생성된다.
         """
 
         return len(self.df)
@@ -300,9 +371,15 @@ class AIHubStage1Dataset(Dataset):
         frame,
     ) -> torch.Tensor:
         """
-        RGB numpy frame [H, W, C], uint8
-        ->
-        Tensor [C, H, W], float32 [0, 1]
+        RGB numpy frame을 PyTorch Tensor로 변환한다.
+
+        Input:
+            uint8 [H, W, C]
+            range [0, 255]
+
+        Output:
+            float32 [C, H, W]
+            range [0, 1]
         """
 
         frame = torch.from_numpy(
@@ -324,31 +401,35 @@ class AIHubStage1Dataset(Dataset):
     ):
         """
         전체 영상을 메모리에 올리지 않고
-        균등한 위치의 frame만 decode한다.
+        균등한 위치에서 self.frames개의 frame을 decode한다.
 
-        동일하게 decode된 source frame으로부터
+        ORIGINAL과 RERECORDED가 서로 다른 resize pipeline을
+        갖지 않도록 하나의 shared intermediate clip만 생성한다.
 
-            original_clip:
-                [T, C, size, size]
+        동일한 decoded frame은
 
-            recapture_clip:
-                [T, C, recapture_size, recapture_size]
+            source
+              |
+              v
+        recapture_size x recapture_size
 
-        두 spatial representation을 만든다.
-
-        또한 CAP_PROP_FPS가 정상적인 경우
-        실제 sampled frame timestamp를 반환한다.
+        로 한 번 resize된 뒤 양 class가 공유한다.
 
         Returns
         -------
-        original_clip:
-            Tensor [T, C, size, size]
-
-        recapture_clip:
-            Tensor [T, C, recapture_size, recapture_size]
+        base_clip:
+            Tensor
+            [T, C, recapture_size, recapture_size]
 
         timestamps:
             Tensor [T] 또는 None
+
+            FPS metadata가 정상적이면 각 sampled frame의
+            실제 timestamp(sec)를 반환한다.
+
+            FPS metadata가 유효하지 않으면 None을 반환하며,
+            RecaptureTransform 내부의 normalized-time fallback을
+            사용한다.
         """
 
         cap = cv2.VideoCapture(
@@ -389,9 +470,7 @@ class AIHubStage1Dataset(Dataset):
             )
 
             if (
-                not torch.isfinite(
-                    torch.tensor(fps)
-                )
+                not math.isfinite(fps)
                 or fps <= 1e-6
             ):
                 fps = None
@@ -399,15 +478,24 @@ class AIHubStage1Dataset(Dataset):
             # --------------------------
             # Sampling 위치
             # --------------------------
+            #
+            # Stage 1은 영상 전체의 재촬영 여부를
+            # 판별하므로 영상 전체에서 균등하게
+            # 16 frame을 선택한다.
+            # --------------------------
 
-            indices = torch.linspace(
-                0,
-                total_frames - 1,
-                steps=self.frames,
-            ).round().long().tolist()
+            indices = (
+                torch.linspace(
+                    0,
+                    total_frames - 1,
+                    steps=self.frames,
+                )
+                .round()
+                .long()
+                .tolist()
+            )
 
-            original_frames = []
-            recapture_frames = []
+            frames = []
 
             # --------------------------
             # 선택 frame decode
@@ -429,44 +517,23 @@ class AIHubStage1Dataset(Dataset):
                         f"from {video_path}"
                     )
 
+                # ----------------------
                 # BGR -> RGB
+                # ----------------------
+
                 frame = cv2.cvtColor(
                     frame,
                     cv2.COLOR_BGR2RGB,
                 )
 
                 # ----------------------
-                # ORIGINAL path
+                # Shared intermediate resize
                 #
-                # 실제 inference와 동일하게
-                # source frame -> 224 직접 resize
+                # ORIGINAL / RERECORDED 모두
+                # 동일한 representation에서 시작한다.
                 # ----------------------
 
-                original_frame = cv2.resize(
-                    frame,
-                    (
-                        self.size,
-                        self.size,
-                    ),
-                    interpolation=(
-                        cv2.INTER_LINEAR
-                    ),
-                )
-
-                original_frames.append(
-                    self._frame_to_tensor(
-                        original_frame
-                    )
-                )
-
-                # ----------------------
-                # RERECORDED simulation path
-                #
-                # 224보다 큰 spatial resolution에서
-                # screen-camera artifact를 만든다.
-                # ----------------------
-
-                recapture_frame = cv2.resize(
+                frame = cv2.resize(
                     frame,
                     (
                         self.recapture_size,
@@ -477,19 +544,18 @@ class AIHubStage1Dataset(Dataset):
                     ),
                 )
 
-                recapture_frames.append(
+                frames.append(
                     self._frame_to_tensor(
-                        recapture_frame
+                        frame
                     )
                 )
 
-            original_clip = torch.stack(
-                original_frames,
-                dim=0,
-            )
+            # --------------------------
+            # [T, C, H, W]
+            # --------------------------
 
-            recapture_clip = torch.stack(
-                recapture_frames,
+            base_clip = torch.stack(
+                frames,
                 dim=0,
             )
 
@@ -502,35 +568,33 @@ class AIHubStage1Dataset(Dataset):
                 timestamps = torch.tensor(
                     [
                         frame_index / fps
-                        for frame_index
-                        in indices
+                        for frame_index in indices
                     ],
                     dtype=torch.float32,
                 )
 
             else:
 
-                # FPS metadata가 신뢰할 수 없는 경우
-                # RecaptureTransform 내부의 normalized-time
-                # fallback을 사용한다.
                 timestamps = None
 
             return (
-                original_clip,
-                recapture_clip,
+                base_clip,
                 timestamps,
             )
 
         finally:
             cap.release()
 
-    def _resize_recaptured_clip(
+    def _resize_to_model_size(
         self,
         clip: torch.Tensor,
     ) -> torch.Tensor:
         """
-        recapture simulation이 끝난 intermediate clip을
-        model input size로 resize한다.
+        Intermediate resolution의 clip을
+        Stage 1 MViT input resolution으로 resize한다.
+
+        이 함수는 ORIGINAL과 RERECORDED 양쪽에
+        반드시 동일하게 사용한다.
 
         Input:
             [T, C, recapture_size, recapture_size]
@@ -556,7 +620,12 @@ class AIHubStage1Dataset(Dataset):
         clip: torch.Tensor,
     ) -> torch.Tensor:
         """
-        clip:
+        Stage 1 MViT normalization.
+
+        Input:
+            [T, C, H, W]
+
+        Output:
             [T, C, H, W]
         """
 
@@ -608,16 +677,21 @@ class AIHubStage1Dataset(Dataset):
             )
 
         # ------------------------------
-        # 2. Source frame decode
+        # 2. Shared source clip
         # ------------------------------
 
-        (
-            original,
-            recapture_base,
-            timestamps,
-        ) = self._load_clip(
-            video_path
+        base_clip, timestamps = (
+            self._load_clip(
+                video_path
+            )
         )
+
+        # 두 class가 완전히 같은 intermediate
+        # representation에서 출발한다.
+
+        original = base_clip.clone()
+
+        rerecorded = base_clip.clone()
 
         # ------------------------------
         # 3. Synthetic RERECORDED
@@ -625,50 +699,72 @@ class AIHubStage1Dataset(Dataset):
 
         if self.train:
 
-            # DataLoader worker의 Python RNG state를 이용해
-            # 매 epoch / sample마다 새로운 seed를 생성한다.
-            #
-            # random.Random(None)을 직접 반복 생성하는 것보다
-            # 전체 training seed 체계와 더 잘 맞는다.
-
-            recapture_seed = random.getrandbits(
-                63
+            # Training에서는 sample이 호출될 때마다
+            # 새로운 synthetic recapture condition을 생성한다.
+            recapture_seed = (
+                random.getrandbits(63)
             )
 
         else:
 
-            # validation에서는 같은 source에 대해
-            # 항상 동일한 synthetic recapture를 생성한다.
+            # Validation에서는 같은 source video에 대해
+            # 항상 동일한 synthetic recapture condition을
+            # 재현할 수 있도록 deterministic seed를 사용한다.
             recapture_seed = (
                 source_index
                 + 10_000_000
             )
 
         rerecorded = self.recapture(
-            recapture_base,
+            rerecorded,
             seed=recapture_seed,
             timestamps=timestamps,
         )
 
-        # intermediate resolution
-        # ->
-        # model resolution
-        rerecorded = (
-            self._resize_recaptured_clip(
-                rerecorded
-            )
+        # ------------------------------
+        # 4. Model input resolution
+        # ------------------------------
+        #
+        # ORIGINAL:
+        #     shared 320
+        #         ->
+        #     동일 resize
+        #         ->
+        #     224
+        #
+        # RERECORDED:
+        #     shared 320
+        #         ->
+        #     RecaptureTransform
+        #         ->
+        #     동일 resize
+        #         ->
+        #     224
+        #
+        # 따라서 resize path 자체가
+        # class label을 나타낼 수 없다.
+        # ------------------------------
+
+        original = self._resize_to_model_size(
+            original
+        )
+
+        rerecorded = self._resize_to_model_size(
+            rerecorded
         )
 
         # ------------------------------
-        # 4. Common augmentation
+        # 5. Common augmentation
         # ------------------------------
         #
-        # 일반 blur / resampling / static gamma는
-        # RERECORDED만의 특징이 아니므로
-        # 학습 중에는 두 class에 독립적으로 적용한다.
+        # blur / ordinary resampling / static gamma는
+        # 실제 ORIGINAL에도 나타날 수 있다.
         #
-        # validation에서는 실제 inference의 ORIGINAL
-        # preprocessing을 유지하기 위해 적용하지 않는다.
+        # 따라서 training에서는 두 class에
+        # 동일한 확률 분포로 독립 적용한다.
+        #
+        # Validation에서는 적용하지 않아
+        # deterministic evaluation을 유지한다.
         # ------------------------------
 
         if self.train:
@@ -692,7 +788,7 @@ class AIHubStage1Dataset(Dataset):
             )
 
         # ------------------------------
-        # 5. Normalize
+        # 6. Normalize
         # ------------------------------
 
         original = self._normalize(
@@ -704,7 +800,7 @@ class AIHubStage1Dataset(Dataset):
         )
 
         # ------------------------------
-        # 6. MViT input shape
+        # 7. MViT input shape
         #
         # [T, C, H, W]
         # ->
@@ -726,7 +822,10 @@ class AIHubStage1Dataset(Dataset):
         ).contiguous()
 
         # ------------------------------
-        # 7. Pair 생성
+        # 8. Pair 생성
+        # ------------------------------
+        #
+        # [2, C, T, H, W]
         # ------------------------------
 
         clips = torch.stack(
@@ -736,6 +835,9 @@ class AIHubStage1Dataset(Dataset):
             ],
             dim=0,
         )
+
+        # ORIGINAL   = 0
+        # RERECORDED = 1
 
         labels = torch.tensor(
             [

@@ -26,6 +26,8 @@ model/
 *.pt
 *.pth
 test.*
+
+submission/
 # Outputs
 outputs/
 runs/

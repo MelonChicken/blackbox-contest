@@ -156,13 +156,7 @@ def _load_stage2_videomae(
 
     state_dict = checkpoint["model_state_dict"]
     num_frames = int(checkpoint.get("num_frames", 16))
-    config_dict = checkpoint.get("videomae_config")
-
-    if config_dict is None:
-        config_dict = infer_videomae_config_from_state_dict(
-            state_dict,
-            num_frames=num_frames,
-        )
+    config_dict = checkpoint.get("videomae_config", STAGE2_VIDEOMAE_CONFIG)
 
     model = Stage2VideoMAE(
         config_dict=config_dict,

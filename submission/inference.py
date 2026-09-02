@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 from pathlib import Path
@@ -13,7 +13,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights
+from torchvision.models.video import mvit_v2_s
 from torchvision.transforms import InterpolationMode
 from transformers import VideoMAEConfig, VideoMAEModel
 
@@ -118,9 +118,9 @@ class Stage1MViT(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # Evaluation environment?먯꽌??internet???ъ슜?????녾퀬
-        # checkpoint媛 ?꾩껜 network state瑜??ы븿?섎?濡?
-        # pretrained weights瑜??ш린???ㅼ떆 遺덈윭???꾩슂媛 ?녿떎.
+        # Evaluation environment??????internet????????????㈑?
+        # checkpoint?띠럾? ?熬곣뫕??network state??????????
+        # pretrained weights??????????곕뻣 ?釉띾쐞????熬곣뫗?꾣뤆?쎛 ???⑸펲.
         self.net = mvit_v2_s(
             weights=None
         )
@@ -147,7 +147,7 @@ class Stage3MViT(nn.Module):
         super().__init__()
 
         self.backbone = mvit_v2_s(
-            weights=MViT_V2_S_Weights.KINETICS400_V1
+            weights=None
         )
 
         dim = (
@@ -193,8 +193,8 @@ def _clip_ids(
     slots: int = 1,
 ):
     """
-    AIHubStage1Dataset怨??숈씪?섍쾶
-    ?곸긽 ?꾩껜?먯꽌 n媛쒖쓽 frame??洹좊벑 sampling?쒕떎.
+    AIHubStage1Dataset?????됰뎄???우벟
+    ??⑤㈇留??熬곣뫕??????n?띠룇裕??frame???잙?伊볢린?sampling??類ｋ펲.
     """
 
     cap = cv2.VideoCapture(
@@ -221,8 +221,8 @@ def _clip_ids(
             f"invalid frame count: {path.name}"
         )
 
-    # Training Dataset怨??숈씪?섍쾶
-    # torch.linspace + round ?ъ슜
+    # Training Dataset?????됰뎄???우벟
+    # torch.linspace + round ????
     return (
         torch.linspace(
             0,
@@ -244,20 +244,20 @@ def _decode_stage1_clip(
     """
     Stage 1 inference preprocessing.
 
-    AIHubStage1Dataset??validation ORIGINAL path?
-    ?숈씪??spatial preprocessing???ъ슜?쒕떎.
+    AIHubStage1Dataset??validation ORIGINAL path??
+    ???됰뎄??spatial preprocessing???????類ｋ펲.
 
         video decode
             ??
         BGR -> RGB
             ??
-        cv2 resize -> recapture_size (湲곕낯 320)
+        cv2 resize -> recapture_size (?リ옇???320)
             ??
         Tensor [T,C,H,W]
             ??
         torchvision bilinear + antialias
             ??
-        model size (湲곕낯 224)
+        model size (?リ옇???224)
             ??
         [C,T,H,W]
             ??
@@ -303,7 +303,7 @@ def _decode_stage1_clip(
             # ------------------------------
             # Shared intermediate resize
             #
-            # Training / validation??ORIGINAL怨??숈씪
+            # Training / validation??ORIGINAL?????됰뎄
             # ------------------------------
 
             rgb = cv2.resize(
@@ -347,8 +347,8 @@ def _decode_stage1_clip(
             f"cannot decode video: {path.name}"
         )
 
-    # ?쇰? selected frame??decode?섏? ?딆? 寃쎌슦
-    # 留덉?留??뺤긽 frame?쇰줈 ?꾩슂??clip 湲몄씠瑜?梨꾩슫??
+    # ??? selected frame??decode??? ??? ?롪퍔???
+    # 嶺뚮씭??嶺??筌먦끆留?frame??怨쀬Ŧ ?熬곣뫗???clip ?ル梨?醫귣ご?嶺?????
     while len(frames) < len(frame_ids):
 
         frames.append(
@@ -366,7 +366,7 @@ def _decode_stage1_clip(
 
     # ------------------------------
     # Dataset._resize_to_model_size()
-    # ? ?숈씪??resize
+    # ?? ???됰뎄??resize
     #
     # [T,C,320,320]
     # ->
@@ -517,9 +517,9 @@ def predict_stage1(
     # ??checkpoint:
     #     recapture_size = 320
     #
-    # 湲곗〈 checkpoint:
-    #     key媛 ?놁쑝誘濡?size瑜??ъ슜??
-    #     湲곗〈 source -> 224 preprocessing怨??명솚
+    # ?リ옇???checkpoint:
+    #     key?띠럾? ??怨몃さ亦껋깢???size???????
+    #     ?リ옇???source -> 224 preprocessing???筌뤿굞??
     recapture_size = int(
         checkpoint.get(
             "recapture_size",
@@ -636,11 +636,11 @@ def predict_stage1(
         scores,
     ):
 
-        # ?뺤긽?곸쑝濡?decode??prediction??議댁옱?섎㈃
-        # probability ?됯퇏???ъ슜?쒕떎.
+        # ?筌먦끆留??⑤챷紐드슖?decode??prediction???브퀡????濡?듆
+        # probability ???????????類ｋ펲.
         #
-        # ?꾩쟾??decode?????녿뒗 ?곸긽??fallback?
-        # ?꾩옱 湲곗〈 ?뺤콉???좎??쒕떎.
+        # ?熬곣뫗???decode???????⑸츎 ??⑤㈇留??fallback??
+        # ?熬곣뫗???リ옇????筌먦끉????????類ｋ펲.
         probability = (
             float(
                 np.mean(values)
@@ -685,6 +685,23 @@ def predict_stage1(
 VIDEOMAE_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 VIDEOMAE_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
+STAGE2_VIDEOMAE_CONFIG = {
+    "image_size": 224,
+    "patch_size": 16,
+    "num_channels": 3,
+    "num_frames": 16,
+    "tubelet_size": 2,
+    "hidden_size": 384,
+    "num_hidden_layers": 12,
+    "num_attention_heads": 6,
+    "intermediate_size": 1536,
+    "hidden_act": "gelu",
+    "hidden_dropout_prob": 0.0,
+    "attention_probs_dropout_prob": 0.0,
+    "initializer_range": 0.02,
+    "layer_norm_eps": 1e-12,
+    "qkv_bias": True,
+}
 
 class Stage2VideoMAE(nn.Module):
     def __init__(self, config_dict: dict, num_input_frames: int = 16, dropout: float = 0.2):
@@ -850,9 +867,7 @@ def _load_stage2_videomae(checkpoint_path: Path, device: torch.device):
         raise KeyError("Stage 2 checkpoint must contain 'model_state_dict'.")
     state_dict = checkpoint["model_state_dict"]
     num_frames = int(checkpoint.get("num_frames", 16))
-    config_dict = checkpoint.get("videomae_config")
-    if config_dict is None:
-        config_dict = infer_videomae_config_from_state_dict(state_dict, num_frames=num_frames)
+    config_dict = checkpoint.get("videomae_config", STAGE2_VIDEOMAE_CONFIG)
     model = Stage2VideoMAE(config_dict=config_dict, num_input_frames=num_frames)
     model.load_state_dict(state_dict)
     model.to(device).eval()

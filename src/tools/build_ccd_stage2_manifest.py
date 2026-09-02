@@ -165,8 +165,8 @@ def build_stage2_manifest() -> pd.DataFrame:
     ego["video_id"] = _normalize_video_id(ego["video_id"])
     top1 = build_top1_candidates(load_collision_candidates())
     df = ego.merge(top1, on="video_id", how="left", validate="one_to_one")
-    has_candidate = df.get("track_id", pd.Series(index=df.index, dtype=object)).notna()
     direction = df.get("approach_side", pd.Series(index=df.index, dtype=object)).map(direction_from_candidate)
+    has_direction = direction.fillna(MISSING_LABEL).astype(int).ge(0)
     out = pd.DataFrame(
         {
             "video_id": df["video_id"],
@@ -178,7 +178,7 @@ def build_stage2_manifest() -> pd.DataFrame:
             "avoidance": MISSING_LABEL,
             "collision_source": "ccd_accident_start",
             "entry_source": "missing",
-            "direction_source": has_candidate.map(lambda ok: "ccd_approach_side" if ok else "missing"),
+            "direction_source": has_direction.map(lambda ok: "ccd_approach_side" if ok else "missing"),
             "avoidance_source": "missing",
             "collision_confidence": 1.0,
             "entry_confidence": 0.0,

@@ -5,23 +5,20 @@ from pathlib import Path
 import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit
 
-from src.config import CCD_STAGE2_MANIFEST
-
-
-INPUT_PATH = (
-    CCD_STAGE2_MANIFEST
-    / "videomae"
-    / "all.csv"
+from src.config import (
+    CCD_STAGE2_VIDEOMAE_ALL_MANIFEST,
+    CCD_STAGE2_VIDEOMAE_MANIFEST,
+    CCD_STAGE2_VIDEOMAE_TRAIN_MANIFEST,
+    CCD_STAGE2_VIDEOMAE_VAL_MANIFEST,
 )
 
-OUTPUT_DIR = (
-    CCD_STAGE2_MANIFEST
-    / "videomae"
-)
 
-TRAIN_PATH = OUTPUT_DIR / "train.csv"
-VAL_PATH = OUTPUT_DIR / "val.csv"
+INPUT_PATH = CCD_STAGE2_VIDEOMAE_ALL_MANIFEST
 
+OUTPUT_DIR = CCD_STAGE2_VIDEOMAE_MANIFEST
+
+TRAIN_PATH = CCD_STAGE2_VIDEOMAE_TRAIN_MANIFEST
+VAL_PATH = CCD_STAGE2_VIDEOMAE_VAL_MANIFEST
 SEED = 42
 VAL_SIZE = 0.15
 

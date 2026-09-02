@@ -1,44 +1,30 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
-from src.config import CCD_STAGE2_MANIFEST
+from src.config import (
+    CCD_STAGE2_COLLISION_CANDIDATES,
+    CCD_STAGE2_MANIFEST,
+    CCD_STAGE2_VIDEOMAE_ALL_MANIFEST,
+    CCD_STAGE2_VIDEOMAE_MANIFEST,
+)
 
 
 # ============================================================
 # Configuration
 # ============================================================
 
-TOOLS_DIR = Path(__file__).resolve().parent
-
 EGO_MANIFEST_PATH = (
     CCD_STAGE2_MANIFEST
     / "ego_candidates.csv"
 )
 
-COLLISION_CANDIDATES_PATH = (
-    TOOLS_DIR
-    / "data"
-    / "stage2"
-    / "CCD-1500"
-    / "collision_candidates"
-    / "collision_candidates.csv"
-)
+COLLISION_CANDIDATES_PATH = CCD_STAGE2_COLLISION_CANDIDATES
 
-OUTPUT_DIR = (
-    CCD_STAGE2_MANIFEST
-    / "videomae"
-)
+OUTPUT_DIR = CCD_STAGE2_VIDEOMAE_MANIFEST
 
-OUTPUT_PATH = (
-    OUTPUT_DIR
-    / "all.csv"
-)
-
-
+OUTPUT_PATH = CCD_STAGE2_VIDEOMAE_ALL_MANIFEST
 # ============================================================
 # Loading
 # ============================================================

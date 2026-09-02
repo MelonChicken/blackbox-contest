@@ -1,46 +1,29 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
-from src.config import CCD_STAGE2_MANIFEST
+from src.config import (
+    CCD_STAGE2_BOTSORT_TRACKS,
+    CCD_STAGE2_COLLISION_CANDIDATES,
+    CCD_STAGE2_MANIFEST,
+)
 
 
 # ============================================================
 # Configuration
 # ============================================================
 
-TOOLS_DIR = Path(__file__).resolve().parent
-
 MANIFEST_PATH = (
     CCD_STAGE2_MANIFEST
     / "ego_candidates.csv"
 )
 
-TRACK_DIR = (
-    TOOLS_DIR
-    / "data"
-    / "stage2"
-    / "CCD-1500"
-    / "tracks"
-    / "botsort"
-)
+TRACK_DIR = CCD_STAGE2_BOTSORT_TRACKS
 
-OUTPUT_DIR = (
-    TOOLS_DIR
-    / "data"
-    / "stage2"
-    / "CCD-1500"
-    / "collision_candidates"
-)
+OUTPUT_PATH = CCD_STAGE2_COLLISION_CANDIDATES
 
-OUTPUT_PATH = (
-    OUTPUT_DIR
-    / "collision_candidates.csv"
-)
-
+OUTPUT_DIR = OUTPUT_PATH.parent
 TOP_K = 3
 
 # 사고 전 얼마나 볼 것인가

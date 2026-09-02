@@ -6,7 +6,7 @@ import cv2
 import pandas as pd
 from ultralytics import YOLO
 
-from src.config import CCD_STAGE2_MANIFEST
+from src.config import CCD_STAGE2_BOTSORT_TRACKS, CCD_STAGE2_MANIFEST
 
 # ============================================================
 # Configuration
@@ -17,9 +17,7 @@ from src.config import CCD_STAGE2_MANIFEST
 MANIFEST_PATH = CCD_STAGE2_MANIFEST / 'ego_candidates.csv'
 
 
-OUTPUT_DIR = Path(
-    "data/stage2/CCD-1500/tracks/botsort"
-)
+OUTPUT_DIR = CCD_STAGE2_BOTSORT_TRACKS
 
 
 # 우선 작은 모델로 pipeline 검증

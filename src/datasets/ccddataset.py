@@ -10,6 +10,171 @@ from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 
 
+VIDEOMAE_MEAN = torch.tensor(
+    [0.485, 0.456, 0.406],
+    dtype=torch.float32,
+).view(3, 1, 1)
+
+VIDEOMAE_STD = torch.tensor(
+    [0.229, 0.224, 0.225],
+    dtype=torch.float32,
+).view(3, 1, 1)
+
+
+def decode_video_rgb(
+    path: Path,
+) -> np.ndarray:
+    cap = cv2.VideoCapture(
+        str(path)
+    )
+
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Cannot open video: {path}"
+        )
+
+    frames = []
+
+    while True:
+        ok, frame = cap.read()
+
+        if not ok:
+            break
+
+        frame = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2RGB,
+        )
+
+        frames.append(frame)
+
+    cap.release()
+
+    if not frames:
+        raise RuntimeError(
+            f"No frames decoded: {path}"
+        )
+
+    return np.stack(
+        frames,
+        axis=0,
+    )
+
+
+def sample_uniform_indices(
+    frame_count: int,
+    num_frames: int,
+) -> np.ndarray:
+    indices = np.linspace(
+        0,
+        frame_count - 1,
+        num_frames,
+    )
+
+    indices = np.round(
+        indices
+    ).astype(np.int64)
+
+    indices = np.clip(
+        indices,
+        0,
+        frame_count - 1,
+    )
+
+    return indices
+
+
+def transform_videomae_frame(
+    frame: np.ndarray,
+    image_size: int = 224,
+) -> torch.Tensor:
+    x = torch.from_numpy(
+        frame.copy()
+    )
+
+    x = x.permute(
+        2, 0, 1
+    )
+
+    x = (
+        x.float()
+        / 255.0
+    )
+
+    _, h, w = x.shape
+
+    scale = (
+        image_size
+        / min(h, w)
+    )
+
+    new_h = max(
+        image_size,
+        round(h * scale),
+    )
+
+    new_w = max(
+        image_size,
+        round(w * scale),
+    )
+
+    x = TF.resize(
+        x,
+        [new_h, new_w],
+        antialias=True,
+    )
+
+    x = TF.center_crop(
+        x,
+        [
+            image_size,
+            image_size,
+        ],
+    )
+
+    x = (
+        x - VIDEOMAE_MEAN
+    ) / VIDEOMAE_STD
+
+    return x
+
+
+def preprocess_videomae_video(
+    path: Path,
+    num_frames: int = 16,
+    image_size: int = 224,
+) -> tuple[torch.Tensor, np.ndarray]:
+    frames = decode_video_rgb(
+        path
+    )
+
+    sampled_indices = sample_uniform_indices(
+        len(frames),
+        num_frames,
+    )
+
+    sampled_frames = frames[
+        sampled_indices
+    ]
+
+    clip = torch.stack(
+        [
+            transform_videomae_frame(
+                frame,
+                image_size=image_size,
+            )
+            for frame
+            in sampled_frames
+        ],
+        dim=0,
+    )
+
+    return (
+        clip,
+        sampled_indices,
+    )
+
+
 class CCDStage2VideoMAEDataset(Dataset):
     """
     CCD Stage 2 dataset for VideoMAE.
@@ -57,16 +222,8 @@ class CCDStage2VideoMAEDataset(Dataset):
         self.num_frames = num_frames
         self.image_size = image_size
 
-        # VideoMAE pretrained preprocessing에 맞춤.
-        self.mean = torch.tensor(
-            [0.485, 0.456, 0.406],
-            dtype=torch.float32,
-        ).view(3, 1, 1)
-
-        self.std = torch.tensor(
-            [0.229, 0.224, 0.225],
-            dtype=torch.float32,
-        ).view(3, 1, 1)
+        self.mean = VIDEOMAE_MEAN
+        self.std = VIDEOMAE_STD
 
     def __len__(self) -> int:
         return len(self.df)
@@ -79,40 +236,8 @@ class CCDStage2VideoMAEDataset(Dataset):
         self,
         path: Path,
     ) -> np.ndarray:
-        cap = cv2.VideoCapture(
-            str(path)
-        )
-
-        if not cap.isOpened():
-            raise RuntimeError(
-                f"Cannot open video: {path}"
-            )
-
-        frames = []
-
-        while True:
-            ok, frame = cap.read()
-
-            if not ok:
-                break
-
-            frame = cv2.cvtColor(
-                frame,
-                cv2.COLOR_BGR2RGB,
-            )
-
-            frames.append(frame)
-
-        cap.release()
-
-        if not frames:
-            raise RuntimeError(
-                f"No frames decoded: {path}"
-            )
-
-        return np.stack(
-            frames,
-            axis=0,
+        return decode_video_rgb(
+            path
         )
 
     # ========================================================
@@ -123,37 +248,10 @@ class CCDStage2VideoMAEDataset(Dataset):
         self,
         frame_count: int,
     ) -> np.ndarray:
-        """
-        Uniform temporal sampling.
-
-        CCD normally contains 50 frames.
-        """
-
-        if frame_count < self.num_frames:
-            # 극단적인 예외 처리.
-            indices = np.linspace(
-                0,
-                frame_count - 1,
-                self.num_frames,
-            )
-        else:
-            indices = np.linspace(
-                0,
-                frame_count - 1,
-                self.num_frames,
-            )
-
-        indices = np.round(
-            indices
-        ).astype(np.int64)
-
-        indices = np.clip(
-            indices,
-            0,
-            frame_count - 1,
+        return sample_uniform_indices(
+            frame_count,
+            self.num_frames,
         )
-
-        return indices
 
     def _map_original_to_sample(
         self,
@@ -181,57 +279,10 @@ class CCDStage2VideoMAEDataset(Dataset):
         self,
         frame: np.ndarray,
     ) -> torch.Tensor:
-        x = torch.from_numpy(
-            frame.copy()
+        return transform_videomae_frame(
+            frame,
+            image_size=self.image_size,
         )
-
-        x = x.permute(
-            2, 0, 1
-        )
-
-        x = (
-            x.float()
-            / 255.0
-        )
-
-        _, h, w = x.shape
-
-        # Short side -> 224
-        scale = (
-            self.image_size
-            / min(h, w)
-        )
-
-        new_h = max(
-            self.image_size,
-            round(h * scale),
-        )
-
-        new_w = max(
-            self.image_size,
-            round(w * scale),
-        )
-
-        x = TF.resize(
-            x,
-            [new_h, new_w],
-            antialias=True,
-        )
-
-        # Center crop 224x224
-        x = TF.center_crop(
-            x,
-            [
-                self.image_size,
-                self.image_size,
-            ],
-        )
-
-        x = (
-            x - self.mean
-        ) / self.std
-
-        return x
 
     # ========================================================
     # Sample
@@ -249,29 +300,13 @@ class CCDStage2VideoMAEDataset(Dataset):
             row["video_path"]
         )
 
-        frames = self._decode_video(
-            video_path
-        )
-
-        sampled_indices = (
-            self._sample_indices(
-                len(frames)
-            )
-        )
-
-        sampled_frames = frames[
-            sampled_indices
-        ]
-
-        clip = torch.stack(
-            [
-                self._transform_frame(
-                    frame
-                )
-                for frame
-                in sampled_frames
-            ],
-            dim=0,
+        (
+            clip,
+            sampled_indices,
+        ) = preprocess_videomae_video(
+            video_path,
+            num_frames=self.num_frames,
+            image_size=self.image_size,
         )
 
         # [T, C, H, W]

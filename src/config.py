@@ -24,6 +24,8 @@ MODEL = PROJECT_ROOT / "model"
 
 STAGE1_MODEL = MODEL / "stage1"
 STAGE2_MODEL = MODEL / "stage2"
+STAGE2_VIDEOMAE_MODEL = STAGE2_MODEL / "videomae"
+STAGE2_VIDEOMAE_CHECKPOINT = STAGE2_VIDEOMAE_MODEL / "best.pt"
 STAGE3_MODEL = MODEL / "stage3"
 # ============================================================
 # Data directories

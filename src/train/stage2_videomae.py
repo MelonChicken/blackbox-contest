@@ -12,8 +12,9 @@ from tqdm import tqdm
 from src.config import (
     CCD_STAGE2_MANIFEST,
     DEVICE,
-    MODEL,
     SEED,
+    STAGE2_VIDEOMAE_CHECKPOINT,
+    STAGE2_VIDEOMAE_MODEL,
 )
 
 from src.datasets.ccddataset import (
@@ -62,17 +63,9 @@ VAL_MANIFEST = (
     / "val.csv"
 )
 
-CHECKPOINT_DIR = (
-    MODEL
-    / "stage2"
-    / "videomae"
-)
+CHECKPOINT_DIR = STAGE2_VIDEOMAE_MODEL
 
-CHECKPOINT_PATH = (
-    CHECKPOINT_DIR
-    / "best.pt"
-)
-
+CHECKPOINT_PATH = STAGE2_VIDEOMAE_CHECKPOINT
 
 # ============================================================
 # Dataloader
@@ -615,6 +608,10 @@ def fit_stage2():
 
                     "num_frames": (
                         NUM_FRAMES
+                    ),
+
+                    "videomae_config": (
+                        model.encoder.config.to_dict()
                     ),
 
                     "epoch": epoch,

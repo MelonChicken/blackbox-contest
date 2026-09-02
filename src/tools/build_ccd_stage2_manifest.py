@@ -3,101 +3,60 @@ from __future__ import annotations
 import ast
 import csv
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 import pandas as pd
-from src.config import CCD_STAGE2_RAW, CCD_STAGE2_PROCESSED, CCD_STAGE2_MANIFEST
+from sklearn.model_selection import GroupShuffleSplit
 
-# ============================================================
-# Configuration
-# ============================================================
+from src.config import (
+    CCD_STAGE2_COLLISION_CANDIDATES,
+    CCD_STAGE2_MANIFEST,
+    CCD_STAGE2_RAW,
+    STAGE2_ALL_MANIFEST,
+    STAGE2_MANIFEST,
+    STAGE2_TRAIN_MANIFEST,
+    STAGE2_VAL_MANIFEST,
+)
 
 CCD_ROOT = CCD_STAGE2_RAW
-
 ANNOTATION_PATH = CCD_ROOT / "Crash-1500.txt"
 VIDEO_DIR = CCD_ROOT / "videos"
-
-OUTPUT_DIR = CCD_STAGE2_MANIFEST
-
-ALL_MANIFEST_PATH = OUTPUT_DIR / "all.csv"
-EGO_MANIFEST_PATH = OUTPUT_DIR / "ego_candidates.csv"
-
+CCD_ALL_MANIFEST_PATH = CCD_STAGE2_MANIFEST / "all.csv"
+EGO_MANIFEST_PATH = CCD_STAGE2_MANIFEST / "ego_candidates.csv"
+COLLISION_CANDIDATES_PATH = CCD_STAGE2_COLLISION_CANDIDATES
 EXPECTED_NUM_FRAMES = 50
 EXPECTED_FPS = 10.0
+MISSING_LABEL = -1
+SEED = 42
+VAL_SIZE = 0.15
 
-
-# ============================================================
-# Parsing
-# ============================================================
 
 def parse_annotation_line(line: str) -> dict:
-    """
-    Parse one line from Crash-1500.txt.
-
-    Format:
-        vidname,
-        [50 binary frame labels],
-        startframe,
-        youtubeID,
-        timing,
-        weather,
-        egoinvolve
-    """
-
     line = line.strip()
-
     if not line:
         raise ValueError("Empty annotation line")
 
-    # binlabels 내부에도 comma가 있으므로 일반 split(",") 사용 불가.
     label_start = line.find("[")
     label_end = line.find("]")
-
     if label_start == -1 or label_end == -1:
         raise ValueError(f"Could not locate binlabels: {line[:100]}")
 
     vidname = line[:label_start].rstrip(",")
-
-    binlabels_text = line[label_start:label_end + 1]
-    remainder = line[label_end + 1:].lstrip(",")
-
-    binlabels = ast.literal_eval(binlabels_text)
-
-    fields = next(csv.reader([remainder]))
-
+    binlabels = ast.literal_eval(line[label_start : label_end + 1])
+    fields = next(csv.reader([line[label_end + 1 :].lstrip(",")]))
     if len(fields) != 5:
-        raise ValueError(
-            f"Expected 5 fields after binlabels, got {len(fields)}: {fields}"
-        )
+        raise ValueError(f"Expected 5 fields after binlabels, got {len(fields)}: {fields}")
 
     startframe, youtube_id, timing, weather, ego_involve = fields
-
     if len(binlabels) != EXPECTED_NUM_FRAMES:
-        raise ValueError(
-            f"{vidname}: expected {EXPECTED_NUM_FRAMES} labels, "
-            f"got {len(binlabels)}"
-        )
-
+        raise ValueError(f"{vidname}: expected {EXPECTED_NUM_FRAMES} labels, got {len(binlabels)}")
     if any(label not in (0, 1) for label in binlabels):
-        raise ValueError(
-            f"{vidname}: binlabels contains values other than 0/1"
-        )
+        raise ValueError(f"{vidname}: binlabels contains values other than 0/1")
 
-    positive_indices = [
-        idx
-        for idx, label in enumerate(binlabels)
-        if label == 1
-    ]
-
-    if positive_indices:
-        accident_start_frame = positive_indices[0]
-        accident_end_frame = positive_indices[-1]
-        num_accident_frames = len(positive_indices)
-    else:
-        accident_start_frame = -1
-        accident_end_frame = -1
-        num_accident_frames = 0
-
+    positive = [idx for idx, label in enumerate(binlabels) if label == 1]
+    accident_start_frame = positive[0] if positive else -1
+    accident_end_frame = positive[-1] if positive else -1
     return {
         "video_id": vidname,
         "source_id": youtube_id,
@@ -107,238 +66,176 @@ def parse_annotation_line(line: str) -> dict:
         "ego_involved": ego_involve.strip().lower() == "yes",
         "accident_start_frame": accident_start_frame,
         "accident_end_frame": accident_end_frame,
-        "num_accident_frames": num_accident_frames,
+        "num_accident_frames": len(positive),
         "total_frames": EXPECTED_NUM_FRAMES,
         "fps": EXPECTED_FPS,
     }
 
 
-# ============================================================
-# Validation
-# ============================================================
-
-def validate_temporal_labels(
-    video_id: str,
-    accident_start_frame: int,
-    accident_end_frame: int,
-    num_accident_frames: int,
-) -> None:
-    """
-    Basic consistency checks for parsed temporal labels.
-    """
-
-    if accident_start_frame < 0:
-        raise ValueError(
-            f"{video_id}: crash video has no positive frame"
-        )
-
-    if accident_end_frame < accident_start_frame:
-        raise ValueError(
-            f"{video_id}: accident_end_frame < accident_start_frame"
-        )
-
-    expected_positive_count = (
-        accident_end_frame - accident_start_frame + 1
-    )
-
-    if expected_positive_count != num_accident_frames:
-        raise ValueError(
-            f"{video_id}: non-contiguous accident labels detected. "
-            f"start={accident_start_frame}, "
-            f"end={accident_end_frame}, "
-            f"positive_count={num_accident_frames}"
-        )
+def validate_temporal_labels(row: dict) -> None:
+    if row["accident_start_frame"] < 0:
+        raise ValueError(f"{row['video_id']}: crash video has no positive frame")
+    if row["accident_end_frame"] < row["accident_start_frame"]:
+        raise ValueError(f"{row['video_id']}: accident_end_frame < accident_start_frame")
+    expected = row["accident_end_frame"] - row["accident_start_frame"] + 1
+    if expected != row["num_accident_frames"]:
+        raise ValueError(f"{row['video_id']}: non-contiguous accident labels detected")
 
 
-# ============================================================
-# Manifest construction
-# ============================================================
-
-def build_manifest() -> pd.DataFrame:
+def build_ccd_manifest() -> pd.DataFrame:
     if not ANNOTATION_PATH.exists():
-        raise FileNotFoundError(
-            f"Annotation file not found: {ANNOTATION_PATH}"
-        )
-
+        raise FileNotFoundError(f"Annotation file not found: {ANNOTATION_PATH}")
     if not VIDEO_DIR.exists():
-        raise FileNotFoundError(
-            f"Video directory not found: {VIDEO_DIR}"
-        )
+        raise FileNotFoundError(f"Video directory not found: {VIDEO_DIR}")
 
     rows = []
-
-    with ANNOTATION_PATH.open(
-        "r",
-        encoding="utf-8",
-    ) as f:
+    with ANNOTATION_PATH.open("r", encoding="utf-8") as f:
         for line_number, line in enumerate(f, start=1):
             if not line.strip():
                 continue
-
             try:
                 row = parse_annotation_line(line)
-
-                validate_temporal_labels(
-                    video_id=row["video_id"],
-                    accident_start_frame=row["accident_start_frame"],
-                    accident_end_frame=row["accident_end_frame"],
-                    num_accident_frames=row["num_accident_frames"],
-                )
-
-                video_path = (
-                    VIDEO_DIR / f"{row['video_id']}.mp4"
-                )
-
+                validate_temporal_labels(row)
+                video_path = VIDEO_DIR / f"{row['video_id']}.mp4"
                 row["video_path"] = str(video_path)
                 row["video_exists"] = video_path.exists()
-
                 rows.append(row)
-
             except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to parse line {line_number}"
-                ) from exc
+                raise RuntimeError(f"Failed to parse line {line_number}") from exc
 
     df = pd.DataFrame(rows)
-
     if df.empty:
         raise RuntimeError("No CCD annotations were parsed")
-
     if df["video_id"].duplicated().any():
-        duplicated = df.loc[
-            df["video_id"].duplicated(keep=False),
-            "video_id",
-        ].tolist()
-
-        raise RuntimeError(
-            f"Duplicate video IDs detected: {duplicated[:10]}"
-        )
-
+        duplicated = df.loc[df["video_id"].duplicated(keep=False), "video_id"].tolist()
+        raise RuntimeError(f"Duplicate video IDs detected: {duplicated[:10]}")
     return df
 
 
-# ============================================================
-# Reporting
-# ============================================================
+def build_manifest() -> pd.DataFrame:
+    return build_ccd_manifest()
 
-def print_summary(df: pd.DataFrame) -> None:
-    print("=== CCD Stage 2 Manifest ===")
+def write_ccd_manifests() -> pd.DataFrame:
+    CCD_STAGE2_MANIFEST.mkdir(parents=True, exist_ok=True)
+    df = build_ccd_manifest()
+    missing = df.loc[~df["video_exists"], ["video_id", "video_path"]]
+    if not missing.empty:
+        print(missing.head(10).to_string(index=False))
+        raise RuntimeError(f"{len(missing)} video files are missing")
 
+    df.to_csv(CCD_ALL_MANIFEST_PATH, index=False)
+    ego_df = df[df["ego_involved"]].copy().reset_index(drop=True)
+    ego_df.to_csv(EGO_MANIFEST_PATH, index=False)
+    print_summary(df, ego_df)
+    return ego_df
+
+
+def _normalize_video_id(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.zfill(6)
+
+
+def load_collision_candidates() -> pd.DataFrame:
+    if not COLLISION_CANDIDATES_PATH.exists():
+        return pd.DataFrame(columns=["video_id"])
+    df = pd.read_csv(COLLISION_CANDIDATES_PATH, dtype={"video_id": str})
+    df["video_id"] = _normalize_video_id(df["video_id"])
+    return df
+
+
+def build_top1_candidates(candidates: pd.DataFrame) -> pd.DataFrame:
+    if candidates.empty or "candidate_rank" not in candidates.columns:
+        return pd.DataFrame(columns=["video_id"])
+    top1 = candidates[candidates["candidate_rank"] == 1].copy()
+    keep = [c for c in ("video_id", "track_id", "candidate_score", "approach_side", "first_frame", "last_frame") if c in top1]
+    return top1[keep].copy()
+
+
+def direction_from_candidate(value: object) -> int:
+    if value == "left":
+        return 0
+    if value == "right":
+        return 1
+    return MISSING_LABEL
+
+
+def build_stage2_manifest() -> pd.DataFrame:
+    if not EGO_MANIFEST_PATH.exists():
+        write_ccd_manifests()
+    ego = pd.read_csv(EGO_MANIFEST_PATH, dtype={"video_id": str, "source_id": str})
+    ego["video_id"] = _normalize_video_id(ego["video_id"])
+    top1 = build_top1_candidates(load_collision_candidates())
+    df = ego.merge(top1, on="video_id", how="left", validate="one_to_one")
+    has_candidate = df.get("track_id", pd.Series(index=df.index, dtype=object)).notna()
+    direction = df.get("approach_side", pd.Series(index=df.index, dtype=object)).map(direction_from_candidate)
+    out = pd.DataFrame(
+        {
+            "video_id": df["video_id"],
+            "video_path": df["video_path"],
+            "source_id": df.get("source_id", ""),
+            "collision_frame": df["accident_start_frame"].astype(int),
+            "entry_frame": MISSING_LABEL,
+            "direction": direction.fillna(MISSING_LABEL).astype(int),
+            "avoidance": MISSING_LABEL,
+            "collision_source": "ccd_accident_start",
+            "entry_source": "missing",
+            "direction_source": has_candidate.map(lambda ok: "ccd_approach_side" if ok else "missing"),
+            "avoidance_source": "missing",
+            "collision_confidence": 1.0,
+            "entry_confidence": 0.0,
+        }
+    )
+    return out
+
+
+def write_stage2_manifest() -> pd.DataFrame:
+    STAGE2_MANIFEST.mkdir(parents=True, exist_ok=True)
+    df = build_stage2_manifest()
+    df.to_csv(STAGE2_ALL_MANIFEST, index=False)
+    print(f"Saved: {STAGE2_ALL_MANIFEST}")
+    print(f"Rows: {len(df)}")
+    return df
+
+
+def split_stage2_manifest() -> None:
+    if not STAGE2_ALL_MANIFEST.exists():
+        write_stage2_manifest()
+    df = pd.read_csv(STAGE2_ALL_MANIFEST, dtype={"video_id": str, "source_id": str})
+    groups = df["source_id"] if "source_id" in df.columns else df.get("video_id", df.index)
+    train_idx, val_idx = next(GroupShuffleSplit(n_splits=1, test_size=VAL_SIZE, random_state=SEED).split(df, groups=groups))
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    val_df = df.iloc[val_idx].reset_index(drop=True)
+    train_df.to_csv(STAGE2_TRAIN_MANIFEST, index=False)
+    val_df.to_csv(STAGE2_VAL_MANIFEST, index=False)
+    print(f"Saved: {STAGE2_TRAIN_MANIFEST}")
+    print(f"Saved: {STAGE2_VAL_MANIFEST}")
+
+
+def print_summary(df: pd.DataFrame, ego_df: pd.DataFrame | None = None) -> None:
+    print("=== CCD Stage2 Manifest ===")
     print(f"Total annotations: {len(df)}")
-
-    print(
-        f"Videos found: "
-        f"{int(df['video_exists'].sum())}/{len(df)}"
-    )
-
-    print(
-        f"Ego involved: "
-        f"{int(df['ego_involved'].sum())}"
-    )
-
-    print(
-        f"Ego not involved: "
-        f"{int((~df['ego_involved']).sum())}"
-    )
-
-    print()
-
+    print(f"Videos found: {int(df['video_exists'].sum())}/{len(df)}")
+    print(f"Ego candidates: {len(ego_df) if ego_df is not None else int(df['ego_involved'].sum())}/{len(df)}")
+    print(f"Unique source videos: {df['source_id'].nunique()}")
     print("Timing:")
     for key, value in Counter(df["timing"]).items():
         print(f"  {key}: {value}")
 
-    print()
 
-    print("Weather:")
-    for key, value in Counter(df["weather"]).items():
-        print(f"  {key}: {value}")
+def build_stage2_flow(include_tracking: bool = True) -> None:
+    steps: list[tuple[str, Callable[[], object]]] = [("ccd manifest", write_ccd_manifests)]
+    if include_tracking:
+        from src.tools import build_ccd_collision_candidates, build_ccd_vehicles_tracks
 
-    print()
+        steps += [("vehicle tracks", build_ccd_vehicles_tracks.main), ("collision candidates", build_ccd_collision_candidates.main)]
+    steps += [("stage2 manifest", write_stage2_manifest), ("stage2 split", split_stage2_manifest)]
+    for index, (name, run_step) in enumerate(steps, start=1):
+        print(f"[{index}/{len(steps)}] {name}")
+        run_step()
+        print()
 
-    print("Accident start frame:")
-    print(
-        df["accident_start_frame"]
-        .describe()
-        .to_string()
-    )
-
-    print()
-
-    source_counts = df["source_id"].value_counts()
-
-    print(
-        f"Unique source videos: {df['source_id'].nunique()}"
-    )
-
-    print(
-        f"Sources producing >1 clip: "
-        f"{int((source_counts > 1).sum())}"
-    )
-
-    print(
-        f"Maximum clips from one source: "
-        f"{int(source_counts.max())}"
-    )
-
-
-# ============================================================
-# Main
-# ============================================================
 
 def main() -> None:
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    df = build_manifest()
-
-    print_summary(df)
-
-    missing = df.loc[
-        ~df["video_exists"],
-        ["video_id", "video_path"],
-    ]
-
-    if not missing.empty:
-        print()
-        print("Missing video examples:")
-        print(
-            missing
-            .head(10)
-            .to_string(index=False)
-        )
-
-        raise RuntimeError(
-            f"{len(missing)} video files are missing"
-        )
-
-    # Full official CCD annotation manifest.
-    df.to_csv(
-        ALL_MANIFEST_PATH,
-        index=False,
-    )
-
-    # DACON Stage 2에 우선 사용할 ego-involved 후보.
-    ego_df = (
-        df[df["ego_involved"]]
-        .copy()
-        .reset_index(drop=True)
-    )
-
-    ego_df.to_csv(
-        EGO_MANIFEST_PATH,
-        index=False,
-    )
-
-    print()
-    print(f"Saved: {ALL_MANIFEST_PATH}")
-    print(f"Saved: {EGO_MANIFEST_PATH}")
-
-    print(
-        f"Ego candidates: "
-        f"{len(ego_df)}/{len(df)}"
-    )
+    build_stage2_flow()
 
 
 if __name__ == "__main__":

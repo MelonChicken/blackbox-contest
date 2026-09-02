@@ -42,7 +42,7 @@ def validate_inference(path: Path) -> None:
     if re.search(r"\bResNet18_Weights\b|\bresnet18\b|resnet18-f37072fd\.pth", text):
         raise RuntimeError("submission/inference.py still references the old Stage 2 ResNet path")
 
-    py_compile.compile(str(path), doraise=True)
+    compile(text, str(path), "exec")
 
 
 def validate_inputs() -> None:

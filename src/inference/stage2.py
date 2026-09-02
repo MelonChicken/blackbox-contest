@@ -140,17 +140,88 @@ def _resolve_checkpoint_path(model_dir=None) -> Path:
     )
 
 
+
+def _patch_videomae_attention_biases(model: nn.Module) -> None:
+    layers = getattr(model.encoder.encoder, "layer", [])
+    for layer in layers:
+        attention = layer.attention.attention
+        if not hasattr(attention, "q_bias") or attention.q_bias is None:
+            continue
+        if not hasattr(attention, "k_bias"):
+            attention.register_parameter("k_bias", nn.Parameter(torch.zeros_like(attention.q_bias)))
+
+        def _forward_with_key_bias(self, hidden_states, head_mask=None):
+            batch_size, _, _ = hidden_states.shape
+            keys = F.linear(hidden_states, self.key.weight, self.k_bias)
+            values = F.linear(hidden_states, self.value.weight, self.v_bias)
+            queries = F.linear(hidden_states, self.query.weight, self.q_bias)
+
+            key_layer = keys.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+            value_layer = values.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+            query_layer = queries.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+
+            attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2)) * self.scaling
+            attention_probs = F.softmax(attention_scores, dim=-1)
+            attention_probs = F.dropout(attention_probs, p=self.dropout_prob, training=self.training)
+            if head_mask is not None:
+                attention_probs = attention_probs * head_mask
+
+            context_layer = torch.matmul(attention_probs, value_layer)
+            context_layer = context_layer.transpose(1, 2).contiguous()
+            context_layer = context_layer.view(batch_size, -1, self.all_head_size)
+            return context_layer, attention_probs
+
+        attention.forward = _forward_with_key_bias.__get__(attention, attention.__class__)
+
+
+def _adapt_stage2_state_dict(model: nn.Module, state_dict: dict) -> dict:
+    model_state = model.state_dict()
+    adapted = {}
+    for key, value in state_dict.items():
+        mapped_key = key
+        if key.endswith(".attention.attention.query.bias"):
+            mapped_key = key[: -len("query.bias")] + "q_bias"
+        elif key.endswith(".attention.attention.key.bias"):
+            mapped_key = key[: -len("key.bias")] + "k_bias"
+        elif key.endswith(".attention.attention.value.bias"):
+            mapped_key = key[: -len("value.bias")] + "v_bias"
+
+        if mapped_key in model_state:
+            adapted[mapped_key] = value
+        elif key in model_state:
+            adapted[key] = value
+    return adapted
+
 def _load_compatible_state_dict(model: nn.Module, state_dict: dict) -> None:
     model_state = model.state_dict()
+    adapted_state = _adapt_stage2_state_dict(model, state_dict)
     compatible = {
         key: value
         for key, value
-        in state_dict.items()
+        in adapted_state.items()
         if key in model_state and tuple(model_state[key].shape) == tuple(value.shape)
     }
 
-    if not compatible:
-        raise RuntimeError("No compatible Stage 2 VideoMAE weights found in checkpoint.")
+    total_tensors = len(state_dict)
+    total_params = sum(value.numel() for value in state_dict.values() if hasattr(value, "numel"))
+    compatible_params = sum(value.numel() for value in compatible.values())
+
+    if len(compatible) != total_tensors or compatible_params != total_params:
+        missing = [key for key in model_state if key not in compatible]
+        unexpected = [key for key in state_dict if key not in _adapt_stage2_state_dict(model, {key: state_dict[key]})]
+        shape_mismatch = [
+            (key, tuple(value.shape), tuple(model_state[key].shape))
+            for key, value
+            in adapted_state.items()
+            if key in model_state and tuple(model_state[key].shape) != tuple(value.shape)
+        ]
+        raise RuntimeError(
+            "Incomplete Stage 2 VideoMAE checkpoint load: "
+            f"compatible_tensors={len(compatible)}/{total_tensors}, "
+            f"compatible_params={compatible_params}/{total_params}, "
+            f"missing={missing[:20]}, unexpected={unexpected[:20]}, "
+            f"shape_mismatch={shape_mismatch[:20]}"
+        )
 
     model_state.update(compatible)
     model.load_state_dict(model_state, strict=True)

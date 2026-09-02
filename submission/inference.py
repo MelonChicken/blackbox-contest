@@ -118,9 +118,9 @@ class Stage1MViT(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # Evaluation environment??????internet?????????????뫢?
-        # checkpoint??좊읈? ??ш끽維??network state??????????
-        # pretrained weights??????????怨뺣빰 ??됰씭??????ш끽維?袁ｋ쨬??쎛 ????명렡.
+        # Evaluation environment??????internet?????????????力?肉??
+        # checkpoint????ル늉?? ?????諛몃마??network state??????????
+        # pretrained weights?????????????살퓢??????⑥ル럯?????????諛몃마??????▲뀋?????쎛 ????嶺뚮ㅏ援??
         self.net = mvit_v2_s(
             weights=None
         )
@@ -193,8 +193,8 @@ def _clip_ids(
     slots: int = 1,
 ):
     """
-    AIHubStage1Dataset??????곕럡????곕쿊
-    ???ㅳ늾筌???ш끽維??????n??좊즵獒??frame?????鴉딅끼由?sampling??筌먲퐢??
+    AIHubStage1Dataset????????ㅻ쿋???????ㅻ깹??
+    ?????紐껊괘???????諛몃마??????n????ル늉????frame?????歷?퉭留㏝걡???롫렓?sampling???꿔꺂?????
     """
 
     cap = cv2.VideoCapture(
@@ -221,7 +221,7 @@ def _clip_ids(
             f"invalid frame count: {path.name}"
         )
 
-    # Training Dataset??????곕럡????곕쿊
+    # Training Dataset????????ㅻ쿋???????ㅻ깹??
     # torch.linspace + round ????
     return (
         torch.linspace(
@@ -245,19 +245,19 @@ def _decode_stage1_clip(
     Stage 1 inference preprocessing.
 
     AIHubStage1Dataset??validation ORIGINAL path??
-    ????곕럡??spatial preprocessing???????筌먲퐢??
+    ??????ㅻ쿋???spatial preprocessing????????꿔꺂?????
 
         video decode
             ??
         BGR -> RGB
             ??
-        cv2 resize -> recapture_size (??れ삀???320)
+        cv2 resize -> recapture_size (????????320)
             ??
         Tensor [T,C,H,W]
             ??
         torchvision bilinear + antialias
             ??
-        model size (??れ삀???224)
+        model size (????????224)
             ??
         [C,T,H,W]
             ??
@@ -303,7 +303,7 @@ def _decode_stage1_clip(
             # ------------------------------
             # Shared intermediate resize
             #
-            # Training / validation??ORIGINAL??????곕럡
+            # Training / validation??ORIGINAL????????ㅻ쿋??
             # ------------------------------
 
             rgb = cv2.resize(
@@ -347,8 +347,8 @@ def _decode_stage1_clip(
             f"cannot decode video: {path.name}"
         )
 
-    # ??? selected frame??decode??? ??? ?濡ろ뜑???
-    # 癲ル슢???癲??嶺뚮Ĳ?놅쭕?frame???⑥????ш끽維???clip ??ヂ?筌??リ랜??癲?????
+    # ??? selected frame??decode??? ??? ??棺堉?뤃????
+    # ?饔낅떽?????????轅붽틓???????곷뼱?frame?????????????諛몃마???clip ???亦낃콛?????????굩????????
     while len(frames) < len(frame_ids):
 
         frames.append(
@@ -366,7 +366,7 @@ def _decode_stage1_clip(
 
     # ------------------------------
     # Dataset._resize_to_model_size()
-    # ?? ????곕럡??resize
+    # ?? ??????ㅻ쿋???resize
     #
     # [T,C,320,320]
     # ->
@@ -517,9 +517,9 @@ def predict_stage1(
     # ??checkpoint:
     #     recapture_size = 320
     #
-    # ??れ삀???checkpoint:
-    #     key??좊읈? ???⑤챶?뺜벧猿뗪묄???size???????
-    #     ??れ삀???source -> 224 preprocessing???嶺뚮ㅏ援??
+    # ????????checkpoint:
+    #     key????ル늉?? ??????⑤뜤?嶺뚮Ŋ裕녺댆???몄뿭????size???????
+    #     ????????source -> 224 preprocessing????轅붽틓??筌뚮챶夷??
     recapture_size = int(
         checkpoint.get(
             "recapture_size",
@@ -636,11 +636,11 @@ def predict_stage1(
         scores,
     ):
 
-        # ?嶺뚮Ĳ?놅쭕???ㅼ굣筌뤿뱶??decode??prediction???釉뚰????嚥???
-        # probability ???????????筌먲퐢??
+        # ??轅붽틓???????곷뼱??????ㅻ쑋?꿔꺂??琉뷩궘??decode??prediction?????怨쀫뮡?????????
+        # probability ????????????꿔꺂?????
         #
-        # ??ш끽維???decode????????몄툗 ???ㅳ늾筌??fallback??
-        # ??ш끽維????れ삀????嶺뚮Ĳ?????????筌먲퐢??
+        # ?????諛몃마???decode????????嶺뚮ㅎ????????紐껊괘???fallback??
+        # ?????諛몃마????????????轅붽틓?????????????꿔꺂?????
         probability = (
             float(
                 np.mean(values)
@@ -862,17 +862,88 @@ def _resolve_stage2_checkpoint(model_dir) -> Path:
 
 
 
+
+def _patch_videomae_attention_biases(model: nn.Module) -> None:
+    layers = getattr(model.encoder.encoder, "layer", [])
+    for layer in layers:
+        attention = layer.attention.attention
+        if not hasattr(attention, "q_bias") or attention.q_bias is None:
+            continue
+        if not hasattr(attention, "k_bias"):
+            attention.register_parameter("k_bias", nn.Parameter(torch.zeros_like(attention.q_bias)))
+
+        def _forward_with_key_bias(self, hidden_states, head_mask=None):
+            batch_size, _, _ = hidden_states.shape
+            keys = F.linear(hidden_states, self.key.weight, self.k_bias)
+            values = F.linear(hidden_states, self.value.weight, self.v_bias)
+            queries = F.linear(hidden_states, self.query.weight, self.q_bias)
+
+            key_layer = keys.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+            value_layer = values.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+            query_layer = queries.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+
+            attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2)) * self.scaling
+            attention_probs = F.softmax(attention_scores, dim=-1)
+            attention_probs = F.dropout(attention_probs, p=self.dropout_prob, training=self.training)
+            if head_mask is not None:
+                attention_probs = attention_probs * head_mask
+
+            context_layer = torch.matmul(attention_probs, value_layer)
+            context_layer = context_layer.transpose(1, 2).contiguous()
+            context_layer = context_layer.view(batch_size, -1, self.all_head_size)
+            return context_layer, attention_probs
+
+        attention.forward = _forward_with_key_bias.__get__(attention, attention.__class__)
+
+
+def _adapt_stage2_state_dict(model: nn.Module, state_dict: dict) -> dict:
+    model_state = model.state_dict()
+    adapted = {}
+    for key, value in state_dict.items():
+        mapped_key = key
+        if key.endswith(".attention.attention.query.bias"):
+            mapped_key = key[: -len("query.bias")] + "q_bias"
+        elif key.endswith(".attention.attention.key.bias"):
+            mapped_key = key[: -len("key.bias")] + "k_bias"
+        elif key.endswith(".attention.attention.value.bias"):
+            mapped_key = key[: -len("value.bias")] + "v_bias"
+
+        if mapped_key in model_state:
+            adapted[mapped_key] = value
+        elif key in model_state:
+            adapted[key] = value
+    return adapted
+
 def _load_compatible_state_dict(model: nn.Module, state_dict: dict) -> None:
     model_state = model.state_dict()
+    adapted_state = _adapt_stage2_state_dict(model, state_dict)
     compatible = {
         key: value
         for key, value
-        in state_dict.items()
+        in adapted_state.items()
         if key in model_state and tuple(model_state[key].shape) == tuple(value.shape)
     }
 
-    if not compatible:
-        raise RuntimeError("No compatible Stage 2 VideoMAE weights found in checkpoint.")
+    total_tensors = len(state_dict)
+    total_params = sum(value.numel() for value in state_dict.values() if hasattr(value, "numel"))
+    compatible_params = sum(value.numel() for value in compatible.values())
+
+    if len(compatible) != total_tensors or compatible_params != total_params:
+        missing = [key for key in model_state if key not in compatible]
+        unexpected = [key for key in state_dict if key not in _adapt_stage2_state_dict(model, {key: state_dict[key]})]
+        shape_mismatch = [
+            (key, tuple(value.shape), tuple(model_state[key].shape))
+            for key, value
+            in adapted_state.items()
+            if key in model_state and tuple(model_state[key].shape) != tuple(value.shape)
+        ]
+        raise RuntimeError(
+            "Incomplete Stage 2 VideoMAE checkpoint load: "
+            f"compatible_tensors={len(compatible)}/{total_tensors}, "
+            f"compatible_params={compatible_params}/{total_params}, "
+            f"missing={missing[:20]}, unexpected={unexpected[:20]}, "
+            f"shape_mismatch={shape_mismatch[:20]}"
+        )
 
     model_state.update(compatible)
     model.load_state_dict(model_state, strict=True)
@@ -885,6 +956,7 @@ def _load_stage2_videomae(checkpoint_path: Path, device: torch.device):
     num_frames = int(checkpoint.get("num_frames", 16))
     config_dict = checkpoint.get("videomae_config", STAGE2_VIDEOMAE_CONFIG)
     model = Stage2VideoMAE(config_dict=config_dict, num_input_frames=num_frames)
+    _patch_videomae_attention_biases(model)
     _load_compatible_state_dict(model, state_dict)
     model.to(device).eval()
     return model, num_frames

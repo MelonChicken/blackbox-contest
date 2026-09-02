@@ -139,6 +139,22 @@ def _resolve_checkpoint_path(model_dir=None) -> Path:
         f"Checked: {', '.join(str(path) for path in candidates)}"
     )
 
+
+def _load_compatible_state_dict(model: nn.Module, state_dict: dict) -> None:
+    model_state = model.state_dict()
+    compatible = {
+        key: value
+        for key, value
+        in state_dict.items()
+        if key in model_state and tuple(model_state[key].shape) == tuple(value.shape)
+    }
+
+    if not compatible:
+        raise RuntimeError("No compatible Stage 2 VideoMAE weights found in checkpoint.")
+
+    model_state.update(compatible)
+    model.load_state_dict(model_state, strict=True)
+
 def _load_stage2_videomae(
     checkpoint_path: Path,
     device: torch.device,
@@ -163,7 +179,7 @@ def _load_stage2_videomae(
         num_input_frames=num_frames,
     )
 
-    model.load_state_dict(state_dict)
+    _load_compatible_state_dict(model, state_dict)
     model.to(device).eval()
 
     return model, num_frames

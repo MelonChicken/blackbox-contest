@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import py_compile
@@ -11,44 +11,59 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.config import MODEL, PROJECT_ROOT, STAGE1_MODEL, STAGE2_MODEL, STAGE3_MODEL
+from src.config import PROJECT_ROOT
 
-MODEL_DIR = MODEL
-REQUIREMENTS = PROJECT_ROOT / "requirements.txt"
-INFERENCE_OUT = PROJECT_ROOT / "inference.py"
+SUBMISSION_DIR = PROJECT_ROOT / "submission"
+MODEL_DIR = SUBMISSION_DIR / "model"
+REQUIREMENTS = SUBMISSION_DIR / "requirements.txt"
+INFERENCE_OUT = SUBMISSION_DIR / "inference.py"
 SUBMIT_ZIP = PROJECT_ROOT / "submit.zip"
-REQUIRED_CHECKPOINTS = [
-    STAGE1_MODEL / "best.pt",
-    STAGE2_MODEL / "best.pt",
-    STAGE2_MODEL / "resnet18-f37072fd.pth",
-    STAGE3_MODEL / "best.pt",
-]
 ROOT_ZIP_ENTRIES = {"model/", "inference.py", "requirements.txt"}
+
+
+def _relative(path: Path) -> str:
+    return str(path.relative_to(PROJECT_ROOT))
 
 
 def validate_inference(path: Path) -> None:
     if not path.is_file():
         raise FileNotFoundError(path)
+
     text = path.read_text(encoding="utf-8")
     for name in ("predict_stage1", "predict_stage2", "predict_stage3"):
         if not re.search(rf"^def\s+{name}\s*\(", text, flags=re.MULTILINE):
             raise RuntimeError(f"missing function: {name}")
+
+    if re.search(r"^\s*(from\s+src\.|import\s+src\.)", text, flags=re.MULTILINE):
+        raise RuntimeError(
+            "submission/inference.py must be self-contained; found a src.* import"
+        )
+
+    if re.search(r"\bResNet18_Weights\b|\bresnet18\b|resnet18-f37072fd\.pth", text):
+        raise RuntimeError("submission/inference.py still references the old Stage 2 ResNet path")
+
     py_compile.compile(str(path), doraise=True)
 
 
 def validate_inputs() -> None:
-    missing = [str(path.relative_to(PROJECT_ROOT)) for path in REQUIRED_CHECKPOINTS if not path.is_file()]
+    required = [
+        INFERENCE_OUT,
+        REQUIREMENTS,
+        MODEL_DIR / "stage1" / "best.pt",
+        MODEL_DIR / "stage2" / "best.pt",
+        MODEL_DIR / "stage3" / "best.pt",
+    ]
+    missing = [_relative(path) for path in required if not path.is_file()]
     if missing:
-        raise FileNotFoundError(f"missing model checkpoint(s): {missing}")
-    if not REQUIREMENTS.is_file():
-        raise FileNotFoundError("requirements.txt is missing")
+        raise FileNotFoundError(f"missing submission file(s): {missing}")
 
 
-def _iter_model_files():
-    for path in sorted(MODEL_DIR.rglob("*")):
+def _iter_submission_files():
+    for path in sorted(SUBMISSION_DIR.rglob("*")):
         if not path.is_file():
             continue
-        if path.suffix in {".pyc", ".ipynb"} or "__pycache__" in path.parts:
+        rel = path.relative_to(SUBMISSION_DIR).as_posix()
+        if "__pycache__" in path.parts or path.suffix in {".pyc", ".ipynb"}:
             continue
         yield path
 
@@ -56,11 +71,11 @@ def _iter_model_files():
 def build_zip() -> Path:
     if SUBMIT_ZIP.exists():
         SUBMIT_ZIP.unlink()
+
     with zipfile.ZipFile(SUBMIT_ZIP, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.write(INFERENCE_OUT, "inference.py")
-        zf.write(REQUIREMENTS, "requirements.txt")
-        for path in _iter_model_files():
-            zf.write(path, path.relative_to(PROJECT_ROOT).as_posix())
+        for path in _iter_submission_files():
+            zf.write(path, path.relative_to(SUBMISSION_DIR).as_posix())
+
     validate_zip(SUBMIT_ZIP)
     return SUBMIT_ZIP
 
@@ -68,21 +83,23 @@ def build_zip() -> Path:
 def validate_zip(path: Path) -> None:
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
+
     roots = set()
     for name in names:
         first = name.split("/", 1)[0]
         roots.add(f"{first}/" if "/" in name else first)
         if "__pycache__" in name or name.endswith((".pyc", ".ipynb")) or name.startswith("data/"):
             raise RuntimeError(f"forbidden zip member: {name}")
+
     if roots != ROOT_ZIP_ENTRIES:
         raise RuntimeError(f"unexpected zip root entries: {sorted(roots)}")
+
     required = {
-        "model/stage1/best.pt",
-        "model/stage2/best.pt",
-        "model/stage2/resnet18-f37072fd.pth",
-        "model/stage3/best.pt",
         "inference.py",
         "requirements.txt",
+        "model/stage1/best.pt",
+        "model/stage2/best.pt",
+        "model/stage3/best.pt",
     }
     missing = sorted(required - set(names))
     if missing:
@@ -90,11 +107,10 @@ def validate_zip(path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Validate DACON inference.py and build submit.zip.")
+    parser = argparse.ArgumentParser(description="Validate submission/ and build submit.zip.")
     parser.parse_args()
 
     validate_inference(INFERENCE_OUT)
-    print(f"validated: {INFERENCE_OUT.relative_to(PROJECT_ROOT)}")
     validate_inputs()
     zip_path = build_zip()
     print(f"generated: {zip_path.relative_to(PROJECT_ROOT)}")

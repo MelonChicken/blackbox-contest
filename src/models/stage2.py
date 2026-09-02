@@ -1,8 +1,16 @@
 # 1. Configuration
 
 # 1.1. 관련 패키지 임포트
+from __future__ import annotations
+
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
+
+from transformers import (
+    VideoMAEForVideoClassification,
+)
+
 
 
 
@@ -56,3 +64,282 @@ class Stage2Temporal(nn.Module):
         # 위의 세가지를 최종적으로 제출한다.
         return ci, ei, self.scene(torch.cat([h[b, ci], h[b, ei]], 1))
 
+class Stage2VideoMAE(nn.Module):
+    """
+    Stage 2 VideoMAE.
+
+    Initial version:
+        - collision temporal prediction
+        - entry-side auxiliary prediction
+
+    Later:
+        - entry temporal head
+        - evasion-space head
+    """
+
+    def __init__(
+        self,
+        pretrained_name: str = (
+            "MCG-NJU/"
+            "videomae-small-finetuned-ssv2"
+        ),
+        num_input_frames: int = 16,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+
+        pretrained = (
+            VideoMAEForVideoClassification
+            .from_pretrained(
+                pretrained_name
+            )
+        )
+
+        # classification head 제거하고
+        # pretrained VideoMAE encoder만 사용
+        self.encoder = (
+            pretrained.videomae
+        )
+
+        config = self.encoder.config
+
+        self.hidden_size = (
+            config.hidden_size
+        )
+
+        self.patch_size = (
+            config.patch_size
+        )
+
+        self.tubelet_size = (
+            config.tubelet_size
+        )
+
+        self.image_size = (
+            config.image_size
+        )
+
+        self.num_input_frames = (
+            num_input_frames
+        )
+
+        # Spatial patch 개수
+        spatial_size = (
+            self.image_size
+            // self.patch_size
+        )
+
+        self.num_spatial_tokens = (
+            spatial_size
+            * spatial_size
+        )
+
+        self.num_temporal_tokens = (
+            num_input_frames
+            // self.tubelet_size
+        )
+
+        # ----------------------------------------------------
+        # Temporal collision head
+        # ----------------------------------------------------
+
+        self.temporal_norm = (
+            nn.LayerNorm(
+                self.hidden_size
+            )
+        )
+
+        self.collision_head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(
+                self.hidden_size,
+                1,
+            ),
+        )
+
+        # ----------------------------------------------------
+        # Global side head
+        # ----------------------------------------------------
+
+        self.side_head = nn.Sequential(
+            nn.LayerNorm(
+                self.hidden_size
+            ),
+
+            nn.Dropout(dropout),
+
+            nn.Linear(
+                self.hidden_size,
+                2,
+            ),
+        )
+
+    # ========================================================
+    # Feature extraction
+    # ========================================================
+
+    def _temporal_features(
+        self,
+        hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        hidden:
+            [B, sequence_length, D]
+
+        VideoMAE sequence:
+            temporal tubelets
+            × spatial patches
+
+        return:
+            [B, temporal_tokens, D]
+        """
+
+        batch_size = (
+            hidden.shape[0]
+        )
+
+        expected_tokens = (
+            self.num_temporal_tokens
+            * self.num_spatial_tokens
+        )
+
+        if hidden.shape[1] != expected_tokens:
+            raise RuntimeError(
+                "Unexpected VideoMAE token count: "
+                f"got={hidden.shape[1]}, "
+                f"expected={expected_tokens}"
+            )
+
+        hidden = hidden.reshape(
+            batch_size,
+            self.num_temporal_tokens,
+            self.num_spatial_tokens,
+            self.hidden_size,
+        )
+
+        # Spatial mean pooling
+        temporal = hidden.mean(
+            dim=2
+        )
+
+        return temporal
+
+    # ========================================================
+    # Forward
+    # ========================================================
+
+    def forward(
+        self,
+        video: torch.Tensor,
+    ) -> dict:
+        """
+        video:
+            [B, T, C, H, W]
+        """
+
+        outputs = self.encoder(
+            pixel_values=video,
+        )
+
+        hidden = (
+            outputs.last_hidden_state
+        )
+
+        temporal = (
+            self._temporal_features(
+                hidden
+            )
+        )
+
+        temporal = (
+            self.temporal_norm(
+                temporal
+            )
+        )
+
+        # [B, 8, 1]
+        collision_logits = (
+            self.collision_head(
+                temporal
+            )
+        )
+
+        # [B, 8]
+        collision_logits = (
+            collision_logits
+            .squeeze(-1)
+        )
+
+        # tubelet level 8
+        # ->
+        # sampled-frame level 16
+        collision_logits = (
+            F.interpolate(
+                collision_logits
+                .unsqueeze(1),
+
+                size=(
+                    self.num_input_frames
+                ),
+
+                mode="linear",
+
+                align_corners=False,
+            )
+            .squeeze(1)
+        )
+
+        # Global representation
+        global_feature = (
+            temporal.mean(
+                dim=1
+            )
+        )
+
+        side_logits = (
+            self.side_head(
+                global_feature
+            )
+        )
+
+        return {
+            "collision_logits": (
+                collision_logits
+            ),
+
+            "side_logits": (
+                side_logits
+            ),
+
+            "temporal_features": (
+                temporal
+            ),
+        }
+
+    def freeze_backbone(
+            self,
+            unfreeze_last_n: int = 2,
+    ) -> None:
+
+        # 전체 encoder freeze
+        for parameter in self.encoder.parameters():
+            parameter.requires_grad = False
+
+        # 마지막 N개 transformer block만 학습
+        layers = self.encoder.encoder.layer
+
+        if unfreeze_last_n > 0:
+            for layer in layers[-unfreeze_last_n:]:
+                for parameter in layer.parameters():
+                    parameter.requires_grad = True
+
+        # final layernorm이 실제로 존재할 때만 unfreeze
+        layernorm = getattr(
+            self.encoder,
+            "layernorm",
+            None,
+        )
+
+        if layernorm is not None:
+            for parameter in layernorm.parameters():
+                parameter.requires_grad = True

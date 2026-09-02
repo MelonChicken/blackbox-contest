@@ -1,0 +1,36 @@
+[project]
+name = "dacon-blackbox"
+version = "0.1.0"
+description = "DACON Blackbox Video Analysis Project"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    # Deep Learning
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    # Data
+    "numpy==1.26.4",
+    "pandas==2.2.2",
+    "scikit-learn==1.5.2",
+    # Image / Video
+    "opencv-python-headless==4.10.0.84",
+    "pillow==10.4.0",
+    "av>=15,<17",
+    # Utility
+    "tqdm==4.66.5",
+    "ultralytics>=8.4.138",
+    "huggingface-hub[hf-xet]>=1.29.0",
+    "transformers>=5.16.1",
+]
+
+
+# torch / torchvision만 PyTorch CUDA 12.8 index에서 설치
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

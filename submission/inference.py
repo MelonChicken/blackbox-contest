@@ -685,111 +685,52 @@ def predict_stage1(
 VIDEOMAE_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 VIDEOMAE_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
-STAGE2_VIDEOMAE_CONFIG = {
-    "image_size": 224,
-    "patch_size": 16,
-    "num_channels": 3,
-    "num_frames": 16,
-    "tubelet_size": 2,
-    "hidden_size": 384,
-    "num_hidden_layers": 12,
-    "num_attention_heads": 6,
-    "intermediate_size": 1536,
-    "hidden_act": "gelu",
-    "hidden_dropout_prob": 0.0,
-    "attention_probs_dropout_prob": 0.0,
-    "initializer_range": 0.02,
-    "layer_norm_eps": 1e-12,
-    "qkv_bias": True,
-}
 
 class Stage2VideoMAE(nn.Module):
-    def __init__(self, config_dict: dict, num_input_frames: int = 16, dropout: float = 0.2):
+    def __init__(self, model_config: dict):
         super().__init__()
-        self.encoder = VideoMAEModel(VideoMAEConfig.from_dict(config_dict))
-        config = self.encoder.config
-        self.hidden_size = config.hidden_size
-        self.patch_size = config.patch_size
-        self.tubelet_size = config.tubelet_size
-        self.image_size = config.image_size
-        self.num_input_frames = num_input_frames
-        spatial_size = self.image_size // self.patch_size
-        self.num_spatial_tokens = spatial_size * spatial_size
-        self.num_temporal_tokens = num_input_frames // self.tubelet_size
-        self.temporal_norm = nn.LayerNorm(self.hidden_size)
-        self.collision_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(self.hidden_size, 1))
-        self.side_head = nn.Sequential(
-            nn.LayerNorm(self.hidden_size),
-            nn.Dropout(dropout),
-            nn.Linear(self.hidden_size, 2),
-        )
+        self.num_frames = int(model_config.get("num_frames", 16))
+        self.image_size = int(model_config.get("image_size", 224))
+        self.direction_classes = int(model_config.get("direction_classes", 2))
+        self.avoidance_classes = int(model_config.get("avoidance_classes", 2))
+        self.dropout = float(model_config.get("dropout", 0.2))
+        hf_config = model_config.get("hf_config")
+        if hf_config is None:
+            raise KeyError("Stage 2 checkpoint model_config must contain hf_config.")
+        self.backbone = VideoMAEModel(VideoMAEConfig.from_dict(hf_config))
+        hidden_size = int(self.backbone.config.hidden_size)
+        self.head_dropout = nn.Dropout(self.dropout)
+        self.collision_head = nn.Linear(hidden_size, 1)
+        self.entry_head = nn.Linear(hidden_size, 1)
+        self.direction_head = nn.Linear(hidden_size, self.direction_classes)
+        self.avoidance_head = nn.Linear(hidden_size, self.avoidance_classes)
 
-    def _temporal_features(self, hidden: torch.Tensor) -> torch.Tensor:
-        batch_size = hidden.shape[0]
-        expected_tokens = self.num_temporal_tokens * self.num_spatial_tokens
-        if hidden.shape[1] != expected_tokens:
-            raise RuntimeError(
-                "Unexpected VideoMAE token count: "
-                f"got={hidden.shape[1]}, expected={expected_tokens}"
-            )
-        hidden = hidden.reshape(
-            batch_size,
-            self.num_temporal_tokens,
-            self.num_spatial_tokens,
-            self.hidden_size,
-        )
-        return hidden.mean(dim=2)
-
-    def forward(self, video: torch.Tensor) -> dict:
-        outputs = self.encoder(pixel_values=video)
-        temporal = self.temporal_norm(self._temporal_features(outputs.last_hidden_state))
+    def forward(self, pixel_values: torch.Tensor) -> dict:
+        outputs = self.backbone(pixel_values=pixel_values)
+        tokens = outputs.last_hidden_state
+        batch_size, token_count, hidden_size = tokens.shape
+        temporal_count = max(1, self.num_frames // int(self.backbone.config.tubelet_size))
+        spatial_count = max(1, token_count // temporal_count)
+        temporal = tokens[:, : temporal_count * spatial_count].reshape(
+            batch_size, temporal_count, spatial_count, hidden_size
+        ).mean(dim=2)
+        temporal = self.head_dropout(temporal)
         collision_logits = self.collision_head(temporal).squeeze(-1)
-        collision_logits = F.interpolate(
-            collision_logits.unsqueeze(1),
-            size=self.num_input_frames,
-            mode="linear",
-            align_corners=False,
-        ).squeeze(1)
-        global_feature = temporal.mean(dim=1)
+        entry_logits = self.entry_head(temporal).squeeze(-1)
+        if collision_logits.shape[1] != self.num_frames:
+            collision_logits = F.interpolate(
+                collision_logits.unsqueeze(1), size=self.num_frames, mode="linear", align_corners=False
+            ).squeeze(1)
+            entry_logits = F.interpolate(
+                entry_logits.unsqueeze(1), size=self.num_frames, mode="linear", align_corners=False
+            ).squeeze(1)
+        global_feature = self.head_dropout(temporal.mean(dim=1))
         return {
             "collision_logits": collision_logits,
-            "side_logits": self.side_head(global_feature),
-            "temporal_features": temporal,
+            "entry_logits": entry_logits,
+            "direction_logits": self.direction_head(global_feature),
+            "avoidance_logits": self.avoidance_head(global_feature),
         }
-
-
-def infer_videomae_config_from_state_dict(state_dict: dict, num_frames: int = 16) -> dict:
-    projection = state_dict["encoder.embeddings.patch_embeddings.projection.weight"]
-    hidden_size = int(projection.shape[0])
-    num_channels = int(projection.shape[1])
-    tubelet_size = int(projection.shape[2])
-    patch_size = int(projection.shape[3])
-    layer_indices = [
-        int(key.split(".")[3])
-        for key in state_dict
-        if key.startswith("encoder.encoder.layer.")
-    ]
-    if not layer_indices:
-        raise RuntimeError("Cannot infer VideoMAE config: encoder layers are missing from checkpoint.")
-    intermediate_size = int(state_dict["encoder.encoder.layer.0.intermediate.dense.weight"].shape[0])
-    num_attention_heads = {384: 6, 768: 12, 1024: 16}.get(hidden_size)
-    if num_attention_heads is None:
-        for candidate in range(16, 0, -1):
-            if hidden_size % candidate == 0:
-                num_attention_heads = candidate
-                break
-    return VideoMAEConfig(
-        image_size=224,
-        patch_size=patch_size,
-        num_channels=num_channels,
-        num_frames=num_frames,
-        tubelet_size=tubelet_size,
-        hidden_size=hidden_size,
-        num_hidden_layers=max(layer_indices) + 1,
-        num_attention_heads=num_attention_heads,
-        intermediate_size=intermediate_size,
-        qkv_bias=True,
-    ).to_dict()
 
 
 def _frame_number(path: Path):
@@ -800,10 +741,7 @@ def _frame_number(path: Path):
 def _stage2_image_paths(folder: Path):
     if not folder.exists():
         return []
-    return sorted(
-        (p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXT),
-        key=_frame_number,
-    )
+    return sorted((p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXT), key=_frame_number)
 
 
 def _stage2_sequence_folders(data_dir):
@@ -821,28 +759,31 @@ def _stage2_sequence_folders(data_dir):
     return [root] if _stage2_image_paths(root) else []
 
 
+def sample_frame_indices(frame_count: int, num_frames: int) -> np.ndarray:
+    if frame_count <= 0:
+        raise ValueError("frame_count must be positive")
+    if frame_count == 1:
+        return np.zeros(num_frames, dtype=np.int64)
+    return np.rint(np.linspace(0, frame_count - 1, num_frames)).astype(np.int64)
+
+
 def transform_videomae_frame(frame: np.ndarray, image_size: int = 224) -> torch.Tensor:
-    x = torch.from_numpy(frame.copy()).permute(2, 0, 1).float() / 255.0
-    _, h, w = x.shape
-    scale = image_size / min(h, w)
-    new_h = max(image_size, round(h * scale))
-    new_w = max(image_size, round(w * scale))
-    x = TF.resize(x, [new_h, new_w], antialias=True)
+    image = Image.fromarray(frame).convert("RGB")
+    width, height = image.size
+    scale = image_size / min(width, height)
+    resized = (round(height * scale), round(width * scale))
+    x = TF.to_tensor(TF.resize(image, resized, antialias=True))
     x = TF.center_crop(x, [image_size, image_size])
     return (x - VIDEOMAE_MEAN) / VIDEOMAE_STD
 
 
-def sample_uniform_indices(frame_count: int, num_frames: int) -> np.ndarray:
-    indices = np.linspace(0, frame_count - 1, num_frames)
-    indices = np.round(indices).astype(np.int64)
-    return np.clip(indices, 0, frame_count - 1)
-
-
 def preprocess_videomae_images(paths, num_frames: int = 16, image_size: int = 224):
-    sampled_indices = sample_uniform_indices(len(paths), num_frames)
+    if not paths:
+        raise RuntimeError("Stage 2 image sequence is empty")
+    sampled_positions = sample_frame_indices(len(paths), num_frames)
     frames = []
     frame_numbers = []
-    for index in sampled_indices:
+    for index in sampled_positions:
         path = paths[int(index)]
         with Image.open(path) as image:
             frame = np.asarray(image.convert("RGB"))
@@ -855,145 +796,51 @@ def _resolve_stage2_checkpoint(model_dir) -> Path:
     checkpoint_path = Path(model_dir) / "best.pt"
     if checkpoint_path.is_file():
         return checkpoint_path
+    raise FileNotFoundError(f"Stage 2 checkpoint not found: {checkpoint_path}")
 
-    raise FileNotFoundError(
-        f"Stage 2 VideoMAE checkpoint not found: {checkpoint_path}"
-    )
-
-
-
-
-def _patch_videomae_attention_biases(model: nn.Module) -> None:
-    layers = getattr(model.encoder.encoder, "layer", [])
-    for layer in layers:
-        attention = layer.attention.attention
-        if not hasattr(attention, "q_bias") or attention.q_bias is None:
-            continue
-        if not hasattr(attention, "k_bias"):
-            attention.register_parameter("k_bias", nn.Parameter(torch.zeros_like(attention.q_bias)))
-
-        def _forward_with_key_bias(self, hidden_states, head_mask=None):
-            batch_size, _, _ = hidden_states.shape
-            keys = F.linear(hidden_states, self.key.weight, self.k_bias)
-            values = F.linear(hidden_states, self.value.weight, self.v_bias)
-            queries = F.linear(hidden_states, self.query.weight, self.q_bias)
-
-            key_layer = keys.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
-            value_layer = values.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
-            query_layer = queries.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
-
-            attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2)) * self.scaling
-            attention_probs = F.softmax(attention_scores, dim=-1)
-            attention_probs = F.dropout(attention_probs, p=self.dropout_prob, training=self.training)
-            if head_mask is not None:
-                attention_probs = attention_probs * head_mask
-
-            context_layer = torch.matmul(attention_probs, value_layer)
-            context_layer = context_layer.transpose(1, 2).contiguous()
-            context_layer = context_layer.view(batch_size, -1, self.all_head_size)
-            return context_layer, attention_probs
-
-        attention.forward = _forward_with_key_bias.__get__(attention, attention.__class__)
-
-
-def _adapt_stage2_state_dict(model: nn.Module, state_dict: dict) -> dict:
-    model_state = model.state_dict()
-    adapted = {}
-    for key, value in state_dict.items():
-        mapped_key = key
-        if key.endswith(".attention.attention.query.bias"):
-            mapped_key = key[: -len("query.bias")] + "q_bias"
-        elif key.endswith(".attention.attention.key.bias"):
-            mapped_key = key[: -len("key.bias")] + "k_bias"
-        elif key.endswith(".attention.attention.value.bias"):
-            mapped_key = key[: -len("value.bias")] + "v_bias"
-
-        if mapped_key in model_state:
-            adapted[mapped_key] = value
-        elif key in model_state:
-            adapted[key] = value
-    return adapted
-
-def _load_compatible_state_dict(model: nn.Module, state_dict: dict) -> None:
-    model_state = model.state_dict()
-    adapted_state = _adapt_stage2_state_dict(model, state_dict)
-    compatible = {
-        key: value
-        for key, value
-        in adapted_state.items()
-        if key in model_state and tuple(model_state[key].shape) == tuple(value.shape)
-    }
-
-    total_tensors = len(state_dict)
-    total_params = sum(value.numel() for value in state_dict.values() if hasattr(value, "numel"))
-    compatible_params = sum(value.numel() for value in compatible.values())
-
-    if len(compatible) != total_tensors or compatible_params != total_params:
-        missing = [key for key in model_state if key not in compatible]
-        unexpected = [key for key in state_dict if key not in _adapt_stage2_state_dict(model, {key: state_dict[key]})]
-        shape_mismatch = [
-            (key, tuple(value.shape), tuple(model_state[key].shape))
-            for key, value
-            in adapted_state.items()
-            if key in model_state and tuple(model_state[key].shape) != tuple(value.shape)
-        ]
-        raise RuntimeError(
-            "Incomplete Stage 2 VideoMAE checkpoint load: "
-            f"compatible_tensors={len(compatible)}/{total_tensors}, "
-            f"compatible_params={compatible_params}/{total_params}, "
-            f"missing={missing[:20]}, unexpected={unexpected[:20]}, "
-            f"shape_mismatch={shape_mismatch[:20]}"
-        )
-
-    model_state.update(compatible)
-    model.load_state_dict(model_state, strict=True)
 
 def _load_stage2_videomae(checkpoint_path: Path, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if "model_state_dict" not in checkpoint:
-        raise KeyError("Stage 2 checkpoint must contain 'model_state_dict'.")
-    state_dict = checkpoint["model_state_dict"]
-    num_frames = int(checkpoint.get("num_frames", 16))
-    config_dict = checkpoint.get("videomae_config", STAGE2_VIDEOMAE_CONFIG)
-    model = Stage2VideoMAE(config_dict=config_dict, num_input_frames=num_frames)
-    _patch_videomae_attention_biases(model)
-    _load_compatible_state_dict(model, state_dict)
+    if "model_config" not in checkpoint:
+        raise KeyError("Stage 2 checkpoint must contain model_config. Retrain with the current Stage 2 code.")
+    model = Stage2VideoMAE(checkpoint["model_config"])
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device).eval()
-    return model, num_frames
+    return model
+
+
+def _predict_stage2_clip(model: Stage2VideoMAE, clip: torch.Tensor, sampled_frames: np.ndarray, device: torch.device):
+    video = clip.unsqueeze(0).to(device, non_blocking=True)
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        outputs = model(video)
+    collision_idx = int(outputs["collision_logits"].argmax(dim=1).item())
+    entry_idx = int(outputs["entry_logits"].argmax(dim=1).item())
+    direction_idx = int(outputs["direction_logits"].argmax(dim=1).item())
+    avoidance_idx = int(outputs["avoidance_logits"].argmax(dim=1).item())
+    return {
+        "collision_frame": int(sampled_frames[collision_idx]),
+        "entry_frame": int(sampled_frames[entry_idx]),
+        "evasion_space": avoidance_idx,
+        "entry_side": "RIGHT" if direction_idx == 1 else "LEFT",
+    }
 
 
 def predict_stage2(data_dir, model_dir):
     device = _device()
-    checkpoint_path = _resolve_stage2_checkpoint(model_dir)
-    model, num_frames = _load_stage2_videomae(checkpoint_path, device)
+    model = _load_stage2_videomae(_resolve_stage2_checkpoint(model_dir), device)
     rows = []
     with torch.inference_mode():
         for folder in _stage2_sequence_folders(data_dir):
             paths = _stage2_image_paths(folder)
             if not paths:
                 continue
-            clip, sampled_frames = preprocess_videomae_images(paths, num_frames=num_frames, image_size=224)
-            video = clip.unsqueeze(0).to(device, non_blocking=True)
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                outputs = model(video)
-            pred_sample_idx = int(outputs["collision_logits"].argmax(dim=1).item())
-            side_idx = int(outputs["side_logits"].argmax(dim=1).item())
-            rows.append(
-                {
-                    "ID": folder.name,
-                    "collision_frame": int(sampled_frames[pred_sample_idx]),
-                    "entry_frame": int(sampled_frames[pred_sample_idx]),
-                    "evasion_space": 0,
-                    "entry_side": "RIGHT" if side_idx else "LEFT",
-                }
-            )
+            clip, sampled_frames = preprocess_videomae_images(paths, num_frames=model.num_frames, image_size=model.image_size)
+            rows.append({"ID": folder.name, **_predict_stage2_clip(model, clip, sampled_frames, device)})
     del model
     torch.cuda.empty_cache()
-    return pd.DataFrame(
-        rows,
-        columns=["ID", "collision_frame", "entry_frame", "evasion_space", "entry_side"],
-    )
-
+    if not rows:
+        raise RuntimeError(f"No Stage 2 image folders found under: {data_dir}")
+    return pd.DataFrame(rows, columns=["ID", "collision_frame", "entry_frame", "evasion_space", "entry_side"])
 # ============================================================
 # Stage 3
 # ============================================================

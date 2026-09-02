@@ -7,6 +7,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+import torch
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -45,6 +47,25 @@ def validate_inference(path: Path) -> None:
     compile(text, str(path), "exec")
 
 
+
+
+def validate_stage2_checkpoint(path: Path) -> None:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if "model_config" not in checkpoint:
+        raise RuntimeError(
+            "submission/model/stage2/best.pt is an old Stage2 checkpoint. "
+            "Retrain Stage2 so the checkpoint contains model_config and the four-head model weights."
+        )
+    state_dict = checkpoint.get("model_state_dict", {})
+    required_prefixes = (
+        "collision_head.",
+        "entry_head.",
+        "direction_head.",
+        "avoidance_head.",
+    )
+    missing = [prefix for prefix in required_prefixes if not any(key.startswith(prefix) for key in state_dict)]
+    if missing:
+        raise RuntimeError(f"Stage2 checkpoint is missing head weights: {missing}")
 def validate_inputs() -> None:
     required = [
         INFERENCE_OUT,
@@ -56,6 +77,7 @@ def validate_inputs() -> None:
     missing = [_relative(path) for path in required if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"missing submission file(s): {missing}")
+    validate_stage2_checkpoint(MODEL_DIR / "stage2" / "best.pt")
 
 
 def _iter_submission_files():

@@ -1,9 +1,10 @@
-from src.train import fit_stage1, fit_stage3 # fit_stage2
-from src.train.stage2_videomae import fit_stage2
-def main():
-    # fit_stage1(); print('Stage 1 완료')
-    fit_stage2(); print('Stage 2 완료')
-    # fit_stage3(); print('Stage 3 완료')
+from src.train import fit_stage2
 
-if __name__ == '__main__':
+
+def main():
+    fit_stage2()
+    print("Stage 2 done")
+
+
+if __name__ == "__main__":
     main()

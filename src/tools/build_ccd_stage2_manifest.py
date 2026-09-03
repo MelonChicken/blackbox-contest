@@ -25,6 +25,7 @@ VIDEO_DIR = CCD_ROOT / "videos"
 CCD_ALL_MANIFEST_PATH = CCD_STAGE2_MANIFEST / "all.csv"
 EGO_MANIFEST_PATH = CCD_STAGE2_MANIFEST / "ego_candidates.csv"
 COLLISION_CANDIDATES_PATH = CCD_STAGE2_COLLISION_CANDIDATES
+PSEUDO_LABEL_PATH = STAGE2_MANIFEST / "ccd_stage2_entry_direction_pseudo_labels.csv"
 EXPECTED_NUM_FRAMES = 50
 EXPECTED_FPS = 10.0
 MISSING_LABEL = -1
@@ -125,6 +126,9 @@ def write_ccd_manifests() -> pd.DataFrame:
 
     df.to_csv(CCD_ALL_MANIFEST_PATH, index=False)
     ego_df = df[df["ego_involved"]].copy().reset_index(drop=True)
+    ego_df["ego_source"] = "ccd_official_egoinvolve"
+    if not ego_df["ego_involved"].all():
+        raise RuntimeError("ego_candidates.csv would contain non-ego rows")
     ego_df.to_csv(EGO_MANIFEST_PATH, index=False)
     print_summary(df, ego_df)
     return ego_df
@@ -165,23 +169,38 @@ def build_stage2_manifest() -> pd.DataFrame:
     ego["video_id"] = _normalize_video_id(ego["video_id"])
     top1 = build_top1_candidates(load_collision_candidates())
     df = ego.merge(top1, on="video_id", how="left", validate="one_to_one")
-    direction = df.get("approach_side", pd.Series(index=df.index, dtype=object)).map(direction_from_candidate)
+    pseudo = pd.DataFrame(columns=["video_id"])
+    if PSEUDO_LABEL_PATH.exists():
+        pseudo = pd.read_csv(PSEUDO_LABEL_PATH, dtype={"video_id": str})
+        pseudo["video_id"] = _normalize_video_id(pseudo["video_id"])
+        df = df.merge(pseudo, on="video_id", how="left", validate="one_to_one", suffixes=("", "_pseudo"))
+
+    direction = df.get("direction", pd.Series(index=df.index, dtype=float))
+    entry_valid = df.get("entry_valid", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+    direction_valid = df.get("direction_valid", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+    fallback_direction = df.get("approach_side", pd.Series(index=df.index, dtype=object)).map(direction_from_candidate)
+    direction = direction.where(direction_valid, fallback_direction if not PSEUDO_LABEL_PATH.exists() else MISSING_LABEL)
     has_direction = direction.fillna(MISSING_LABEL).astype(int).ge(0)
     out = pd.DataFrame(
         {
             "video_id": df["video_id"],
             "video_path": df["video_path"],
             "source_id": df.get("source_id", ""),
+            "ego_involved": True,
+            "ego_source": df.get("ego_source", pd.Series("ccd_official_egoinvolve", index=df.index)),
             "collision_frame": df["accident_start_frame"].astype(int),
-            "entry_frame": MISSING_LABEL,
+            "entry_frame": df.get("entry_frame", pd.Series(MISSING_LABEL, index=df.index)).where(entry_valid, MISSING_LABEL).fillna(MISSING_LABEL).astype(int),
             "direction": direction.fillna(MISSING_LABEL).astype(int),
             "avoidance": MISSING_LABEL,
             "collision_source": "ccd_accident_start",
-            "entry_source": "missing",
-            "direction_source": has_direction.map(lambda ok: "ccd_approach_side" if ok else "missing"),
+            "entry_source": entry_valid.map(lambda ok: "ccd_yolo_track_roi_pseudo" if ok else "missing"),
+            "direction_source": has_direction.map(lambda ok: "ccd_yolo_track_direction_pseudo" if ok else "missing"),
             "avoidance_source": "missing",
             "collision_confidence": 1.0,
-            "entry_confidence": 0.0,
+            "entry_confidence": df.get("entry_confidence", pd.Series(0.0, index=df.index)).fillna(0.0),
+            "direction_confidence": df.get("direction_confidence", pd.Series(0.0, index=df.index)).fillna(0.0),
+            "overall_confidence": df.get("overall_confidence", pd.Series(0.0, index=df.index)).fillna(0.0),
+            "confidence_level": df.get("confidence_level", pd.Series("low", index=df.index)).fillna("low"),
         }
     )
     return out
@@ -215,6 +234,11 @@ def print_summary(df: pd.DataFrame, ego_df: pd.DataFrame | None = None) -> None:
     print(f"Total annotations: {len(df)}")
     print(f"Videos found: {int(df['video_exists'].sum())}/{len(df)}")
     print(f"Ego candidates: {len(ego_df) if ego_df is not None else int(df['ego_involved'].sum())}/{len(df)}")
+    official_ego = len(ego_df) if ego_df is not None else int(df["ego_involved"].sum())
+    print("=== CCD Official Ego Filter ===")
+    print(f"Total crash videos: {len(df)}")
+    print(f"Official ego-involved: {official_ego}")
+    print(f"Excluded non-ego: {len(df) - official_ego}")
     print(f"Unique source videos: {df['source_id'].nunique()}")
     print("Timing:")
     for key, value in Counter(df["timing"]).items():

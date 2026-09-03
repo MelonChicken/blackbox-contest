@@ -132,9 +132,12 @@ def _label(row: pd.Series, name: str) -> int:
 
 
 class Stage2Dataset(Dataset):
-    def __init__(self, manifest_path: str | Path, num_frames: int = 16, image_size: int = 224):
+    def __init__(self, manifest_path: str | Path, num_frames: int = 16, image_size: int = 224, min_pseudo_label_confidence: float | None = None):
         self.manifest_path = Path(manifest_path)
-        self.rows = pd.read_csv(self.manifest_path).to_dict("records")
+        df = pd.read_csv(self.manifest_path)
+        if min_pseudo_label_confidence is not None and "overall_confidence" in df.columns:
+            df = df[df["overall_confidence"].fillna(0.0).astype(float) >= float(min_pseudo_label_confidence)].reset_index(drop=True)
+        self.rows = df.to_dict("records")
         self.num_frames = num_frames
         self.image_size = image_size
 

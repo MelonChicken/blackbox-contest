@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 from typing import Any
 
@@ -29,18 +30,19 @@ IMAGE_SIZE = 224
 BATCH_SIZE = 1
 NUM_WORKERS = 2
 LR_BACKBONE = 1e-5
-LR_HEAD = 1e-4
+LR_COLLISION_HEAD = 1e-4
+LR_ENTRY_HEAD = 1e-4
+LR_DIRECTION_HEAD = 1e-4
+LR_AVOIDANCE_HEAD = 1e-4
 WEIGHT_DECAY = 0.05
 UNFREEZE_LAST_N = 2
 TASK_ORDER = ("collision", "entry", "direction", "avoidance")
 FRAME_TASKS = ("collision", "entry")
 CLASSIFICATION_TASKS = ("direction", "avoidance")
-ACTIVE_STAGE2_TASKS = ("collision", "entry")
-LOSS_WEIGHTS = {"collision": 1.0, "entry": 1.0, "direction": 1.0, "avoidance": 1.0}
-STAGE2_EXPERIMENT_NAME = "_".join(ACTIVE_STAGE2_TASKS)
-STAGE2_BEST_CHECKPOINT = STAGE2_MODEL / f"best_{STAGE2_EXPERIMENT_NAME}.pt"
-STAGE2_LAST_CHECKPOINT = STAGE2_MODEL / f"last_{STAGE2_EXPERIMENT_NAME}.pt"
-STAGE2_INIT_CHECKPOINT: str | Path | None = None
+ACTIVE_STAGE2_TASKS = ("collision", "direction")
+LOSS_WEIGHTS = {"collision": 1.0, "entry": 1.0, "direction": 1.0}
+STAGE2_INIT_CHECKPOINT: str | Path | None = STAGE2_MODEL / "archive" / "collision_only_best.pt"
+STAGE2_MIN_PSEUDO_LABEL_CONFIDENCE: float | None = None
 SELECTION_METRIC = "val_selection_metric"
 
 
@@ -50,6 +52,62 @@ def _active_tasks(tasks: tuple[str, ...] | list[str] | None = None) -> tuple[str
     if unknown:
         raise ValueError(f"Unknown Stage2 task(s): {unknown}")
     return selected
+
+
+def _experiment_name(tasks: tuple[str, ...] | list[str] | None = None) -> str:
+    return "_".join(_active_tasks(tasks))
+
+
+def _checkpoint_path(kind: str, tasks: tuple[str, ...] | list[str] | None = None) -> Path:
+    return STAGE2_MODEL / f"{kind}_{_experiment_name(tasks)}.pt"
+
+
+STAGE2_EXPERIMENT_NAME = _experiment_name()
+STAGE2_BEST_CHECKPOINT = _checkpoint_path("best")
+STAGE2_LAST_CHECKPOINT = _checkpoint_path("last")
+
+
+def _target_name(task: str) -> str:
+    return f"{task}_index" if task in FRAME_TASKS else task
+
+
+def _valid_target(target: torch.Tensor) -> torch.Tensor:
+    return target.ne(MISSING_LABEL)
+
+
+def split_supervision_counts(manifest_path: str | Path) -> dict[str, Any]:
+    df = pd.read_csv(manifest_path)
+    entry = df.get("entry_frame", pd.Series(MISSING_LABEL, index=df.index)).fillna(MISSING_LABEL).astype(int).ge(0)
+    direction = df.get("direction", pd.Series(MISSING_LABEL, index=df.index)).fillna(MISSING_LABEL).astype(int).ge(0)
+    direction_values = df.loc[direction, "direction"].astype(int) if "direction" in df else pd.Series(dtype=int)
+    return {
+        "rows": int(len(df)),
+        "collision": int(len(df)),
+        "entry": int(entry.sum()),
+        "direction": int(direction.sum()),
+        "left": int((direction_values == 0).sum()),
+        "right": int((direction_values == 1).sum()),
+    }
+
+
+def print_stage2_task_summary(
+    train_manifest: str | Path = STAGE2_TRAIN_MANIFEST,
+    val_manifest: str | Path = STAGE2_VAL_MANIFEST,
+    active_tasks: tuple[str, ...] | list[str] | None = None,
+) -> None:
+    tasks = _active_tasks(active_tasks)
+    print("=== Stage2 Tasks ===")
+    for task in TASK_ORDER:
+        print(f"{task}: {'ON' if task in tasks else 'OFF'}")
+    print("=== Stage2 Split Supervision ===")
+    for name, path in (("Train", train_manifest), ("Val", val_manifest)):
+        counts = split_supervision_counts(path)
+        print(f"{name}:")
+        print(f"  rows: {counts['rows']}")
+        print(f"  entry valid: {counts['entry']}")
+        print(f"  direction valid: {counts['direction']}")
+        print(f"  LEFT: {counts['left']}")
+        print(f"  RIGHT: {counts['right']}")
 
 
 def _frame_count(path: str | Path) -> int:
@@ -84,7 +142,7 @@ def _frame_metrics(pred_frames: list[int], target_frames: list[int]) -> dict[str
 
 def _classification_metrics(pred: list[int], target: list[int], num_classes: int = 2) -> dict[str, Any]:
     if not target:
-        return {"accuracy": float("nan"), "macro_f1": float("nan"), "confusion_matrix": []}
+        return {"accuracy": float("nan"), "macro_f1": float("nan"), "confusion_matrix": [], "left_recall": float("nan"), "right_recall": float("nan")}
     pred_arr = np.asarray(pred, dtype=np.int64)
     target_arr = np.asarray(target, dtype=np.int64)
     matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
@@ -98,11 +156,15 @@ def _classification_metrics(pred: list[int], target: list[int], num_classes: int
         fn = matrix[cls, :].sum() - tp
         denom = (2 * tp) + fp + fn
         f1_scores.append(float((2 * tp) / denom) if denom else 0.0)
-    return {
+    metrics = {
         "accuracy": float((pred_arr == target_arr).mean()),
         "macro_f1": float(np.mean(f1_scores)),
         "confusion_matrix": matrix.tolist(),
     }
+    if num_classes == 2:
+        metrics["left_recall"] = float(matrix[0, 0] / matrix[0, :].sum()) if matrix[0, :].sum() else float("nan")
+        metrics["right_recall"] = float(matrix[1, 1] / matrix[1, :].sum()) if matrix[1, :].sum() else float("nan")
+    return metrics
 
 
 def _trivial_baseline_for_task(task: str, train: pd.DataFrame, val: pd.DataFrame) -> dict[str, dict[str, float]]:
@@ -168,30 +230,56 @@ def compute_trivial_baselines(
 
 
 def build_loaders(train_manifest: str | Path = STAGE2_TRAIN_MANIFEST, val_manifest: str | Path | None = STAGE2_VAL_MANIFEST) -> tuple[DataLoader, DataLoader | None]:
-    train_dataset = Stage2Dataset(train_manifest, num_frames=NUM_FRAMES, image_size=IMAGE_SIZE)
+    train_dataset = Stage2Dataset(train_manifest, num_frames=NUM_FRAMES, image_size=IMAGE_SIZE, min_pseudo_label_confidence=STAGE2_MIN_PSEUDO_LABEL_CONFIDENCE)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
     val_loader = None
     if val_manifest is not None and Path(val_manifest).exists():
-        val_dataset = Stage2Dataset(val_manifest, num_frames=NUM_FRAMES, image_size=IMAGE_SIZE)
+        val_dataset = Stage2Dataset(val_manifest, num_frames=NUM_FRAMES, image_size=IMAGE_SIZE, min_pseudo_label_confidence=STAGE2_MIN_PSEUDO_LABEL_CONFIDENCE)
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
     return train_loader, val_loader
 
 
 def build_optimizer(model: Stage2VideoMAE) -> torch.optim.Optimizer:
-    backbone_parameters = []
-    head_parameters = []
+    groups_by_name: dict[str, list[torch.nn.Parameter]] = {
+        "backbone": [],
+        "collision_head": [],
+        "entry_head": [],
+        "direction_head": [],
+        "avoidance_head": [],
+        "other_heads": [],
+    }
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
         if name.startswith("backbone."):
-            backbone_parameters.append(parameter)
+            groups_by_name["backbone"].append(parameter)
+        elif name.startswith("collision_head."):
+            groups_by_name["collision_head"].append(parameter)
+        elif name.startswith("entry_head."):
+            groups_by_name["entry_head"].append(parameter)
+        elif name.startswith("direction_head."):
+            groups_by_name["direction_head"].append(parameter)
+        elif name.startswith("avoidance_head."):
+            groups_by_name["avoidance_head"].append(parameter)
         else:
-            head_parameters.append(parameter)
-    groups: list[dict[str, Any]] = []
-    if backbone_parameters:
-        groups.append({"params": backbone_parameters, "lr": LR_BACKBONE})
-    if head_parameters:
-        groups.append({"params": head_parameters, "lr": LR_HEAD})
+            groups_by_name["other_heads"].append(parameter)
+
+    lr_by_name = {
+        "backbone": LR_BACKBONE,
+        "collision_head": LR_COLLISION_HEAD,
+        "entry_head": LR_ENTRY_HEAD,
+        "direction_head": LR_DIRECTION_HEAD,
+        "avoidance_head": LR_AVOIDANCE_HEAD,
+        "other_heads": LR_COLLISION_HEAD,
+    }
+    groups = [
+        {"params": params, "lr": lr_by_name[name], "name": name}
+        for name, params in groups_by_name.items()
+        if params
+    ]
+    print("[Stage 2] optimizer parameter groups:")
+    for group in groups:
+        print(f"  {group['name']}: lr={group['lr']} tensors={len(group['params'])}")
     return torch.optim.AdamW(groups, weight_decay=WEIGHT_DECAY)
 
 
@@ -210,10 +298,13 @@ def compute_stage2_loss(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     weights = loss_weights or LOSS_WEIGHTS
     losses = {}
+    counts = {}
     for task in _active_tasks(active_tasks):
         logits = outputs[f"{task}_logits"]
-        target_name = f"{task}_index" if task in FRAME_TASKS else task
-        losses[task] = _masked_cross_entropy(logits, batch[target_name].to(logits.device))
+        target = batch[_target_name(task)].to(logits.device)
+        valid = _valid_target(target)
+        counts[task] = int(valid.sum().detach().cpu())
+        losses[task] = _masked_cross_entropy(logits, target)
 
     total = None
     for task, loss in losses.items():
@@ -223,6 +314,7 @@ def compute_stage2_loss(
         total = outputs["collision_logits"].sum() * 0.0
 
     metrics = {f"{task}_loss": float(loss.detach().cpu()) for task, loss in losses.items()}
+    metrics.update({f"{task}_supervised_count": float(count) for task, count in counts.items()})
     metrics["total_loss"] = float(total.detach().cpu())
     return total, metrics
 
@@ -249,7 +341,11 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
         rows.append(metrics)
-    return _mean_metrics(rows)
+    summary = _mean_metrics(rows)
+    for task in _active_tasks(active_tasks):
+        key = f"{task}_supervised_count"
+        summary[key] = float(sum(row.get(key, 0.0) for row in rows))
+    return summary
 
 
 @torch.inference_mode()
@@ -291,6 +387,9 @@ def evaluate(
                 rows["target"].append(int(y))
 
     metrics = {f"val_{key}": value for key, value in _mean_metrics(loss_rows).items()}
+    for task in tasks:
+        key = f"{task}_supervised_count"
+        metrics[f"val_{key}"] = float(sum(row.get(key, 0.0) for row in loss_rows))
     for task, rows in frame_rows.items():
         for name, value in _frame_metrics(rows["pred"], rows["target"]).items():
             metrics[f"val_{task}_{name}"] = value
@@ -307,13 +406,21 @@ def evaluate(
 
 
 def selection_metric(metrics: dict[str, Any], active_tasks: tuple[str, ...] | list[str] | None = None) -> float:
+    tasks = _active_tasks(active_tasks)
+    collision_mae = metrics.get("val_collision_mean_abs_original_frame_error")
+    if collision_mae is not None and (tasks == ("collision",) or tasks == ("collision", "direction")):
+        return float(collision_mae)
+
     values = []
-    for task in _active_tasks(active_tasks):
+    for task in tasks:
         if task in FRAME_TASKS:
-            values.append(float(metrics[f"val_{task}_mean_abs_original_frame_error"]))
+            value = float(metrics[f"val_{task}_mean_abs_original_frame_error"])
+            if not np.isnan(value):
+                values.append(value)
         elif task in CLASSIFICATION_TASKS:
             accuracy = float(metrics[f"val_{task}_accuracy"])
-            values.append(1.0 - accuracy)
+            if not np.isnan(accuracy):
+                values.append(1.0 - accuracy)
     return float(np.sum(values)) if values else float("inf")
 
 
@@ -332,7 +439,11 @@ def _checkpoint_payload(
         "epoch": int(epoch),
         "val_frame_mae": metrics.get("val_collision_mean_abs_original_frame_error"),
         "active_tasks": list(active_tasks),
+        "active_stage2_tasks": list(active_tasks),
         "loss_weights": dict(loss_weights),
+        "val_collision_metrics": {key: value for key, value in metrics.items() if key.startswith("val_collision_")},
+        "val_entry_metrics": {key: value for key, value in metrics.items() if key.startswith("val_entry_")},
+        "val_direction_metrics": {key: value for key, value in metrics.items() if key.startswith("val_direction_")},
         "selection_metric_name": SELECTION_METRIC,
         "selection_metric": metrics.get(SELECTION_METRIC),
         "metrics": metrics,
@@ -370,7 +481,11 @@ def _mapped_init_state_dict(model: Stage2VideoMAE, checkpoint: dict[str, Any]) -
     target = model.state_dict()
     mapped = {}
     skipped = []
+    allowed_prefixes = ("backbone.", "encoder.", "collision_head.")
     for key, value in source.items():
+        if not key.startswith(allowed_prefixes):
+            skipped.append(key)
+            continue
         candidates = [key]
         if key.startswith("encoder."):
             candidates.append("backbone." + key.removeprefix("encoder."))
@@ -394,8 +509,13 @@ def init_stage2_from_checkpoint(model: Stage2VideoMAE, checkpoint_path: str | Pa
     unexpected_missing = sorted(set(result.missing_keys) - expected_missing)
     if unexpected_missing:
         raise RuntimeError(f"Unexpected missing keys when initializing Stage2 from {checkpoint_path}: {unexpected_missing}")
+    loaded_backbone = sum(key.startswith("backbone.") for key in mapped)
+    loaded_collision = sum(key.startswith("collision_head.") for key in mapped)
     print(f"[Stage 2] init_checkpoint={checkpoint_path}")
-    print(f"[Stage 2] loaded_init_tensors={len(mapped)} skipped_init_tensors={len(skipped)}")
+    print(f"[Stage 2] Loaded backbone tensors: {loaded_backbone}")
+    print(f"[Stage 2] Loaded collision head tensors: {loaded_collision}")
+    print("[Stage 2] Random/new: entry head, direction head")
+    print(f"[Stage 2] Skipped legacy tensors: {len(skipped)}")
     print(f"[Stage 2] missing_after_init={list(result.missing_keys)}")
     print(f"[Stage 2] skipped_init_keys={skipped[:20]}{' ...' if len(skipped) > 20 else ''}")
 
@@ -415,6 +535,12 @@ def build_training_model(init_checkpoint: str | Path | None = STAGE2_INIT_CHECKP
 
 def _print_metrics(epoch: int, train_metrics: dict[str, float], val_metrics: dict[str, Any], active_tasks: tuple[str, ...]) -> None:
     print(f"[Stage 2] Epoch {epoch}/{max(1, EPOCHS)} active_tasks={'+'.join(active_tasks)}")
+    print("Train supervised:")
+    for task in active_tasks:
+        print(f"  {task}: {int(train_metrics.get(f'{task}_supervised_count', 0))}")
+    print("Val supervised:")
+    for task in active_tasks:
+        print(f"  {task}: {int(val_metrics.get(f'val_{task}_supervised_count', 0))}")
     for key in ("total_loss", "collision_loss", "entry_loss", "direction_loss", "avoidance_loss"):
         if key in train_metrics:
             print(f"train_{key}={train_metrics[key]:.5f}")
@@ -428,16 +554,22 @@ def _print_metrics(epoch: int, train_metrics: dict[str, float], val_metrics: dic
             print(f"val_{task}_accuracy={val_metrics[f'val_{task}_accuracy']:.5f}")
             print(f"val_{task}_macro_f1={val_metrics[f'val_{task}_macro_f1']:.5f}")
             print(f"val_{task}_confusion_matrix={val_metrics[f'val_{task}_confusion_matrix']}")
+            if task == "direction":
+                print(f"val_{task}_left_recall={val_metrics[f'val_{task}_left_recall']:.5f}")
+                print(f"val_{task}_right_recall={val_metrics[f'val_{task}_right_recall']:.5f}")
     print(f"val_selection_metric={val_metrics[SELECTION_METRIC]:.5f}")
 
 
-def fit_stage2() -> None:
+def fit_stage2(active_tasks: tuple[str, ...] | list[str] | None = None) -> None:
     set_seed(SEED)
     device = torch.device(DEVICE)
-    active_tasks = _active_tasks()
-    print(f"[Stage 2] experiment={STAGE2_EXPERIMENT_NAME}")
-    print(f"[Stage 2] best_checkpoint={STAGE2_BEST_CHECKPOINT}")
-    print(f"[Stage 2] last_checkpoint={STAGE2_LAST_CHECKPOINT}")
+    active_tasks = _active_tasks(active_tasks)
+    best_checkpoint = _checkpoint_path("best", active_tasks)
+    last_checkpoint = _checkpoint_path("last", active_tasks)
+    print(f"[Stage 2] experiment={_experiment_name(active_tasks)}")
+    print(f"[Stage 2] best_checkpoint={best_checkpoint}")
+    print(f"[Stage 2] last_checkpoint={last_checkpoint}")
+    print_stage2_task_summary(active_tasks=active_tasks)
 
     baselines = compute_trivial_baselines(active_tasks=active_tasks)
     print("=== trivial baselines ===")
@@ -462,8 +594,28 @@ def fit_stage2() -> None:
         row = {"epoch": float(epoch), **{f"train_{k}": v for k, v in train_metrics.items()}, **val_metrics}
         history.append(row)
         _print_metrics(epoch, train_metrics, val_metrics, active_tasks)
-        save_stage2_checkpoint(STAGE2_LAST_CHECKPOINT, model, epoch=epoch, metrics=val_metrics, history=history, active_tasks=active_tasks)
+        save_stage2_checkpoint(last_checkpoint, model, epoch=epoch, metrics=val_metrics, history=history, active_tasks=active_tasks)
         if float(val_metrics[SELECTION_METRIC]) < best_value:
             best_value = float(val_metrics[SELECTION_METRIC])
-            save_stage2_checkpoint(STAGE2_BEST_CHECKPOINT, model, epoch=epoch, metrics=val_metrics, history=history, active_tasks=active_tasks)
-            print(f"saved best checkpoint: {STAGE2_BEST_CHECKPOINT} {SELECTION_METRIC}={best_value:.5f}")
+            save_stage2_checkpoint(best_checkpoint, model, epoch=epoch, metrics=val_metrics, history=history, active_tasks=active_tasks)
+            print(f"saved best checkpoint: {best_checkpoint} {SELECTION_METRIC}={best_value:.5f}")
+
+
+def _parse_tasks(value: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train Stage2 VideoMAE multi-task ablations.")
+    parser.add_argument("--tasks", default=",".join(ACTIVE_STAGE2_TASKS), help="Comma-separated tasks, e.g. collision,direction")
+    parser.add_argument("--print-split", action="store_true", help="Only print Stage2 task/split supervision counts.")
+    args = parser.parse_args()
+    tasks = _parse_tasks(args.tasks)
+    if args.print_split:
+        print_stage2_task_summary(active_tasks=tasks)
+        return
+    fit_stage2(active_tasks=tasks)
+
+
+if __name__ == "__main__":
+    main()

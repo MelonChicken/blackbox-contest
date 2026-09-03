@@ -2,12 +2,12 @@
 
 Expected local raw layout:
 
-- `/data/raw/comma2k19/Chunk_*/*/video.hevc`
-- `/data/raw/comma2k19/Chunk_*/*/processed_log/CAN/speed/{t,value}` or `car_speed/{t,value}`
-- `/data/raw/comma2k19/Chunk_*/*/processed_log/CAN/steering_angle/{t,value}`
-- `/data/raw/comma2k19/Chunk_*/*/global_pose/frame_times`
+- `/data/raw/comma2k19/Chunk_*/*/*/video.hevc`
+- `/data/raw/comma2k19/Chunk_*/*/*/processed_log/CAN/speed/{t,value}` or `car_speed/{t,value}`
+- `/data/raw/comma2k19/Chunk_*/*/*/processed_log/CAN/steering_angle/{t,value}`
+- `/data/raw/comma2k19/Chunk_*/*/*/global_pose/frame_times`
 
-Each directory matched by `Chunk_*/*` is treated as one driving segment. Missing video/state files produce a warning and the segment is skipped.
+Each directory matched by `Chunk_*/*/*` is treated as one driving segment. Missing video/state files produce a warning and the segment is skipped.
 
 HuggingFace path is also supported:
 

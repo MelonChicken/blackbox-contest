@@ -5,6 +5,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import cv2
 import pandas as pd
 import torch
@@ -14,7 +18,7 @@ from transformers import VideoMAEConfig
 from src.datasets.stage2_dataset import Stage2Dataset
 from src.inference.stage2 import run_stage2_clip
 from src.models.stage2_videomae import Stage2VideoMAE
-from src.train.stage2 import compute_stage2_loss, save_stage2_checkpoint
+from src.train.stage2 import compute_stage2_loss, evaluate, save_stage2_checkpoint
 
 
 def _write_video(path: Path, frames: int = 18) -> None:
@@ -108,11 +112,21 @@ def main() -> None:
         assert outputs["direction_logits"].shape[0] == 2
         assert outputs["avoidance_logits"].shape[0] == 2
 
-        loss, metrics = compute_stage2_loss(outputs, batch)
+        loss, metrics = compute_stage2_loss(outputs, batch, active_tasks=("collision", "entry"))
         loss.backward()
+        assert model.collision_head.weight.grad is not None
+        assert model.entry_head.weight.grad is not None
+        inactive_loss, inactive_metrics = compute_stage2_loss(outputs, batch, active_tasks=("collision",))
+        assert "entry_loss" not in inactive_metrics
+        assert float(inactive_loss.detach()) != float(loss.detach())
 
-        ckpt = root / "best.pt"
-        save_stage2_checkpoint(ckpt, model, epoch=1, val_loss=float(loss.detach()))
+        val_metrics = evaluate(model, loader, torch.device("cpu"), active_tasks=("collision", "entry"))
+        assert "val_collision_mean_abs_original_frame_error" in val_metrics
+        assert "val_entry_mean_abs_original_frame_error" in val_metrics
+        assert "val_selection_metric" in val_metrics
+
+        ckpt = root / "best_collision_entry.pt"
+        save_stage2_checkpoint(ckpt, model, epoch=1, metrics=val_metrics, history=[], active_tasks=("collision", "entry"))
         code = (
             "import torch, sys; "
             "from src.train.stage2 import load_stage2_checkpoint; "
@@ -129,6 +143,7 @@ def main() -> None:
         print("Stage2 smoke passed")
         print(f"loss={float(loss.detach()):.6f}")
         print(metrics)
+        print(val_metrics)
         print(result)
 
 

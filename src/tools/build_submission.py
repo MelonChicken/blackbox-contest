@@ -51,18 +51,13 @@ def validate_inference(path: Path) -> None:
 
 def validate_stage2_checkpoint(path: Path) -> None:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if "model_config" not in checkpoint:
-        raise RuntimeError(
-            "submission/model/stage2/best.pt is an old Stage2 checkpoint. "
-            "Retrain Stage2 so the checkpoint contains model_config and the four-head model weights."
-        )
     state_dict = checkpoint.get("model_state_dict", {})
-    required_prefixes = (
-        "collision_head.",
-        "entry_head.",
-        "direction_head.",
-        "avoidance_head.",
-    )
+    if "model_config" in checkpoint:
+        required_prefixes = ("collision_head.", "entry_head.", "direction_head.", "avoidance_head.")
+    elif "videomae_config" in checkpoint:
+        required_prefixes = ("encoder.", "collision_head.", "side_head.")
+    else:
+        raise RuntimeError("Stage2 checkpoint contains neither model_config nor videomae_config.")
     missing = [prefix for prefix in required_prefixes if not any(key.startswith(prefix) for key in state_dict)]
     if missing:
         raise RuntimeError(f"Stage2 checkpoint is missing head weights: {missing}")

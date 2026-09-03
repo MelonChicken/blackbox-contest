@@ -27,7 +27,7 @@ model/
 *.pth
 test.*
 
-submission/
+submission/model/
 # Outputs
 outputs/
 runs/

@@ -733,6 +733,52 @@ class Stage2VideoMAE(nn.Module):
         }
 
 
+class LegacyStage2VideoMAE(nn.Module):
+    def __init__(self, model_config: dict):
+        super().__init__()
+        hf_config = model_config["hf_config"]
+        self.encoder = VideoMAEModel(VideoMAEConfig.from_dict(hf_config))
+        config = self.encoder.config
+        self.hidden_size = int(config.hidden_size)
+        self.patch_size = int(config.patch_size)
+        self.tubelet_size = int(config.tubelet_size)
+        self.image_size = int(config.image_size)
+        self.num_frames = int(model_config.get("num_frames", 16))
+        spatial_size = self.image_size // self.patch_size
+        self.num_spatial_tokens = spatial_size * spatial_size
+        self.num_temporal_tokens = self.num_frames // self.tubelet_size
+        self.temporal_norm = nn.LayerNorm(self.hidden_size)
+        self.collision_head = nn.Sequential(nn.Dropout(0.2), nn.Linear(self.hidden_size, 1))
+        self.side_head = nn.Sequential(nn.LayerNorm(self.hidden_size), nn.Dropout(0.2), nn.Linear(self.hidden_size, 2))
+
+    def forward(self, video: torch.Tensor) -> dict:
+        outputs = self.encoder(pixel_values=video)
+        batch_size = outputs.last_hidden_state.shape[0]
+        temporal = outputs.last_hidden_state.reshape(
+            batch_size, self.num_temporal_tokens, self.num_spatial_tokens, self.hidden_size
+        ).mean(dim=2)
+        temporal = self.temporal_norm(temporal)
+        collision_logits = self.collision_head(temporal).squeeze(-1)
+        collision_logits = F.interpolate(
+            collision_logits.unsqueeze(1), size=self.num_frames, mode="linear", align_corners=False
+        ).squeeze(1)
+        return {"collision_logits": collision_logits, "side_logits": self.side_head(temporal.mean(dim=1))}
+
+
+def _stage2_model_config_from_checkpoint(checkpoint: dict):
+    config = checkpoint.get("model_config")
+    if config is not None:
+        return config
+    config = checkpoint.get("videomae_config")
+    if config is None:
+        raise KeyError("Stage2 checkpoint contains neither 'model_config' nor 'videomae_config'.")
+    return {
+        "num_frames": checkpoint.get("num_frames", config.get("num_frames", 16)),
+        "image_size": config.get("image_size", 224),
+        "hf_config": config,
+    }
+
+
 def _frame_number(path: Path):
     match = re.search(r"(\d+)$", path.stem)
     return int(match.group(1)) if match else 0
@@ -801,10 +847,10 @@ def _resolve_stage2_checkpoint(model_dir) -> Path:
 
 def _load_stage2_videomae(checkpoint_path: Path, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if "model_config" not in checkpoint:
-        raise KeyError("Stage 2 checkpoint must contain model_config. Retrain with the current Stage 2 code.")
-    model = Stage2VideoMAE(checkpoint["model_config"])
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    state_dict = checkpoint["model_state_dict"]
+    config = _stage2_model_config_from_checkpoint(checkpoint)
+    model = LegacyStage2VideoMAE(config) if any(key.startswith("encoder.") for key in state_dict) else Stage2VideoMAE(config)
+    model.load_state_dict(state_dict, strict=True)
     model.to(device).eval()
     return model
 
@@ -814,9 +860,10 @@ def _predict_stage2_clip(model: Stage2VideoMAE, clip: torch.Tensor, sampled_fram
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         outputs = model(video)
     collision_idx = int(outputs["collision_logits"].argmax(dim=1).item())
-    entry_idx = int(outputs["entry_logits"].argmax(dim=1).item())
-    direction_idx = int(outputs["direction_logits"].argmax(dim=1).item())
-    avoidance_idx = int(outputs["avoidance_logits"].argmax(dim=1).item())
+    entry_idx = int(outputs.get("entry_logits", outputs["collision_logits"]).argmax(dim=1).item())
+    side_logits = outputs.get("direction_logits", outputs.get("side_logits"))
+    direction_idx = int(side_logits.argmax(dim=1).item())
+    avoidance_idx = int(outputs.get("avoidance_logits", torch.zeros(1, 1, device=side_logits.device)).argmax(dim=1).item())
     return {
         "collision_frame": int(sampled_frames[collision_idx]),
         "entry_frame": int(sampled_frames[entry_idx]),

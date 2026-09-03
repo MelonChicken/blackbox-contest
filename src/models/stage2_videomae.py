@@ -39,6 +39,20 @@ def default_hf_config(num_frames: int = 16, image_size: int = 224) -> dict[str, 
     }
 
 
+def stage2_config_from_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    config = checkpoint.get("model_config")
+    if config is not None:
+        return config
+    config = checkpoint.get("videomae_config")
+    if config is None:
+        raise KeyError("Stage2 checkpoint contains neither 'model_config' nor 'videomae_config'.")
+    return {
+        "num_frames": checkpoint.get("num_frames", config.get("num_frames", 16)),
+        "image_size": config.get("image_size", 224),
+        "hf_config": config,
+    }
+
+
 class Stage2VideoMAE(nn.Module):
     def __init__(
         self,
@@ -89,6 +103,8 @@ class Stage2VideoMAE(nn.Module):
 
     @classmethod
     def from_config(cls, config: dict[str, Any], use_pretrained: bool = False) -> "Stage2VideoMAE":
+        if "hf_config" not in config and config.get("model_type") == "videomae":
+            config = {"num_frames": config.get("num_frames", 16), "image_size": config.get("image_size", 224), "hf_config": config}
         merged = deepcopy(DEFAULT_STAGE2_CONFIG)
         merged.update(config)
         return cls(
@@ -147,6 +163,54 @@ class Stage2VideoMAE(nn.Module):
             "direction_logits": self.direction_head(global_feature),
             "avoidance_logits": self.avoidance_head(global_feature),
         }
+
+
+class LegacyStage2VideoMAE(nn.Module):
+    def __init__(self, hf_config: dict[str, Any], num_frames: int = 16, dropout: float = 0.2):
+        super().__init__()
+        self.encoder = VideoMAEModel(VideoMAEConfig.from_dict(hf_config))
+        config = self.encoder.config
+        self.hidden_size = int(config.hidden_size)
+        self.patch_size = int(config.patch_size)
+        self.tubelet_size = int(config.tubelet_size)
+        self.image_size = int(config.image_size)
+        self.num_frames = int(num_frames)
+        self.num_input_frames = self.num_frames
+        spatial_size = self.image_size // self.patch_size
+        self.num_spatial_tokens = spatial_size * spatial_size
+        self.num_temporal_tokens = self.num_frames // self.tubelet_size
+        self.temporal_norm = nn.LayerNorm(self.hidden_size)
+        self.collision_head = nn.Sequential(nn.Dropout(dropout), nn.Linear(self.hidden_size, 1))
+        self.side_head = nn.Sequential(nn.LayerNorm(self.hidden_size), nn.Dropout(dropout), nn.Linear(self.hidden_size, 2))
+
+    def _temporal_features(self, hidden: torch.Tensor) -> torch.Tensor:
+        batch_size = hidden.shape[0]
+        expected_tokens = self.num_temporal_tokens * self.num_spatial_tokens
+        if hidden.shape[1] != expected_tokens:
+            raise RuntimeError(f"Unexpected VideoMAE token count: got={hidden.shape[1]}, expected={expected_tokens}")
+        hidden = hidden.reshape(batch_size, self.num_temporal_tokens, self.num_spatial_tokens, self.hidden_size)
+        return hidden.mean(dim=2)
+
+    def forward(self, pixel_values: torch.Tensor) -> dict[str, torch.Tensor]:
+        outputs = self.encoder(pixel_values=pixel_values)
+        temporal = self.temporal_norm(self._temporal_features(outputs.last_hidden_state))
+        collision_logits = self.collision_head(temporal).squeeze(-1)
+        collision_logits = F.interpolate(
+            collision_logits.unsqueeze(1), size=self.num_frames, mode="linear", align_corners=False
+        ).squeeze(1)
+        return {
+            "collision_logits": collision_logits,
+            "side_logits": self.side_head(temporal.mean(dim=1)),
+            "temporal_features": temporal,
+        }
+
+
+def build_stage2_from_checkpoint(checkpoint: dict[str, Any]) -> nn.Module:
+    config = stage2_config_from_checkpoint(checkpoint)
+    state_dict = checkpoint["model_state_dict"]
+    if any(key.startswith("encoder.") for key in state_dict):
+        return LegacyStage2VideoMAE(config["hf_config"], num_frames=config.get("num_frames", 16))
+    return Stage2VideoMAE.from_config(config, use_pretrained=False)
 
 
 def build_stage2_model(config: dict[str, Any] | None = None, use_pretrained: bool = False) -> Stage2VideoMAE:

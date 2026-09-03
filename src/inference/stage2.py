@@ -8,7 +8,7 @@ import torch
 from src.config import STAGE2_CHECKPOINT, STAGE2_MODEL
 from src.datasets.stage2_dataset import image_paths, preprocess_image_sequence, preprocess_video
 from src.inference.stage1 import _video_paths
-from src.models.stage2_videomae import Stage2VideoMAE
+from src.models.stage2_videomae import Stage2VideoMAE, build_stage2_from_checkpoint
 
 
 OUTPUT_COLUMNS = ["ID", "collision_frame", "entry_frame", "evasion_space", "entry_side"]
@@ -44,9 +44,7 @@ def _resolve_checkpoint_path(model_dir: str | Path | None = None) -> Path:
 
 def load_stage2_model(checkpoint_path: str | Path, device: torch.device | None = None) -> Stage2VideoMAE:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if "model_config" not in checkpoint:
-        raise KeyError("Stage2 checkpoint must contain model_config. Retrain Stage2 with src.train.stage2.fit_stage2().")
-    model = Stage2VideoMAE.from_config(checkpoint["model_config"], use_pretrained=False)
+    model = build_stage2_from_checkpoint(checkpoint)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device or _device()).eval()
     return model
@@ -61,9 +59,10 @@ def run_stage2_clip(
 ) -> dict[str, int | str]:
     outputs = model(clip.unsqueeze(0).to(device, non_blocking=True))
     collision_idx = int(outputs["collision_logits"].argmax(dim=1).item())
-    entry_idx = int(outputs["entry_logits"].argmax(dim=1).item())
-    direction_idx = int(outputs["direction_logits"].argmax(dim=1).item())
-    avoidance_idx = int(outputs["avoidance_logits"].argmax(dim=1).item())
+    entry_idx = int(outputs.get("entry_logits", outputs["collision_logits"]).argmax(dim=1).item())
+    side_logits = outputs.get("direction_logits", outputs.get("side_logits"))
+    direction_idx = int(side_logits.argmax(dim=1).item())
+    avoidance_idx = int(outputs.get("avoidance_logits", torch.zeros(1, 1, device=side_logits.device)).argmax(dim=1).item())
     return {
         "collision_frame": int(sampled_frames[collision_idx]),
         "entry_frame": int(sampled_frames[entry_idx]),

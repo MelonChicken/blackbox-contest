@@ -128,7 +128,13 @@ def _rows(video_path: str, frame_t, speed_t, speed_v, steer_t, steer_v, invert_s
 
 def _segment_dirs(raw_root: Path) -> list[Path]:
     chunks = sorted(p for p in raw_root.glob("Chunk_*") if p.is_dir())
-    return [p for chunk in chunks for p in sorted(chunk.iterdir()) if p.is_dir()]
+    segments = []
+    for chunk in chunks:
+        for route in sorted(p for p in chunk.iterdir() if p.is_dir()):
+            for segment in sorted(p for p in route.iterdir() if p.is_dir()):
+                if (segment / "video.hevc").is_file():
+                    segments.append(segment)
+    return segments
 
 
 def _local_rows(segment: Path, raw_root: Path, invert_steering: bool) -> list[dict]:
@@ -137,7 +143,13 @@ def _local_rows(segment: Path, raw_root: Path, invert_steering: bool) -> list[di
     speed_t, speed_v = _series(segment, "speed")
     steer_t, steer_v = _series(segment, "steering_angle")
     rel_video = video.relative_to(raw_root) if video.is_relative_to(raw_root) else video
-    return _rows(str(rel_video), frame_t, speed_t, speed_v, steer_t, steer_v, invert_steering)
+    rows = _rows(str(rel_video), frame_t, speed_t, speed_v, steer_t, steer_v, invert_steering)
+    route_id = segment.parent.name
+    segment_id = segment.name
+    for row in rows:
+        row["route_id"] = route_id
+        row["segment_id"] = segment_id
+    return rows
 
 
 def _hf_video_path(row: dict, video_dir: Path) -> str:
@@ -183,17 +195,20 @@ def _hf_rows(split: str, limit: int | None, video_dir: Path, invert_steering: bo
 def _write_splits(df: pd.DataFrame, out_dir: Path, val_ratio: float) -> tuple[Path, Path]:
     if df.empty:
         raise RuntimeError("no valid comma2k19 samples were produced")
-    segment_key = df.video_path.astype(str)
-    segments = sorted(segment_key.unique())
-    val_count = max(1, int(round(len(segments) * val_ratio))) if val_ratio > 0 and len(segments) > 1 else 0
-    val_segments = set(segments[-val_count:]) if val_count else set()
-    df["split"] = np.where(segment_key.isin(val_segments), "val", "train")
+
+    split_key = df["route_id"].astype(str) if "route_id" in df.columns else df.video_path.astype(str)
+    routes = sorted(split_key.unique())
+    val_count = max(1, int(round(len(routes) * val_ratio))) if val_ratio > 0 and len(routes) > 1 else 0
+    val_routes = set(routes[-val_count:]) if val_count else set()
+    df["split"] = np.where(split_key.isin(val_routes), "val", "train")
+
     out_dir.mkdir(parents=True, exist_ok=True)
     train_path, val_path = out_dir / "train.csv", out_dir / "val.csv"
     df[df.split == "train"].to_csv(train_path, index=False)
     df[df.split == "val"].to_csv(val_path, index=False)
     for split, part in df.groupby("split"):
         print(f"{split}: {len(part)} samples")
+        print(f"{split} routes: {part.route_id.nunique() if 'route_id' in part.columns else 'N/A'}")
         print("accel:", {ACCEL_NAMES[k]: int(v) for k, v in part.accel_label.value_counts().sort_index().items()})
         print("steer:", {STEER_NAMES[k]: int(v) for k, v in part.steer_label.value_counts().sort_index().items()})
     return train_path, val_path

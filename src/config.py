@@ -100,6 +100,9 @@ STAGE3_STOP_SPEED_THRESHOLD = 0.5
 STAGE3_STEER_THRESHOLD = 3.0
 STAGE3_LOSS_WEIGHTS = {"accel": 1.0, "steer": 1.0}
 STAGE3_CLASS_WEIGHTS = {"accel": None, "steer": None}
+STAGE3_TRAIN_TEMPORAL_STRIDE = 5
+STAGE3_VAL_TEMPORAL_STRIDE = 5
+STAGE3_NUM_WORKERS = 4
 
 S1_MEAN = torch.tensor([0.45, 0.45, 0.45])[:, None, None, None]
 S1_STD = torch.tensor([0.225, 0.225, 0.225])[:, None, None, None]

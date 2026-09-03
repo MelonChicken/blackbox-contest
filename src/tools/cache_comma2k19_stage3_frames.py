@@ -31,14 +31,14 @@ def _video_path(raw_root: Path, value: str) -> Path:
     return path if path.is_absolute() else raw_root / path
 
 
-def _clip_indices(center: int, total: int, frames: int = STAGE3_NUM_FRAMES) -> np.ndarray:
-    return np.clip(int(center) - frames // 2 + np.arange(frames), 0, total - 1).astype(int)
+def _clip_indices(center: int, frames: int = STAGE3_NUM_FRAMES) -> np.ndarray:
+    return np.maximum(int(center) - frames // 2 + np.arange(frames), 0).astype(int)
 
 
-def _needed_frames(df: pd.DataFrame, frame_count: int) -> np.ndarray:
+def _needed_frames(df: pd.DataFrame) -> np.ndarray:
     needed = set()
     for frame_index in df.frame_index.astype(int):
-        needed.update(_clip_indices(frame_index, frame_count).tolist())
+        needed.update(_clip_indices(frame_index).tolist())
     return np.asarray(sorted(needed), dtype=np.int64)
 
 
@@ -58,27 +58,27 @@ def cache_segment(group: pd.DataFrame, raw_root: Path, cache_root: Path, jpeg_qu
     video = _video_path(raw_root, str(group.iloc[0].video_path))
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
-        raise ValueError(f"cannot open video: {video}")
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if frame_count <= 0:
-        cap.release()
-        raise ValueError(f"invalid frame count: {video}")
+        raise RuntimeError(f"cannot open video: {video}")
 
-    needed = _needed_frames(group, frame_count)
-    need_set = set(needed.tolist())
+    reported_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    needed = _needed_frames(group)
+    required_set = set(needed.tolist())
+    max_required = int(needed[-1])
     out_dir = _cache_dir(cache_root, group, video)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows = []
     ts = dict(zip(needed.tolist(), _timestamps(group, needed).tolist()))
     saved = 0
+    decoded = 0
     idx = 0
     try:
-        while True:
+        while idx <= max_required:
             ok, frame = cap.read()
             if not ok:
                 break
-            if idx in need_set:
+            decoded += 1
+            if idx in required_set:
                 name = f"{idx:06d}.jpg"
                 ok = cv2.imwrite(str(out_dir / name), frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
                 if not ok:
@@ -89,7 +89,16 @@ def cache_segment(group: pd.DataFrame, raw_root: Path, cache_root: Path, jpeg_qu
     finally:
         cap.release()
 
+    missing = sorted(required_set - {int(row["original_frame_index"]) for row in rows})
+    if saved == 0:
+        raise RuntimeError(f"no required frames decoded from {video}")
     pd.DataFrame(rows).to_csv(out_dir / "frames.csv", index=False)
+    print(
+        f"segment_cache_stats required={len(needed)} decoded={decoded} saved={saved} "
+        f"missing={len(missing)} reported_frame_count={reported_count}"
+    )
+    if missing:
+        print(f"missing_required_frame_indices={missing[:20]}{'...' if len(missing) > 20 else ''}")
     return saved, out_dir
 
 

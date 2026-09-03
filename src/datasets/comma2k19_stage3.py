@@ -104,8 +104,14 @@ class Comma2k19Stage3Dataset(Dataset):
         video_path = self._video_path(str(row.video_path))
         frame_index = int(row.frame_index)
         cache_dir = self._cache_dir(row)
+        try:
+            video = stage3_cached_clip(cache_dir, frame_index, self.frames) if cache_dir else stage3_video_clip(video_path, frame_index, self.frames)
+        except FileNotFoundError:
+            if cache_dir is None:
+                raise
+            video = stage3_video_clip(video_path, frame_index, self.frames)
         return {
-            "video": stage3_cached_clip(cache_dir, frame_index, self.frames) if cache_dir else stage3_video_clip(video_path, frame_index, self.frames),
+            "video": video,
             "accel_label": int(row.accel_label),
             "steer_label": int(row.steer_label),
             "timestamp": float(row.timestamp),

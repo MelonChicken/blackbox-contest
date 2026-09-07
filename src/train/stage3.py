@@ -13,16 +13,19 @@ from src.config import (
     DEVICE,
     EPOCHS,
     SEED,
+    STAGE3_ARCH,
     STAGE3_CLASS_WEIGHTS,
     STAGE3_LOSS_WEIGHTS,
     STAGE3_MODEL,
     STAGE3_NUM_WORKERS,
     STAGE3_RAW,
+    STAGE3_TRAIN_SAMPLE_LIMIT,
     STAGE3_TRAIN_TEMPORAL_STRIDE,
+    STAGE3_VAL_SAMPLE_LIMIT,
     STAGE3_VAL_TEMPORAL_STRIDE,
 )
 from src.datasets.comma2k19_stage3 import Comma2k19Stage3Dataset, Stage3DaconDataset
-from src.models import Stage3MViT
+from src.models import Stage3MViT, Stage3ResNetGRU
 from src.utils import set_seed
 
 set_seed(SEED)
@@ -60,11 +63,21 @@ def _stride_manifest(df: pd.DataFrame, stride: int) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True) if parts else df.reset_index(drop=True)
 
 
-def _comma_dataset(path, stride: int):
+def _comma_dataset(path, stride: int, limit: int | None):
     dataset = Comma2k19Stage3Dataset(path)
     before = len(dataset)
     dataset.df = _stride_manifest(dataset.df, stride)
+    if limit is not None and limit > 0:
+        dataset.df = dataset.df.head(limit).reset_index(drop=True)
     return dataset, before, len(dataset)
+
+
+def _build_stage3_model(pretrained: bool = True):
+    if STAGE3_ARCH == "mvit":
+        return Stage3MViT(pretrained=pretrained)
+    if STAGE3_ARCH == "resnet18_gru":
+        return Stage3ResNetGRU(pretrained=pretrained)
+    raise ValueError(f"Unknown STAGE3_ARCH: {STAGE3_ARCH}")
 
 
 def _datasets():
@@ -87,12 +100,12 @@ def _datasets():
             val_sets.append(Stage3DaconDataset(df.iloc[split:]))
             summary["dacon_val"] = len(df) - split
     if COMMA2K19_STAGE3_TRAIN_MANIFEST.is_file():
-        dataset, before, after = _comma_dataset(COMMA2K19_STAGE3_TRAIN_MANIFEST, STAGE3_TRAIN_TEMPORAL_STRIDE)
+        dataset, before, after = _comma_dataset(COMMA2K19_STAGE3_TRAIN_MANIFEST, STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_TRAIN_SAMPLE_LIMIT)
         train_sets.append(dataset)
         summary["comma_train_before"] = before
         summary["comma_train_after"] = after
     if COMMA2K19_STAGE3_VAL_MANIFEST.is_file():
-        dataset, before, after = _comma_dataset(COMMA2K19_STAGE3_VAL_MANIFEST, STAGE3_VAL_TEMPORAL_STRIDE)
+        dataset, before, after = _comma_dataset(COMMA2K19_STAGE3_VAL_MANIFEST, STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_VAL_SAMPLE_LIMIT)
         val_sets.append(dataset)
         summary["comma_val_before"] = before
         summary["comma_val_after"] = after
@@ -106,6 +119,7 @@ def _print_dataset_summary(train_dataset, val_dataset, summary: dict) -> None:
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset) if val_dataset else 0}")
     print(f"Batch size: {BATCH_SIZE}")
+    print(f"Architecture: {STAGE3_ARCH}")
     print(f"Train temporal stride: {STAGE3_TRAIN_TEMPORAL_STRIDE}")
     print(f"Validation temporal stride: {STAGE3_VAL_TEMPORAL_STRIDE}")
     print(f"DACON train samples: {summary['dacon_train']}")
@@ -160,7 +174,7 @@ def fit_stage3():
     _print_dataset_summary(train_dataset, val_dataset, summary)
     train_loader = _loader(train_dataset, shuffle=True)
     val_loader = _loader(val_dataset, shuffle=False) if val_dataset else None
-    model = Stage3MViT().to(DEVICE)
+    model = _build_stage3_model(pretrained=True).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), 1e-4)
     accel_class_weights = _class_weights("accel")
     steer_class_weights = _class_weights("steer")
@@ -193,7 +207,7 @@ def fit_stage3():
         )
 
         if val_loader is None:
-            torch.save({"model": model.state_dict(), "epoch": epoch + 1, "train_loss": train_loss}, out / "best.pt")
+            torch.save({"model": model.state_dict(), "arch": STAGE3_ARCH, "epoch": epoch + 1, "train_loss": train_loss}, out / "best.pt")
             continue
         metrics = _validate(model, val_loader)
         print(f"epoch={epoch + 1} val_accel_accuracy={metrics['accel']['accuracy']:.5f}")
@@ -206,4 +220,4 @@ def fit_stage3():
         print(f"epoch={epoch + 1} val_steer_prediction_distribution={metrics['steer']['prediction_distribution']}")
         if metrics["selection"] > best:
             best = metrics["selection"]
-            torch.save({"model": model.state_dict(), "epoch": epoch + 1, "metrics": metrics, "train_loss": train_loss}, out / "best.pt")
+            torch.save({"model": model.state_dict(), "arch": STAGE3_ARCH, "epoch": epoch + 1, "metrics": metrics, "train_loss": train_loss}, out / "best.pt")

@@ -1,10 +1,11 @@
 from .stage1 import Stage1MViT
 from .stage2_videomae import Stage2VideoMAE, build_stage2_model
-from .stage3 import Stage3MViT
+from .stage3 import Stage3MViT, Stage3ResNetGRU
 
 __all__ = [
     "Stage1MViT",
     "Stage2VideoMAE",
     "Stage3MViT",
+    "Stage3ResNetGRU",
     "build_stage2_model",
 ]

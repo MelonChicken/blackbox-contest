@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -8,7 +8,7 @@ from PIL import Image
 
 from src.config import S3_MEAN, S3_STD
 from src.inference.stage1 import _video_paths
-from src.models.stage3 import Stage3MViT
+from src.models.stage3 import Stage3MViT, Stage3ResNetGRU
 
 
 ACCEL = ["ACCELERATING", "DECELERATING", "CONSTANT", "STOPPED"]
@@ -43,10 +43,18 @@ def _stage3_frames(path: Path):
     return torch.stack(frames)
 
 
+def _stage3_model(arch: str):
+    if arch == "mvit":
+        return Stage3MViT(pretrained=False)
+    if arch == "resnet18_gru":
+        return Stage3ResNetGRU(pretrained=False)
+    raise ValueError(f"Unknown Stage3 arch: {arch}")
+
+
 def predict_stage3(data_dir, model_dir):
     device = _device()
     checkpoint = torch.load(Path(model_dir) / "best.pt", map_location="cpu", weights_only=False)
-    model = Stage3MViT()
+    model = _stage3_model(checkpoint.get("arch", "mvit"))
     model.load_state_dict(checkpoint["model"])
     model.to(device).eval()
     videos = _video_paths(Path(data_dir) / "videos")

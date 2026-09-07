@@ -18,6 +18,11 @@ from torchvision.models.video import mvit_v2_s
 from torchvision.transforms import InterpolationMode
 from transformers import VideoMAEConfig, VideoMAEModel
 
+try:
+    from src.models.stage3 import Stage3TartanVOGRU as SrcStage3TartanVOGRU
+except Exception:
+    SrcStage3TartanVOGRU = None
+
 
 # ============================================================
 # Configuration
@@ -220,6 +225,10 @@ def _stage3_model(arch: str):
         return Stage3MViT()
     if arch == "resnet18_gru":
         return Stage3ResNetGRU()
+    if arch == "tartanvo_gru":
+        if SrcStage3TartanVOGRU is None:
+            raise RuntimeError("Stage3TartanVOGRU is unavailable in this submission runtime.")
+        return SrcStage3TartanVOGRU(load_pretrained=False)
     raise ValueError(f"Unknown Stage3 arch: {arch}")
 
 

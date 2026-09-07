@@ -5,6 +5,9 @@ from torch import nn
 from torchvision.models import ResNet18_Weights, resnet18
 from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights
 
+from src.config import S3_MEAN, S3_STD, STAGE3_TARTANVO_FEATURE, STAGE3_TARTANVO_HEIGHT, STAGE3_TARTANVO_POSE_NORM, STAGE3_TARTANVO_WIDTH, TARTANVO_CHECKPOINT
+from src.models.tartanvo import TartanVOEncoder
+
 
 class Stage3MViT(nn.Module):
     """
@@ -69,3 +72,63 @@ class Stage3ResNetGRU(nn.Module):
         temporal, _ = self.gru(features)
         z = self.dropout(temporal.mean(dim=1))
         return self.accel(z), self.steer(z)
+
+class Stage3TartanVOGRU(nn.Module):
+    def __init__(
+        self,
+        load_pretrained: bool = True,
+        checkpoint=TARTANVO_CHECKPOINT,
+        feature: str = STAGE3_TARTANVO_FEATURE,
+        hidden_size: int = 256,
+        num_layers: int = 1,
+        dropout: float = 0.2,
+        pose_norm: str = STAGE3_TARTANVO_POSE_NORM,
+        height: int = STAGE3_TARTANVO_HEIGHT,
+        width: int = STAGE3_TARTANVO_WIDTH,
+    ):
+        super().__init__()
+        if feature != "pose":
+            raise ValueError(f"Stage3TartanVOGRU only supports pose feature, got: {feature}")
+        self.feature = feature
+        self.hidden_size = int(hidden_size)
+        self.num_layers = int(num_layers)
+        self.dropout_value = float(dropout)
+        if pose_norm not in {"none", "layernorm"}:
+            raise ValueError(f"Unknown TartanVO pose norm: {pose_norm}")
+        self.pose_norm_name = pose_norm
+        self.pose_norm = nn.Identity() if pose_norm == "none" else nn.LayerNorm(6)
+        self.tartanvo = TartanVOEncoder(checkpoint=checkpoint, load_pretrained=load_pretrained, height=height, width=width)
+        self.gru = nn.GRU(input_size=6, hidden_size=hidden_size, num_layers=num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
+        self.dropout = nn.Dropout(dropout)
+        self.accel = nn.Linear(hidden_size, 4)
+        self.steer = nn.Linear(hidden_size, 3)
+        self.register_buffer("s3_mean", S3_MEAN[:, None, :, :].clone())
+        self.register_buffer("s3_std", S3_STD[:, None, :, :].clone())
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.tartanvo.eval()
+        return self
+
+    def pose_sequence(self, x):
+        frames = (x * self.s3_std + self.s3_mean).clamp(0.0, 1.0)
+        return self.tartanvo(frames)
+
+    def forward_pose(self, poses):
+        temporal, _ = self.gru(self.pose_norm(poses))
+        z = self.dropout(temporal.mean(dim=1))
+        return self.accel(z), self.steer(z)
+
+    def forward(self, x):
+        return self.forward_pose(self.pose_sequence(x))
+
+    def model_config(self) -> dict:
+        return {
+            "tartanvo_feature": self.feature,
+            "gru_hidden_size": self.hidden_size,
+            "gru_num_layers": self.num_layers,
+            "dropout": self.dropout_value,
+            "tartanvo_pose_norm": self.pose_norm_name,
+            "tartanvo_height": self.tartanvo.height,
+            "tartanvo_width": self.tartanvo.width,
+        }

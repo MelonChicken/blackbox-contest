@@ -8,7 +8,7 @@ from PIL import Image
 
 from src.config import S3_MEAN, S3_STD
 from src.inference.stage1 import _video_paths
-from src.models.stage3 import Stage3MViT, Stage3ResNetGRU
+from src.models.stage3 import Stage3MViT, Stage3ResNetGRU, Stage3TartanVOGRU
 
 
 ACCEL = ["ACCELERATING", "DECELERATING", "CONSTANT", "STOPPED"]
@@ -48,6 +48,8 @@ def _stage3_model(arch: str):
         return Stage3MViT(pretrained=False)
     if arch == "resnet18_gru":
         return Stage3ResNetGRU(pretrained=False)
+    if arch == "tartanvo_gru":
+        return Stage3TartanVOGRU(load_pretrained=False)
     raise ValueError(f"Unknown Stage3 arch: {arch}")
 
 
@@ -55,7 +57,7 @@ def predict_stage3(data_dir, model_dir):
     device = _device()
     checkpoint = torch.load(Path(model_dir) / "best.pt", map_location="cpu", weights_only=False)
     model = _stage3_model(checkpoint.get("arch", "mvit"))
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device).eval()
     videos = _video_paths(Path(data_dir) / "videos")
     rows = []

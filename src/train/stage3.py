@@ -14,6 +14,8 @@ from src.config import (
     EPOCHS,
     SEED,
     STAGE3_ARCH,
+    STAGE3_TARTANVO_FEATURE,
+    STAGE3_TARTANVO_USE_FEATURE_CACHE,
     STAGE3_CLASS_WEIGHTS,
     STAGE3_LOSS_WEIGHTS,
     STAGE3_MODEL,
@@ -25,7 +27,8 @@ from src.config import (
     STAGE3_VAL_TEMPORAL_STRIDE,
 )
 from src.datasets.comma2k19_stage3 import Comma2k19Stage3Dataset, Stage3DaconDataset
-from src.models import Stage3MViT, Stage3ResNetGRU
+from src.datasets.stage3_tartanvo_pose import Stage3TartanPoseDataset
+from src.models import Stage3MViT, Stage3ResNetGRU, Stage3TartanVOGRU
 from src.utils import set_seed
 
 set_seed(SEED)
@@ -77,10 +80,14 @@ def _build_stage3_model(pretrained: bool = True):
         return Stage3MViT(pretrained=pretrained)
     if STAGE3_ARCH == "resnet18_gru":
         return Stage3ResNetGRU(pretrained=pretrained)
+    if STAGE3_ARCH == "tartanvo_gru":
+        return Stage3TartanVOGRU(load_pretrained=pretrained)
     raise ValueError(f"Unknown STAGE3_ARCH: {STAGE3_ARCH}")
 
 
 def _datasets():
+    if STAGE3_ARCH == "tartanvo_gru" and STAGE3_TARTANVO_USE_FEATURE_CACHE:
+        return Stage3TartanPoseDataset("train"), Stage3TartanPoseDataset("val"), {"cache": True}
     train_sets, val_sets = [], []
     summary = {
         "dacon_train": 0,
@@ -120,6 +127,9 @@ def _print_dataset_summary(train_dataset, val_dataset, summary: dict) -> None:
     print(f"Validation samples: {len(val_dataset) if val_dataset else 0}")
     print(f"Batch size: {BATCH_SIZE}")
     print(f"Architecture: {STAGE3_ARCH}")
+    if summary.get("cache"):
+        print("TartanVO feature cache: enabled")
+        return
     print(f"Train temporal stride: {STAGE3_TRAIN_TEMPORAL_STRIDE}")
     print(f"Validation temporal stride: {STAGE3_VAL_TEMPORAL_STRIDE}")
     print(f"DACON train samples: {summary['dacon_train']}")
@@ -131,6 +141,12 @@ def _print_dataset_summary(train_dataset, val_dataset, summary: dict) -> None:
 def _class_weights(name: str):
     values = STAGE3_CLASS_WEIGHTS.get(name)
     return torch.tensor(values, dtype=torch.float32, device=DEVICE) if values is not None else None
+
+
+def _model_outputs(model, batch):
+    if "pose" in batch:
+        return model.forward_pose(batch["pose"].to(DEVICE, non_blocking=True))
+    return model(batch["video"].to(DEVICE, non_blocking=True))
 
 
 def _loss(accel, steer, batch, accel_weight=None, steer_weight=None):
@@ -145,7 +161,7 @@ def _validate(model, loader):
     accel_pred, accel_target, steer_pred, steer_target = [], [], [], []
     with torch.inference_mode():
         for batch in loader:
-            accel, steer = model(batch["video"].to(DEVICE, non_blocking=True))
+            accel, steer = _model_outputs(model, batch)
             accel_pred.extend(accel.argmax(1).cpu().tolist())
             steer_pred.extend(steer.argmax(1).cpu().tolist())
             accel_target.extend(batch["accel_label"].tolist())
@@ -153,6 +169,19 @@ def _validate(model, loader):
     accel_metrics = _classification_metrics(accel_pred, accel_target, 4)
     steer_metrics = _classification_metrics(steer_pred, steer_target, 3)
     return {"accel": accel_metrics, "steer": steer_metrics, "selection": (accel_metrics["macro_f1"] + steer_metrics["macro_f1"]) / 2}
+
+
+def _param_count(model, trainable: bool) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad is trainable)
+
+
+def _checkpoint_payload(model, epoch: int, train_loss: float, metrics=None) -> dict:
+    payload = {"model": model.state_dict(), "arch": STAGE3_ARCH, "epoch": epoch, "train_loss": train_loss}
+    if metrics is not None:
+        payload["metrics"] = metrics
+    if hasattr(model, "model_config"):
+        payload["model_config"] = model.model_config()
+    return payload
 
 
 def _loader(dataset, shuffle: bool):
@@ -175,7 +204,15 @@ def fit_stage3():
     train_loader = _loader(train_dataset, shuffle=True)
     val_loader = _loader(val_dataset, shuffle=False) if val_dataset else None
     model = _build_stage3_model(pretrained=True).to(DEVICE)
-    opt = torch.optim.AdamW(model.parameters(), 1e-4)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("Stage3 model has no trainable parameters.")
+    print(f"Trainable parameters: {_param_count(model, True)}")
+    print(f"Frozen parameters: {_param_count(model, False)}")
+    if STAGE3_ARCH == "tartanvo_gru":
+        print(f"TartanVO feature mode: {STAGE3_TARTANVO_FEATURE}")
+        print(f"TartanVO pretrained loaded: {model.tartanvo.pretrained_loaded}")
+    opt = torch.optim.AdamW(trainable_params, 1e-4)
     accel_class_weights = _class_weights("accel")
     steer_class_weights = _class_weights("steer")
     best = -1.0
@@ -185,7 +222,7 @@ def fit_stage3():
         total_loss = total_accel_loss = total_steer_loss = 0.0
         progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} Train")
         for batch in progress:
-            accel, steer = model(batch["video"].to(DEVICE, non_blocking=True))
+            accel, steer = _model_outputs(model, batch)
             loss, loss_accel, loss_steer = _loss(accel, steer, batch, accel_class_weights, steer_class_weights)
             opt.zero_grad()
             loss.backward()
@@ -207,7 +244,7 @@ def fit_stage3():
         )
 
         if val_loader is None:
-            torch.save({"model": model.state_dict(), "arch": STAGE3_ARCH, "epoch": epoch + 1, "train_loss": train_loss}, out / "best.pt")
+            torch.save(_checkpoint_payload(model, epoch + 1, train_loss), out / "best.pt")
             continue
         metrics = _validate(model, val_loader)
         print(f"epoch={epoch + 1} val_accel_accuracy={metrics['accel']['accuracy']:.5f}")
@@ -220,4 +257,4 @@ def fit_stage3():
         print(f"epoch={epoch + 1} val_steer_prediction_distribution={metrics['steer']['prediction_distribution']}")
         if metrics["selection"] > best:
             best = metrics["selection"]
-            torch.save({"model": model.state_dict(), "arch": STAGE3_ARCH, "epoch": epoch + 1, "metrics": metrics, "train_loss": train_loss}, out / "best.pt")
+            torch.save(_checkpoint_payload(model, epoch + 1, train_loss, metrics), out / "best.pt")

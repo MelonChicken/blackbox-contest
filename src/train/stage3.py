@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 from torch import nn
@@ -175,10 +181,48 @@ def _param_count(model, trainable: bool) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad is trainable)
 
 
-def _checkpoint_payload(model, epoch: int, train_loss: float, metrics=None) -> dict:
+def _save_history(history: dict, run_id: str) -> tuple:
+    history_dir = STAGE3_MODEL / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    history_path = history_dir / f"{run_id}_history.csv"
+    loss_path = history_dir / f"{run_id}_loss.png"
+    metrics_path = history_dir / f"{run_id}_metrics.png"
+
+    df = pd.DataFrame(history)
+    df.to_csv(history_path, index=False)
+
+    plt.figure()
+    for name in ("train_loss", "train_accel_loss", "train_steer_loss"):
+        plt.plot(df["epoch"], df[name], marker="o", label=name)
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(f"Stage3 Training Loss - {STAGE3_ARCH}")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(loss_path, bbox_inches="tight")
+    plt.close()
+
+    plt.figure()
+    for name in ("val_accel_macro_f1", "val_steer_macro_f1", "selection"):
+        plt.plot(df["epoch"], df[name], marker="o", label=name)
+    plt.xlabel("Epoch")
+    plt.ylabel("Score")
+    plt.ylim(0, 1)
+    plt.title(f"Stage3 Validation Metrics - {STAGE3_ARCH}")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(metrics_path, bbox_inches="tight")
+    plt.close()
+
+    return history_path, loss_path, metrics_path
+
+
+def _checkpoint_payload(model, epoch: int, train_loss: float, metrics=None, history=None) -> dict:
     payload = {"model": model.state_dict(), "arch": STAGE3_ARCH, "epoch": epoch, "train_loss": train_loss}
     if metrics is not None:
         payload["metrics"] = metrics
+    if history is not None:
+        payload["history"] = history
     if hasattr(model, "model_config"):
         payload["model_config"] = model.model_config()
     return payload
@@ -198,6 +242,23 @@ def _loader(dataset, shuffle: bool):
 def fit_stage3():
     out = STAGE3_MODEL
     out.mkdir(parents=True, exist_ok=True)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    history = {
+        "epoch": [],
+        "arch": [],
+        "batch_size": [],
+        "train_sample_limit": [],
+        "val_sample_limit": [],
+        "train_loss": [],
+        "train_accel_loss": [],
+        "train_steer_loss": [],
+        "val_accel_accuracy": [],
+        "val_accel_macro_f1": [],
+        "val_steer_accuracy": [],
+        "val_steer_macro_f1": [],
+        "selection": [],
+    }
+    history_path = loss_path = metrics_path = None
 
     train_dataset, val_dataset, summary = _datasets()
     _print_dataset_summary(train_dataset, val_dataset, summary)
@@ -244,7 +305,21 @@ def fit_stage3():
         )
 
         if val_loader is None:
-            torch.save(_checkpoint_payload(model, epoch + 1, train_loss), out / "best.pt")
+            history["epoch"].append(epoch + 1)
+            history["arch"].append(STAGE3_ARCH)
+            history["batch_size"].append(BATCH_SIZE)
+            history["train_sample_limit"].append(STAGE3_TRAIN_SAMPLE_LIMIT)
+            history["val_sample_limit"].append(STAGE3_VAL_SAMPLE_LIMIT)
+            history["train_loss"].append(train_loss)
+            history["train_accel_loss"].append(train_accel_loss)
+            history["train_steer_loss"].append(train_steer_loss)
+            history["val_accel_accuracy"].append(float("nan"))
+            history["val_accel_macro_f1"].append(float("nan"))
+            history["val_steer_accuracy"].append(float("nan"))
+            history["val_steer_macro_f1"].append(float("nan"))
+            history["selection"].append(float("nan"))
+            history_path, loss_path, metrics_path = _save_history(history, run_id)
+            torch.save(_checkpoint_payload(model, epoch + 1, train_loss, history=history), out / "best.pt")
             continue
         metrics = _validate(model, val_loader)
         print(f"epoch={epoch + 1} val_accel_accuracy={metrics['accel']['accuracy']:.5f}")
@@ -255,6 +330,24 @@ def fit_stage3():
         print(f"epoch={epoch + 1} val_steer_macro_f1={metrics['steer']['macro_f1']:.5f}")
         print(f"epoch={epoch + 1} val_steer_confusion_matrix={metrics['steer']['confusion_matrix']}")
         print(f"epoch={epoch + 1} val_steer_prediction_distribution={metrics['steer']['prediction_distribution']}")
+        history["epoch"].append(epoch + 1)
+        history["arch"].append(STAGE3_ARCH)
+        history["batch_size"].append(BATCH_SIZE)
+        history["train_sample_limit"].append(STAGE3_TRAIN_SAMPLE_LIMIT)
+        history["val_sample_limit"].append(STAGE3_VAL_SAMPLE_LIMIT)
+        history["train_loss"].append(train_loss)
+        history["train_accel_loss"].append(train_accel_loss)
+        history["train_steer_loss"].append(train_steer_loss)
+        history["val_accel_accuracy"].append(metrics["accel"]["accuracy"])
+        history["val_accel_macro_f1"].append(metrics["accel"]["macro_f1"])
+        history["val_steer_accuracy"].append(metrics["steer"]["accuracy"])
+        history["val_steer_macro_f1"].append(metrics["steer"]["macro_f1"])
+        history["selection"].append(metrics["selection"])
+        history_path, loss_path, metrics_path = _save_history(history, run_id)
         if metrics["selection"] > best:
             best = metrics["selection"]
-            torch.save(_checkpoint_payload(model, epoch + 1, train_loss, metrics), out / "best.pt")
+            torch.save(_checkpoint_payload(model, epoch + 1, train_loss, metrics, history), out / "best.pt")
+
+    print(f"Stage3 history saved:\n{history_path}")
+    print(f"Loss plot:\n{loss_path}")
+    print(f"Metrics plot:\n{metrics_path}")

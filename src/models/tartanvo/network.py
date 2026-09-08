@@ -234,10 +234,13 @@ class VOFlowRes(nn.Module):
             layers.append(block(self.inplanes, planes, 1, None, pad, dilation))
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, return_latent: bool = False):
         x = self.layer5(self.layer4(self.layer3(self.layer2(self.layer1(self.firstconv(x))))))
         x = x.view(x.shape[0], -1)
-        return torch.cat((self.voflow_trans(x), self.voflow_rot(x)), dim=1)
+        pose = torch.cat((self.voflow_trans(x), self.voflow_rot(x)), dim=1)
+        if return_latent:
+            return pose, x
+        return pose
 
 
 class VONet(nn.Module):
@@ -246,7 +249,11 @@ class VONet(nn.Module):
         self.flowNet = PWCDCNet()
         self.flowPoseNet = VOFlowRes()
 
-    def forward(self, x):
+    def forward(self, x, return_latent: bool = False):
         flow = self.flowNet(x[0:2])
-        pose = self.flowPoseNet(torch.cat((flow, x[2]), dim=1))
+        pose_input = torch.cat((flow, x[2]), dim=1)
+        if return_latent:
+            pose, latent = self.flowPoseNet(pose_input, return_latent=True)
+            return flow, pose, latent
+        pose = self.flowPoseNet(pose_input)
         return flow, pose

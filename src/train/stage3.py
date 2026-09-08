@@ -33,7 +33,7 @@ from src.config import (
     STAGE3_VAL_TEMPORAL_STRIDE,
 )
 from src.datasets.comma2k19_stage3 import Comma2k19Stage3Dataset, Stage3DaconDataset
-from src.datasets.stage3_tartanvo_pose import Stage3TartanPoseDataset
+from src.datasets.stage3_tartanvo_pose import Stage3TartanFeatureDataset
 from src.models import Stage3MViT, Stage3ResNetGRU, Stage3TartanVOGRU
 from src.utils import set_seed
 
@@ -93,7 +93,7 @@ def _build_stage3_model(pretrained: bool = True):
 
 def _datasets():
     if STAGE3_ARCH == "tartanvo_gru" and STAGE3_TARTANVO_USE_FEATURE_CACHE:
-        return Stage3TartanPoseDataset("train"), Stage3TartanPoseDataset("val"), {"cache": True}
+        return Stage3TartanFeatureDataset("train", STAGE3_TARTANVO_FEATURE), Stage3TartanFeatureDataset("val", STAGE3_TARTANVO_FEATURE), {"cache": True}
     train_sets, val_sets = [], []
     summary = {
         "dacon_train": 0,
@@ -150,6 +150,8 @@ def _class_weights(name: str):
 
 
 def _model_outputs(model, batch):
+    if "feature" in batch:
+        return model.forward_feature(batch["feature"].to(DEVICE, non_blocking=True))
     if "pose" in batch:
         return model.forward_pose(batch["pose"].to(DEVICE, non_blocking=True))
     return model(batch["video"].to(DEVICE, non_blocking=True))

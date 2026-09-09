@@ -50,15 +50,25 @@ class TartanVOEncoder(nn.Module):
         self.loaded_key_count = len(cleaned)
         self.missing_key_count = len(missing)
 
-    def _intrinsic(self, batch: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def _intrinsic(self, batch: int, device: torch.device, dtype: torch.dtype, intrinsics: torch.Tensor | None = None) -> torch.Tensor:
         h, w = self.height, self.width
-        fx, fy, cx, cy = float(w), float(w), w / 2.0, h / 2.0
+        if intrinsics is None:
+            values = torch.tensor([[float(w), float(w), w / 2.0, h / 2.0]], device=device, dtype=dtype).repeat(batch, 1)
+        else:
+            values = intrinsics.to(device=device, dtype=dtype)
+            if values.ndim == 1:
+                values = values.unsqueeze(0)
+            if values.shape[0] != batch:
+                values = values.repeat_interleave(batch // values.shape[0], dim=0)
         ys, xs = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing="ij")
-        intrinsic = torch.stack(((xs.float() - cx + 0.5) / fx, (ys.float() - cy + 0.5) / fy), dim=0)
-        intrinsic = F.interpolate(intrinsic.unsqueeze(0), size=(h // 4, w // 4), mode="bilinear", align_corners=False).to(dtype)
-        return intrinsic.repeat(batch, 1, 1, 1)
+        xs = xs.to(dtype) + 0.5
+        ys = ys.to(dtype) + 0.5
+        maps = []
+        for fx, fy, cx, cy in values:
+            maps.append(torch.stack(((xs - cx) / fx.clamp_min(1e-6), (ys - cy) / fy.clamp_min(1e-6)), dim=0))
+        return F.interpolate(torch.stack(maps, dim=0), size=(h // 4, w // 4), mode="bilinear", align_corners=False)
 
-    def forward(self, frames: torch.Tensor, feature: str = "pose") -> torch.Tensor:
+    def forward(self, frames: torch.Tensor, feature: str = "pose", intrinsics: torch.Tensor | None = None) -> torch.Tensor:
         b, c, t, _, _ = frames.shape
         if c != 3 or t < 2:
             raise ValueError(f"expected [B,3,T,H,W] with T>=2, got {frames.shape}")
@@ -69,7 +79,8 @@ class TartanVOEncoder(nn.Module):
         resized = resized.reshape(b, t, c, self.height, self.width)
         img1 = resized[:, :-1].reshape(b * (t - 1), c, self.height, self.width).contiguous()
         img2 = resized[:, 1:].reshape(b * (t - 1), c, self.height, self.width).contiguous()
-        intrinsic = self._intrinsic(img1.shape[0], img1.device, img1.dtype)
+        pair_intrinsics = intrinsics.repeat_interleave(t - 1, dim=0) if intrinsics is not None and intrinsics.ndim == 2 else intrinsics
+        intrinsic = self._intrinsic(img1.shape[0], img1.device, img1.dtype, pair_intrinsics)
         with torch.no_grad():
             if feature == "latent":
                 _, _, latent = self.vonet([img1, img2, intrinsic], return_latent=True)

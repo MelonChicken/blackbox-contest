@@ -117,13 +117,13 @@ class Stage3TartanVOGRU(nn.Module):
         self.tartanvo.eval()
         return self
 
-    def feature_sequence(self, x):
+    def feature_sequence(self, x, intrinsics=None):
         frames = (x * self.s3_std + self.s3_mean).clamp(0.0, 1.0)
-        return self.tartanvo(frames, feature=self.feature)
+        return self.tartanvo(frames, feature=self.feature, intrinsics=intrinsics)
 
-    def pose_sequence(self, x):
+    def pose_sequence(self, x, intrinsics=None):
         frames = (x * self.s3_std + self.s3_mean).clamp(0.0, 1.0)
-        return self.tartanvo(frames, feature="pose")
+        return self.tartanvo(frames, feature=pose, intrinsics=intrinsics)
 
     def forward_feature(self, features):
         temporal, _ = self.gru(self.feature_norm(features))
@@ -133,8 +133,8 @@ class Stage3TartanVOGRU(nn.Module):
     def forward_pose(self, poses):
         return self.forward_feature(poses)
 
-    def forward(self, x):
-        return self.forward_feature(self.feature_sequence(x))
+    def forward(self, x, intrinsics=None):
+        return self.forward_feature(self.feature_sequence(x, intrinsics=intrinsics))
 
     def model_config(self) -> dict:
         return {

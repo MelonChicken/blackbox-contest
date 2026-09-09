@@ -18,6 +18,10 @@ def _row_value(row, name: str):
 
 def stage3_tartanvo_sample_key(row) -> str:
     try:
+        return f"{_row_value(row, 'sequence_id')}__{int(_row_value(row, 'frame_index'))}"
+    except (KeyError, AttributeError):
+        pass
+    try:
         return f"{_row_value(row, 'route_id')}__{_row_value(row, 'segment_id')}__{int(_row_value(row, 'frame_index'))}"
     except (KeyError, AttributeError):
         value = f"{_row_value(row, 'video_path')}|{int(_row_value(row, 'frame_index'))}"
@@ -25,13 +29,14 @@ def stage3_tartanvo_sample_key(row) -> str:
 
 
 class Stage3TartanFeatureDataset(Dataset):
-    def __init__(self, split: str, feature: str = "pose", root: str | Path = STAGE3_TARTANVO_FEATURE_CACHE):
+    def __init__(self, split: str, feature: str = "pose", root: str | Path = STAGE3_TARTANVO_FEATURE_CACHE, dataset: str = "comma2k19"):
         self.split = split
         self.feature = feature
+        self.dataset = dataset
         self.root = Path(root)
-        self.base = self.root / feature
+        self.base = self.root / feature / dataset if dataset != "comma2k19" else self.root / feature
         self.index_path = self.base / f"{split}_index.csv"
-        if not self.index_path.is_file() and feature == "pose":
+        if not self.index_path.is_file() and dataset == "comma2k19" and feature == "pose":
             self.base = self.root
             self.index_path = self.root / f"{split}_index.csv"
         if not self.index_path.is_file():
@@ -52,12 +57,14 @@ class Stage3TartanFeatureDataset(Dataset):
             "feature": feature.to(torch.float32),
             "accel_label": int(item["accel_label"]),
             "steer_label": int(item["steer_label"]),
+            "sequence_id": item.get("sequence_id"),
+            "frame_index": item.get("frame_index"),
         }
 
 
 class Stage3TartanPoseDataset(Stage3TartanFeatureDataset):
-    def __init__(self, split: str, root: str | Path = STAGE3_TARTANVO_FEATURE_CACHE):
-        super().__init__(split, feature="pose", root=root)
+    def __init__(self, split: str, root: str | Path = STAGE3_TARTANVO_FEATURE_CACHE, dataset: str = "comma2k19"):
+        super().__init__(split, feature="pose", root=root, dataset=dataset)
 
     def __getitem__(self, index: int) -> dict:
         item = super().__getitem__(index)

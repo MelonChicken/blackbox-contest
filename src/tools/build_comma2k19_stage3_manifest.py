@@ -13,7 +13,7 @@ from src.config import COMMA2K19_STAGE3_MANIFEST, COMMA2K19_STAGE3_RAW, STAGE3_A
 from src.datasets.stage3_labels import ACCEL_NAMES, STEER_NAMES, derive_accel_label, derive_acceleration, derive_steer_label
 
 VIDEO_EXT = {".hevc", ".mp4", ".mkv", ".avi", ".mov"}
-ALIGNMENT_VERSION = "video_pts_nearest_v1"
+ALIGNMENT_VERSION = "comma_frame_times_nearest_v1"
 DEFAULT_MAX_ALIGNMENT_ERROR_SEC = 0.06
 
 
@@ -115,16 +115,14 @@ def _frame_time_arrays(segment: Path) -> list[tuple[str, np.ndarray]]:
     return out
 
 
-def _video_clock(segment: Path, timing: VideoTiming, allow_relative_pts_fallback: bool) -> tuple[np.ndarray, str]:
+def _video_clock(segment: Path, timing: VideoTiming) -> tuple[np.ndarray, str]:
     for name, values in _frame_time_arrays(segment):
         values = np.asarray(values, dtype=float).squeeze()
         if len(values) == timing.decoded_frame_count:
             return values, name
-    if allow_relative_pts_fallback:
-        return timing.pts_sec - timing.pts_sec[0], "video_pts_relative_fallback"
     raise FileNotFoundError(
         f"no frame timestamp array with decoded frame count={timing.decoded_frame_count} under {segment}; "
-        "refusing to assume CAN start == video PTS 0"
+        "refusing to use HEVC PTS as the synchronization clock"
     )
 
 
@@ -155,8 +153,8 @@ def _rows(
     steer_t = np.asarray(steer_t, dtype=float).squeeze()
     speed_v = np.asarray(speed_v, dtype=float).squeeze()
     steer_v = np.asarray(steer_v, dtype=float).squeeze()
-    start = max(float(video_clock_t[0]), float(speed_t[0]), float(steer_t[0]))
-    end = min(float(video_clock_t[-1]), float(speed_t[-1]), float(steer_t[-1]))
+    start = max(float(speed_t[0]), float(steer_t[0]))
+    end = min(float(speed_t[-1]), float(steer_t[-1]))
     target_t = _target_grid(start, end)
     if len(target_t) == 0:
         return [], AlignmentStats(0, 0, 0, tuple())
@@ -171,9 +169,12 @@ def _rows(
     dropped = 0
     video_start = float(video_clock_t[0])
     for i, target in enumerate(target_t):
+        if target < float(video_clock_t[0]) or target > float(video_clock_t[-1]):
+            dropped += 1
+            continue
         frame_index = int(np.argmin(np.abs(video_clock_t - target)))
-        err = float(video_clock_t[frame_index] - target)
-        if abs(err) > max_alignment_error_sec:
+        err = abs(float(video_clock_t[frame_index] - target))
+        if err > max_alignment_error_sec:
             dropped += 1
             continue
         errors.append(err)
@@ -209,10 +210,10 @@ def _segment_dirs(raw_root: Path) -> list[Path]:
     return segments
 
 
-def _local_rows(segment: Path, raw_root: Path, invert_steering: bool, allow_relative_pts_fallback: bool) -> tuple[list[dict], AlignmentStats]:
+def _local_rows(segment: Path, raw_root: Path, invert_steering: bool) -> tuple[list[dict], AlignmentStats]:
     video = _direct_video(segment)
     timing = _video_timing(video)
-    video_clock_t, alignment_source = _video_clock(segment, timing, allow_relative_pts_fallback)
+    video_clock_t, alignment_source = _video_clock(segment, timing)
     speed_t, speed_v = _series(segment, "speed")
     steer_t, steer_v = _series(segment, "steering_angle")
     rel_video = video.relative_to(raw_root) if video.is_relative_to(raw_root) else video
@@ -278,11 +279,17 @@ def _hf_rows(split: str, limit: int | None, video_dir: Path, invert_steering: bo
 def _alignment_summary(df: pd.DataFrame) -> None:
     if df.empty or "alignment_error_sec" not in df.columns:
         return
-    err = df.alignment_error_sec.abs().to_numpy(float)
+    err = df.alignment_error_sec.to_numpy(float)
+    delta = df.video_frame_index.to_numpy(int) - (2 * df.sample_index.to_numpy(int))
     print(f"valid aligned samples: {len(df)}")
     print(f"max alignment error: {err.max():.6f}")
     print(f"mean alignment error: {err.mean():.6f}")
     print(f"p95 alignment error: {np.percentile(err, 95):.6f}")
+    print(
+        "actual_frame_index - 2*k: "
+        f"min={delta.min()} p5={np.percentile(delta, 5):.1f} median={np.median(delta):.1f} "
+        f"p95={np.percentile(delta, 95):.1f} max={delta.max()}"
+    )
 
 
 def _write_splits(df: pd.DataFrame, out_dir: Path, val_ratio: float) -> tuple[Path, Path]:
@@ -317,7 +324,7 @@ def _write_splits(df: pd.DataFrame, out_dir: Path, val_ratio: float) -> tuple[Pa
     return train_path, val_path
 
 
-def build_manifest(raw_root: Path, out_dir: Path, val_ratio: float, limit: int | None, invert_steering: bool, hf_split: str | None, allow_relative_pts_fallback: bool = False) -> tuple[Path, Path]:
+def build_manifest(raw_root: Path, out_dir: Path, val_ratio: float, limit: int | None, invert_steering: bool, hf_split: str | None) -> tuple[Path, Path]:
     if hf_split:
         rows = _hf_rows(hf_split, limit, out_dir.parent / "videos", invert_steering)
     else:
@@ -331,7 +338,7 @@ def build_manifest(raw_root: Path, out_dir: Path, val_ratio: float, limit: int |
         all_errors = []
         for segment in segments:
             try:
-                part, stats = _local_rows(segment, raw_root, invert_steering, allow_relative_pts_fallback)
+                part, stats = _local_rows(segment, raw_root, invert_steering)
                 rows.extend(part)
                 total_candidates += stats.candidates
                 total_valid += stats.valid
@@ -343,8 +350,15 @@ def build_manifest(raw_root: Path, out_dir: Path, val_ratio: float, limit: int |
         print(f"valid aligned samples: {total_valid}")
         print(f"dropped because no video frame: {total_dropped}")
         if all_errors:
-            err = np.abs(np.asarray(all_errors, dtype=float))
+            err = np.asarray(all_errors, dtype=float)
             print(f"max / mean / p95 alignment error: {err.max():.6f} / {err.mean():.6f} / {np.percentile(err, 95):.6f}")
+            tmp = pd.DataFrame(rows)
+            delta = tmp.video_frame_index.to_numpy(int) - (2 * tmp.sample_index.to_numpy(int))
+            print(
+                "actual_frame_index - 2*k distribution: "
+                f"min={delta.min()} p5={np.percentile(delta, 5):.1f} median={np.median(delta):.1f} "
+                f"p95={np.percentile(delta, 95):.1f} max={delta.max()}"
+            )
     return _write_splits(pd.DataFrame(rows), out_dir, val_ratio)
 
 
@@ -356,9 +370,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--hf-split", default=None, help="Use HuggingFace load_dataset('commaai/comma2k19', split=...) instead of local Chunk_* files.")
     parser.add_argument("--invert-steering", action="store_true")
-    parser.add_argument("--allow-relative-pts-fallback", action="store_true", help="Use video PTS relative time when no per-frame timestamp file exists. This assumes CAN/video starts are synchronized.")
     args = parser.parse_args()
-    build_manifest(args.raw_root, args.out_dir, args.val_ratio, args.limit, args.invert_steering, args.hf_split, args.allow_relative_pts_fallback)
+    build_manifest(args.raw_root, args.out_dir, args.val_ratio, args.limit, args.invert_steering, args.hf_split)
 
 
 if __name__ == "__main__":

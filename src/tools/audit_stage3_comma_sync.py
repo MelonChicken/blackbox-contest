@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from src.config import COMMA2K19_STAGE3_RAW, STAGE3_TARTANVO_FEATURE, STAGE3_TARTANVO_FEATURE_CACHE
-from src.tools.build_comma2k19_stage3_manifest import _direct_video, _frame_time_arrays, _segment_dirs, _series, _video_timing
+from src.tools.build_comma2k19_stage3_manifest import ALIGNMENT_VERSION, _direct_video, _frame_time_arrays, _segment_dirs, _series, _video_timing
 
 
 def _summary(name: str, t) -> dict:
@@ -28,6 +28,19 @@ def _best_pose_times(segment: Path, decoded_frames: int):
     if exact:
         return exact[0][0], exact[0][1]
     return (arrays[0] if arrays else ("missing", np.asarray([], dtype=float)))
+
+
+def _cadence_summary(prefix: str, t) -> dict:
+    arr = np.asarray(t, dtype=float).squeeze()
+    if len(arr) < 2:
+        return {f"{prefix}_diff_mean": float("nan"), f"{prefix}_diff_median": float("nan"), f"{prefix}_diff_p5": float("nan"), f"{prefix}_diff_p95": float("nan")}
+    diff = np.diff(arr)
+    return {
+        f"{prefix}_diff_mean": float(np.mean(diff)),
+        f"{prefix}_diff_median": float(np.median(diff)),
+        f"{prefix}_diff_p5": float(np.percentile(diff, 5)),
+        f"{prefix}_diff_p95": float(np.percentile(diff, 95)),
+    }
 
 
 def _segment_row(segment: Path) -> dict:
@@ -52,6 +65,7 @@ def _segment_row(segment: Path) -> dict:
     row.update(_summary("speed", speed_t))
     row.update(_summary("steering", steer_t))
     row.update(_summary("pose", pose_t))
+    row.update(_cadence_summary("pose", pose_t))
     return row
 
 
@@ -64,11 +78,11 @@ def _print_invalid_cache_report() -> None:
         if not index.is_file():
             print(f"{split}: missing cache index ({index})")
             continue
-        reason = "metadata lacks manifest_alignment_version=video_pts_nearest_v1"
+        reason = f"metadata lacks manifest_alignment_version={ALIGNMENT_VERSION}"
         try:
             import json
             data = json.loads(meta.read_text(encoding="utf-8")) if meta.is_file() else {}
-            if data.get("manifest_alignment_version") == "video_pts_nearest_v1":
+            if data.get("manifest_alignment_version") == ALIGNMENT_VERSION:
                 print(f"{split}: cache appears aligned ({index})")
             else:
                 print(f"{split}: INVALID until regenerated - {reason}: {index}")
@@ -96,7 +110,8 @@ def main() -> None:
             "segment", "video_duration", "speed_duration", "steering_duration", "pose_duration",
             "video_first_pts", "video_last_pts", "speed_start", "speed_end", "steering_start", "steering_end",
             "pose_start", "pose_end", "video_reported_fps", "video_decoded_frames", "speed_samples",
-            "steering_samples", "pose_samples", "pose_source", "pose_matches_decoded_frames", "error",
+            "steering_samples", "pose_samples", "pose_source", "pose_matches_decoded_frames",
+            "pose_diff_mean", "pose_diff_median", "pose_diff_p5", "pose_diff_p95", "error",
         ]
         cols = [c for c in cols if c in df.columns]
         print(df[cols].to_string(index=False))

@@ -90,10 +90,10 @@ class Stage3TartanFeatureDataset(Dataset):
             return
         meta_path = self.base / f"{self.split}_metadata.json"
         if not meta_path.is_file():
-            raise RuntimeError(f"comma2k19 TartanVO cache is invalid until regenerated with video_pts_nearest_v1 alignment: {self.index_path}")
+            raise RuntimeError(f"comma2k19 TartanVO cache is invalid until regenerated with comma_frame_times_nearest_v1 alignment: {self.index_path}")
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if meta.get("manifest_alignment_version") != "video_pts_nearest_v1":
-            raise RuntimeError(f"comma2k19 TartanVO cache is invalid until regenerated with video_pts_nearest_v1 alignment: {self.index_path}")
+        if meta.get("manifest_alignment_version") != "comma_frame_times_nearest_v1":
+            raise RuntimeError(f"comma2k19 TartanVO cache is invalid until regenerated with comma_frame_times_nearest_v1 alignment: {self.index_path}")
 
     def _base_dir(self, dataset: str, feature: str) -> Path:
         source_base = self.root / feature / dataset

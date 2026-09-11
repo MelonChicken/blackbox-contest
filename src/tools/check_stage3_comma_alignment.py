@@ -59,39 +59,31 @@ def _manifest_time_column(seg: pd.DataFrame) -> str:
 
 def _manifest_row_near(seg: pd.DataFrame, desired_time: float):
     col = _manifest_time_column(seg)
-    return seg.iloc[int(np.argmin(np.abs(seg[col].to_numpy(float) - desired_time)))]
-
-
-def _sample_index(timestamp: float) -> int:
-    return int(round(timestamp * 10.0))
+    base = float(seg[col].min())
+    return seg.iloc[int(np.argmin(np.abs(seg[col].to_numpy(float) - (base + desired_time))))]
 
 
 def _print_check(video_path: Path, seg: pd.DataFrame, pts_index: VideoPtsIndex, desired_time: float) -> None:
     row = _manifest_row_near(seg, desired_time)
-    relative_timestamp = float(row.timestamp)
-    target_timestamp = float(getattr(row, "target_timestamp", relative_timestamp))
+    col = _manifest_time_column(seg)
+    target_timestamp = float(row[col])
+    relative_timestamp = target_timestamp - float(seg[col].min())
     dataset_frame = int(row.video_frame_index if "video_frame_index" in seg.columns else row.frame_index)
-    nearest_frame = _nearest_index(pts_index.pts_sec, relative_timestamp)
     selected_pts = float(pts_index.pts_sec[dataset_frame]) if 0 <= dataset_frame < len(pts_index.pts_sec) else float("nan")
-    selected_clock = float(getattr(row, "video_frame_timestamp", selected_pts))
-    nearest_pts = float(pts_index.pts_sec[nearest_frame])
-    manifest_error = float(getattr(row, "alignment_error_sec", selected_clock - target_timestamp))
-    sample_index = _sample_index(relative_timestamp)
+    frame_time = float(getattr(row, "video_frame_timestamp", selected_pts))
+    manifest_error = abs(float(getattr(row, "alignment_error_sec", frame_time - target_timestamp)))
+    sample_index = int(getattr(row, "sample_index", round(relative_timestamp * 10.0)))
+    expected_2k = 2 * sample_index
     print(f"sample_index={sample_index}")
-    print(f"target_timestamp={target_timestamp:.6f}")
-    print(f"relative_timestamp={relative_timestamp:.6f}")
+    print(f"target_CAN_timestamp={target_timestamp:.6f}")
+    print(f"nearest_frame_times_timestamp={frame_time:.6f}")
+    print(f"video_frame_index={dataset_frame}")
+    print(f"alignment_error={manifest_error:.6f}")
+    print(f"expected_2k_frame={expected_2k}")
+    print(f"actual_minus_expected={dataset_frame - expected_2k}")
     print(f"video_reported_fps={pts_index.reported_fps:.6f}")
     print(f"decoded_frame_count={pts_index.decoded_frame_count}")
-    print(f"selected_frame_index={dataset_frame}")
-    print(f"selected_frame_pts_sec={selected_pts:.6f}")
-    print(f"selected_frame_timestamp={selected_clock:.6f}")
-    print(f"time_error_sec={manifest_error:.6f}")
-    print(f"nearest_by_pts_frame_index={nearest_frame}")
-    print(f"nearest_by_pts_sec={nearest_pts:.6f}")
-    print(f"nearest_time_error_sec={nearest_pts - target_timestamp:.6f}")
-    print(f"dataset_selected_nearest_by_pts={dataset_frame == nearest_frame}")
-    print(f"expected_if_20fps={int(round(relative_timestamp * 20.0))}")
-    print(f"expected_if_25fps={int(round(relative_timestamp * 25.0))}")
+    print(f"diagnostic_hevc_pts_sec={selected_pts:.6f}")
     print(f"video_path={video_path}")
     print()
 
@@ -117,14 +109,15 @@ def _video_groups(max_videos: int):
     for _, seg in df.groupby("video_path", sort=False):
         video_path = abs_video_path(seg.iloc[0])
         if video_path.is_file():
-            groups.append((video_path, seg.sort_values("timestamp").reset_index(drop=True)))
+            sort_col = _manifest_time_column(seg)
+            groups.append((video_path, seg.sort_values(sort_col).reset_index(drop=True)))
         if len(groups) >= max_videos:
             break
     return groups
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Check comma2k19 Stage3 frame alignment from decoded frame PTS.")
+    parser = argparse.ArgumentParser(description="Check comma2k19 Stage3 frame alignment from global_pose/frame_times.")
     parser.add_argument("--max-videos", type=int, default=5)
     parser.add_argument("--times", type=float, nargs="*", default=list(CHECK_TIMES_SEC))
     args = parser.parse_args()

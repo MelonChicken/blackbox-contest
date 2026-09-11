@@ -35,6 +35,7 @@ from src.datasets.comma2k19_stage3 import ACCEL_TO_ID, STEER_TO_ID, Comma2k19Sta
 from src.datasets.kitti_stage3 import KittiStage3Dataset, _label_id
 from src.datasets.nuscenes_stage3 import NuScenesStage3Dataset
 from src.datasets.stage3_tartanvo_pose import stage3_tartanvo_feature_path, stage3_tartanvo_sample_key
+from src.tools.build_comma2k19_stage3_manifest import ALIGNMENT_VERSION
 from src.models import Stage3TartanVOGRU
 
 CACHE_VERSION = 2
@@ -111,6 +112,10 @@ def cache_split(split: str, feature: str, root: Path = STAGE3_TARTANVO_FEATURE_C
         raise ValueError(f"unknown feature: {feature}")
     manifest, stride, limit = _split_config(dataset, split)
     ds = _dataset(dataset, manifest, split)
+    if dataset == "comma2k19":
+        versions = set(ds.df.get("alignment_version", pd.Series(dtype=str)).dropna().astype(str))
+        if versions != {ALIGNMENT_VERSION}:
+            raise RuntimeError(f"comma2k19 manifest must use {ALIGNMENT_VERSION}; found {sorted(versions) or [None]}")
     ds.df = _balanced_limit(_stride_manifest(ds.df, stride), limit)
     if max_samples:
         ds.df = ds.df.head(max_samples).reset_index(drop=True)

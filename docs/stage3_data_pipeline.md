@@ -31,7 +31,7 @@ python -m src.tools.build_comma2k19_stage3_manifest
 python -m src.tools.check_stage3_comma_alignment
 ```
 
-The manifest builder aligns target CAN timestamps to video frames using explicit per-frame timestamps when available. It decodes HEVC metadata with PyAV and does not assume `frame = 2 * sample_index`. Targets outside the video-timestamp range are dropped, not clamped.
+The manifest builder aligns absolute CAN target timestamps to decoded frame indices using `global_pose/frame_times` as the synchronization clock. The `frame_times` length must match the decoded frame count; HEVC PTS is decoded only as diagnostic metadata and is not used as the canonical clock. Targets outside the `frame_times` range are dropped, not clamped.
 
 Outputs:
 
@@ -52,8 +52,8 @@ Canonical schema:
 | `target_timestamp` | target CAN/video-clock timestamp used for labels and frame lookup |
 | `video_frame_index` | selected decoded video frame index nearest to `target_timestamp` |
 | `video_frame_timestamp` | timestamp of selected video frame in the synchronization clock |
-| `alignment_error_sec` | `video_frame_timestamp - target_timestamp` |
-| `alignment_version` | manifest alignment version, currently `video_pts_nearest_v1` |
+| `alignment_error_sec` | `abs(video_frame_timestamp - target_timestamp)` |
+| `alignment_version` | manifest alignment version, currently `comma_frame_times_nearest_v1` |
 | `speed` | speed interpolated at `target_timestamp` |
 | `steering_angle` | steering angle interpolated at `target_timestamp` |
 | `acceleration` | derived acceleration at `target_timestamp` |
@@ -99,7 +99,7 @@ python -m src.tools.cache_stage3_tartanvo_feature --split train --feature latent
 python -m src.tools.cache_stage3_tartanvo_feature --split val --feature latent
 ```
 
-The cache builder reads the canonical manifest frame fields and records `manifest_alignment_version` in cache metadata. comma2k19 caches without `manifest_alignment_version=video_pts_nearest_v1` are treated as invalid and must be regenerated.
+The cache builder reads the canonical manifest frame fields and records `manifest_alignment_version` in cache metadata. comma2k19 caches without `manifest_alignment_version=comma_frame_times_nearest_v1` are treated as invalid and must be regenerated.
 
 Target structure:
 

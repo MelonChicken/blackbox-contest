@@ -9,7 +9,7 @@ import av
 import numpy as np
 import pandas as pd
 
-from src.tools.stage3_comma_debug import abs_video_path, read_manifest
+from src.tools.stage3_comma_manifest import abs_video_path, frame_index_series, read_manifest
 
 CHECK_TIMES_SEC = (0.0, 10.0, 30.0, 59.0)
 
@@ -53,8 +53,13 @@ def _nearest_index(values: np.ndarray, target: float) -> int:
     return int(np.argmin(np.abs(values - target)))
 
 
+def _manifest_time_column(seg: pd.DataFrame) -> str:
+    return "target_timestamp" if "target_timestamp" in seg.columns else "timestamp"
+
+
 def _manifest_row_near(seg: pd.DataFrame, desired_time: float):
-    return seg.iloc[int(np.argmin(np.abs(seg.timestamp.to_numpy(float) - desired_time)))]
+    col = _manifest_time_column(seg)
+    return seg.iloc[int(np.argmin(np.abs(seg[col].to_numpy(float) - desired_time)))]
 
 
 def _sample_index(timestamp: float) -> int:
@@ -63,25 +68,30 @@ def _sample_index(timestamp: float) -> int:
 
 def _print_check(video_path: Path, seg: pd.DataFrame, pts_index: VideoPtsIndex, desired_time: float) -> None:
     row = _manifest_row_near(seg, desired_time)
-    target_timestamp = float(row.timestamp)
-    dataset_frame = int(row.frame_index)
-    nearest_frame = _nearest_index(pts_index.pts_sec, target_timestamp)
+    relative_timestamp = float(row.timestamp)
+    target_timestamp = float(getattr(row, "target_timestamp", relative_timestamp))
+    dataset_frame = int(row.video_frame_index if "video_frame_index" in seg.columns else row.frame_index)
+    nearest_frame = _nearest_index(pts_index.pts_sec, relative_timestamp)
     selected_pts = float(pts_index.pts_sec[dataset_frame]) if 0 <= dataset_frame < len(pts_index.pts_sec) else float("nan")
+    selected_clock = float(getattr(row, "video_frame_timestamp", selected_pts))
     nearest_pts = float(pts_index.pts_sec[nearest_frame])
-    sample_index = _sample_index(target_timestamp)
+    manifest_error = float(getattr(row, "alignment_error_sec", selected_clock - target_timestamp))
+    sample_index = _sample_index(relative_timestamp)
     print(f"sample_index={sample_index}")
     print(f"target_timestamp={target_timestamp:.6f}")
+    print(f"relative_timestamp={relative_timestamp:.6f}")
     print(f"video_reported_fps={pts_index.reported_fps:.6f}")
     print(f"decoded_frame_count={pts_index.decoded_frame_count}")
     print(f"selected_frame_index={dataset_frame}")
     print(f"selected_frame_pts_sec={selected_pts:.6f}")
-    print(f"time_error_sec={selected_pts - target_timestamp:.6f}")
+    print(f"selected_frame_timestamp={selected_clock:.6f}")
+    print(f"time_error_sec={manifest_error:.6f}")
     print(f"nearest_by_pts_frame_index={nearest_frame}")
     print(f"nearest_by_pts_sec={nearest_pts:.6f}")
     print(f"nearest_time_error_sec={nearest_pts - target_timestamp:.6f}")
     print(f"dataset_selected_nearest_by_pts={dataset_frame == nearest_frame}")
-    print(f"expected_if_20fps={int(round(target_timestamp * 20.0))}")
-    print(f"expected_if_25fps={int(round(target_timestamp * 25.0))}")
+    print(f"expected_if_20fps={int(round(relative_timestamp * 20.0))}")
+    print(f"expected_if_25fps={int(round(relative_timestamp * 25.0))}")
     print(f"video_path={video_path}")
     print()
 
@@ -94,8 +104,8 @@ def _video_groups(max_videos: int):
         except FileNotFoundError as exc:
             print(exc)
             continue
-        if "timestamp" not in df.columns or "frame_index" not in df.columns:
-            print(f"{split} manifest missing timestamp/frame_index columns")
+        if ("timestamp" not in df.columns and "target_timestamp" not in df.columns) or ("frame_index" not in df.columns and "video_frame_index" not in df.columns):
+            print(f"{split} manifest missing timestamp/target_timestamp or frame index columns")
             continue
         df = df.copy()
         df["_split"] = split

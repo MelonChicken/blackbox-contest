@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import cv2
 import numpy as np
 import pandas as pd
 
@@ -12,14 +11,32 @@ from src.config import (
     COMMA2K19_STAGE3_VAL_MANIFEST,
     STAGE3_COMMA_TRAIN_SAMPLE_LIMIT,
     STAGE3_COMMA_VAL_SAMPLE_LIMIT,
-    STAGE3_OUTPUT_HZ,
     STAGE3_TARTANVO_FEATURE,
     STAGE3_TARTANVO_FEATURE_CACHE,
     STAGE3_TRAIN_TEMPORAL_STRIDE,
     STAGE3_VAL_TEMPORAL_STRIDE,
+    SEED,
 )
-from src.train.stage3 import _balanced_limit, _stride_manifest
-from src.tools.build_comma2k19_stage3_manifest import ACCEL_NAMES, STEER_NAMES, _labels
+from src.tools.build_comma2k19_stage3_manifest import _video_timing
+
+
+def _stride_manifest(df: pd.DataFrame, stride: int) -> pd.DataFrame:
+    if stride <= 1 or df.empty:
+        return df.reset_index(drop=True)
+    key = "segment_id" if "segment_id" in df.columns else "sequence_id" if "sequence_id" in df.columns else "video_path"
+    parts = [part.iloc[::stride] for _, part in df.groupby(key, sort=False)]
+    return pd.concat(parts, ignore_index=True) if parts else df.reset_index(drop=True)
+
+
+def _balanced_limit(df: pd.DataFrame, limit: int | None) -> pd.DataFrame:
+    if not limit or limit <= 0 or len(df) <= limit:
+        return df.reset_index(drop=True)
+    key = "sequence_id" if "sequence_id" in df.columns else "segment_id" if "segment_id" in df.columns else None
+    if key is None:
+        return df.sample(n=limit, random_state=SEED).sort_index().reset_index(drop=True)
+    per_group = max(1, limit // df[key].nunique() + 1)
+    out = df.groupby(key, group_keys=False).sample(frac=1.0, random_state=SEED).groupby(key, group_keys=False).head(per_group)
+    return out.head(limit).sort_index().reset_index(drop=True)
 
 
 def read_manifest(split: str) -> pd.DataFrame:
@@ -33,6 +50,14 @@ def route_series(df: pd.DataFrame) -> pd.Series:
     if "route_id" in df.columns:
         return df["route_id"].astype(str)
     return df["video_path"].astype(str).map(lambda x: str(Path(x).parent))
+
+
+def frame_index_series(df: pd.DataFrame) -> pd.Series:
+    if "video_frame_index" in df.columns:
+        return df["video_frame_index"].astype(int)
+    if "frame_index" in df.columns:
+        return df["frame_index"].astype(int)
+    raise KeyError("manifest has neither video_frame_index nor legacy frame_index")
 
 
 def split_after_training_filters(df: pd.DataFrame, split: str) -> pd.DataFrame:
@@ -59,19 +84,14 @@ def feature_index(split: str) -> pd.DataFrame | None:
     return pd.read_csv(path) if path.is_file() else None
 
 
-def cap_info(video_path: str | Path) -> tuple[float, int]:
-    cap = cv2.VideoCapture(str(video_path))
-    try:
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 20.0)
-        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    finally:
-        cap.release()
-    return fps, frames
-
-
 def abs_video_path(row) -> Path:
     p = Path(str(row.video_path))
     return p if p.is_absolute() else COMMA2K19_STAGE3_RAW / p
+
+
+def cap_info(video_path: str | Path) -> tuple[float, int]:
+    timing = _video_timing(Path(video_path))
+    return timing.reported_fps, timing.decoded_frame_count
 
 
 def label_counts(values: pd.Series, names: dict[int, str]) -> dict[str, int]:
@@ -99,8 +119,9 @@ def print_sample_count_audit(split: str) -> None:
         key = 'segment_id' if 'segment_id' in df.columns else 'video_path'
         seg_key, seg = next(iter(df.groupby(key, sort=False)))
         video = abs_video_path(seg.iloc[0])
-        fps, frames = cap_info(video) if video.is_file() else (20.0, int(seg.frame_index.max()) + 1)
-        valid = ((seg.frame_index >= 0) & (seg.frame_index < frames)).sum()
+        fps, frames = cap_info(video) if video.is_file() else (20.0, int(frame_index_series(seg).max()) + 1)
+        frame_index = frame_index_series(seg)
+        valid = ((frame_index >= 0) & (frame_index < frames)).sum()
         used = split_after_training_filters(seg, split)
         print(f"segment {seg_key}")
         print(f"original frames: {frames}")
@@ -109,17 +130,20 @@ def print_sample_count_audit(split: str) -> None:
         print(f"final samples used: {len(used)}")
 
 
-def disagreement(df: pd.DataFrame) -> tuple[float, list[list[int]], dict[str, dict[str, int]]]:
-    if not {"speed", "steering_angle"} <= set(df.columns):
-        return float('nan'), [], {}
-    _, current, _ = _labels(df.speed.to_numpy(float), df.steering_angle.to_numpy(float), False, "current")
-    _, alt, _ = _labels(df.speed.to_numpy(float), df.steering_angle.to_numpy(float), False, "window_regression")
+def disagreement(df: pd.DataFrame, accel_names: dict[int, str]) -> tuple[float, list[list[int]], dict[str, dict[str, int]]]:
+    from src.datasets.stage3_labels import derive_acceleration_current, derive_acceleration_window_regression, derive_accel_label
+
+    if "speed" not in df.columns:
+        return float("nan"), [], {}
+    speed = df.speed.to_numpy(float)
+    current = derive_accel_label(speed, derive_acceleration_current(speed))
+    alt = derive_accel_label(speed, derive_acceleration_window_regression(speed))
     matrix = np.zeros((4, 4), dtype=int)
     for a, b in zip(current, alt):
         matrix[int(a), int(b)] += 1
-    agree = float((current == alt).mean()) if len(current) else float('nan')
+    agree = float((current == alt).mean()) if len(current) else float("nan")
     dist = {
-        "current": {ACCEL_NAMES[i]: int((current == i).sum()) for i in ACCEL_NAMES},
-        "window_regression": {ACCEL_NAMES[i]: int((alt == i).sum()) for i in ACCEL_NAMES},
+        "current": {accel_names[i]: int((current == i).sum()) for i in accel_names},
+        "window_regression": {accel_names[i]: int((alt == i).sum()) for i in accel_names},
     }
     return agree, matrix.tolist(), dist

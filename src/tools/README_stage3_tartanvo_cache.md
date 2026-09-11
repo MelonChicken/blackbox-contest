@@ -13,8 +13,8 @@ uv run python train.py
 Pose cache remains available:
 
 ```powershell
-uv run python -m src.tools.cache_stage3_tartanvo_pose --split train
-uv run python -m src.tools.cache_stage3_tartanvo_pose --split val
+uv run python -m src.tools.cache_stage3_tartanvo_feature --split train --feature pose
+uv run python -m src.tools.cache_stage3_tartanvo_feature --split val --feature pose
 ```
 
 Required config values in `src/config.py`:

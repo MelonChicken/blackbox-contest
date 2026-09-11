@@ -2,27 +2,42 @@ from __future__ import annotations
 
 import argparse
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
-import cv2
+import av
 import numpy as np
 import pandas as pd
 
-from src.config import (
-    COMMA2K19_STAGE3_MANIFEST,
-    COMMA2K19_STAGE3_RAW,
-    STAGE3_ACCEL_LABEL_MODE,
-    STAGE3_ACCEL_THRESHOLD,
-    STAGE3_ACCEL_WINDOW_SECONDS,
-    STAGE3_DECEL_THRESHOLD,
-    STAGE3_OUTPUT_HZ,
-    STAGE3_STEER_THRESHOLD_DEG,
-    STAGE3_STOP_SPEED_THRESHOLD,
-)
+from src.config import COMMA2K19_STAGE3_MANIFEST, COMMA2K19_STAGE3_RAW, STAGE3_ACCEL_LABEL_MODE, STAGE3_OUTPUT_HZ
+from src.datasets.stage3_labels import ACCEL_NAMES, STEER_NAMES, derive_accel_label, derive_acceleration, derive_steer_label
 
 VIDEO_EXT = {".hevc", ".mp4", ".mkv", ".avi", ".mov"}
-ACCEL_NAMES = {0: "ACCELERATING", 1: "DECELERATING", 2: "CONSTANT", 3: "STOPPED"}
-STEER_NAMES = {0: "LEFT", 1: "STRAIGHT", 2: "RIGHT"}
+ALIGNMENT_VERSION = "video_pts_nearest_v1"
+DEFAULT_MAX_ALIGNMENT_ERROR_SEC = 0.06
+
+
+@dataclass(frozen=True)
+class VideoTiming:
+    reported_fps: float
+    pts_sec: np.ndarray
+    time_base: str
+
+    @property
+    def decoded_frame_count(self) -> int:
+        return int(len(self.pts_sec))
+
+    @property
+    def duration(self) -> float:
+        return float(self.pts_sec[-1] - self.pts_sec[0]) if len(self.pts_sec) else 0.0
+
+
+@dataclass(frozen=True)
+class AlignmentStats:
+    candidates: int
+    valid: int
+    dropped_no_video_frame: int
+    errors: tuple[float, ...]
 
 
 def _load_array(path: Path) -> np.ndarray:
@@ -59,90 +74,128 @@ def _direct_video(segment: Path) -> Path:
     return videos[0]
 
 
-def _frame_times(segment: Path, video: Path) -> np.ndarray:
-    for rel in ("global_pose/frame_times", "global_pose/frame_times.npy", "global_pos/frame_times", "global_pos/frame_times.npy"):
+def _video_timing(video: Path) -> VideoTiming:
+    pts = []
+    with av.open(str(video)) as container:
+        stream = container.streams.video[0]
+        fps = float(stream.average_rate) if stream.average_rate is not None else float("nan")
+        time_base = str(stream.time_base)
+        for i, frame in enumerate(container.decode(stream)):
+            if frame.pts is not None and stream.time_base is not None:
+                pts.append(float(frame.pts * stream.time_base))
+            elif frame.time is not None:
+                pts.append(float(frame.time))
+            elif fps == fps and fps > 0:
+                pts.append(i / fps)
+            else:
+                pts.append(float(i))
+    if not pts:
+        raise ValueError(f"video decoded zero frames: {video}")
+    return VideoTiming(reported_fps=fps, pts_sec=np.asarray(pts, dtype=float), time_base=time_base)
+
+
+def _frame_time_arrays(segment: Path) -> list[tuple[str, np.ndarray]]:
+    rels = (
+        "global_pose/frame_times",
+        "global_pose/frame_times.npy",
+        "global_pos/frame_times",
+        "global_pos/frame_times.npy",
+        "frame_times",
+        "frame_times.npy",
+    )
+    out = []
+    for rel in rels:
         path = segment / rel
         if path.is_file():
-            return _load_array(path).astype(float)
-    cap = cv2.VideoCapture(str(video))
-    try:
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 20.0)
-        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    finally:
-        cap.release()
-    if count <= 0:
-        raise ValueError(f"cannot read frame count: {video}")
-    return np.arange(count, dtype=float) / fps
-
-
-def _align_time_base(target_t: np.ndarray, state_t: np.ndarray) -> np.ndarray:
-    if state_t.min() <= target_t.max() and target_t.min() <= state_t.max():
-        return state_t
-    return state_t - state_t[0] + target_t[0]
-
-
-def _smooth(values: np.ndarray, width: int = 5) -> np.ndarray:
-    if len(values) < width:
-        return values
-    return np.convolve(values, np.ones(width, dtype=float) / width, mode="same")
-
-
-def _window_regression_accel(speed: np.ndarray, hz: float, half_window_seconds: float) -> np.ndarray:
-    times = np.arange(len(speed), dtype=float) / hz
-    out = np.zeros(len(speed), dtype=float)
-    for i, t in enumerate(times):
-        mask = np.abs(times - t) <= half_window_seconds
-        if mask.sum() < 2:
-            out[i] = 0.0
-        else:
-            out[i] = float(np.polyfit(times[mask] - t, speed[mask], 1)[0])
+            out.append((rel, _load_array(path).astype(float)))
+    for path in sorted(segment.rglob("*frame_times*.npy")):
+        rel = str(path.relative_to(segment))
+        if rel not in {name for name, _ in out}:
+            out.append((rel, _load_array(path).astype(float)))
     return out
 
 
-def _labels(speed: np.ndarray, steering: np.ndarray, invert_steering: bool, accel_mode: str = STAGE3_ACCEL_LABEL_MODE) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if accel_mode == "current":
-        accel = np.gradient(_smooth(speed), 1.0 / STAGE3_OUTPUT_HZ)
-    elif accel_mode == "window_regression":
-        accel = _window_regression_accel(np.asarray(speed, dtype=float), STAGE3_OUTPUT_HZ, STAGE3_ACCEL_WINDOW_SECONDS)
-    else:
-        raise ValueError(f"unknown STAGE3_ACCEL_LABEL_MODE: {accel_mode}")
-    accel_label = np.full(len(speed), 2, dtype=np.int64)
-    accel_label[accel > STAGE3_ACCEL_THRESHOLD] = 0
-    accel_label[accel < -STAGE3_DECEL_THRESHOLD] = 1
-    accel_label[speed < STAGE3_STOP_SPEED_THRESHOLD] = 3
-
-    steering = -steering if invert_steering else steering
-    steer_label = np.full(len(steering), 1, dtype=np.int64)
-    steer_label[steering > STAGE3_STEER_THRESHOLD_DEG] = 0
-    steer_label[steering < -STAGE3_STEER_THRESHOLD_DEG] = 2
-    return accel, accel_label, steer_label
+def _video_clock(segment: Path, timing: VideoTiming, allow_relative_pts_fallback: bool) -> tuple[np.ndarray, str]:
+    for name, values in _frame_time_arrays(segment):
+        values = np.asarray(values, dtype=float).squeeze()
+        if len(values) == timing.decoded_frame_count:
+            return values, name
+    if allow_relative_pts_fallback:
+        return timing.pts_sec - timing.pts_sec[0], "video_pts_relative_fallback"
+    raise FileNotFoundError(
+        f"no frame timestamp array with decoded frame count={timing.decoded_frame_count} under {segment}; "
+        "refusing to assume CAN start == video PTS 0"
+    )
 
 
-def _rows(video_path: str, frame_t, speed_t, speed_v, steer_t, steer_v, invert_steering: bool) -> list[dict]:
-    frame_t = np.asarray(frame_t, dtype=float).squeeze()
-    if len(frame_t) < 2:
-        raise ValueError("need at least two frame timestamps")
-    start, end = float(frame_t[0]), float(frame_t[-1])
-    target_t = np.arange(start, end + 1e-9, 1.0 / STAGE3_OUTPUT_HZ)
-    speed_t = _align_time_base(target_t, np.asarray(speed_t, dtype=float).squeeze())
-    steer_t = _align_time_base(target_t, np.asarray(steer_t, dtype=float).squeeze())
-    speed = np.interp(target_t, speed_t, np.asarray(speed_v, dtype=float).squeeze())
-    steering = np.interp(target_t, steer_t, np.asarray(steer_v, dtype=float).squeeze())
-    acceleration, accel_label, steer_label = _labels(speed, steering, invert_steering)
-    frame_index = np.clip(np.rint(np.interp(target_t, frame_t, np.arange(len(frame_t)))).astype(int), 0, len(frame_t) - 1)
-    return [
-        {
-            "video_path": video_path,
-            "frame_index": int(frame_index[i]),
-            "timestamp": float(target_t[i] - start),
-            "speed": float(speed[i]),
-            "acceleration": float(acceleration[i]),
-            "steering_angle": float(steering[i]),
-            "accel_label": int(accel_label[i]),
-            "steer_label": int(steer_label[i]),
-        }
-        for i in range(len(target_t))
-    ]
+
+def _target_grid(start: float, end: float) -> np.ndarray:
+    hz = float(STAGE3_OUTPUT_HZ)
+    first = np.ceil(start * hz - 1e-9) / hz
+    if first > end:
+        return np.empty(0, dtype=float)
+    return np.arange(first, end + 1e-9, 1.0 / hz, dtype=float)
+
+
+def _rows(
+    video_path: str,
+    video_clock_t: np.ndarray,
+    video_pts_sec: np.ndarray,
+    speed_t,
+    speed_v,
+    steer_t,
+    steer_v,
+    invert_steering: bool,
+    alignment_source: str,
+    max_alignment_error_sec: float = DEFAULT_MAX_ALIGNMENT_ERROR_SEC,
+) -> tuple[list[dict], AlignmentStats]:
+    video_clock_t = np.asarray(video_clock_t, dtype=float).squeeze()
+    video_pts_sec = np.asarray(video_pts_sec, dtype=float).squeeze()
+    speed_t = np.asarray(speed_t, dtype=float).squeeze()
+    steer_t = np.asarray(steer_t, dtype=float).squeeze()
+    speed_v = np.asarray(speed_v, dtype=float).squeeze()
+    steer_v = np.asarray(steer_v, dtype=float).squeeze()
+    start = max(float(video_clock_t[0]), float(speed_t[0]), float(steer_t[0]))
+    end = min(float(video_clock_t[-1]), float(speed_t[-1]), float(steer_t[-1]))
+    target_t = _target_grid(start, end)
+    if len(target_t) == 0:
+        return [], AlignmentStats(0, 0, 0, tuple())
+
+    speed = np.interp(target_t, speed_t, speed_v)
+    steering = np.interp(target_t, steer_t, steer_v)
+    acceleration = derive_acceleration(speed, STAGE3_ACCEL_LABEL_MODE)
+    accel_label = derive_accel_label(speed, acceleration)
+    steer_label = derive_steer_label(steering, invert_steering)
+    errors = []
+    rows = []
+    dropped = 0
+    video_start = float(video_clock_t[0])
+    for i, target in enumerate(target_t):
+        frame_index = int(np.argmin(np.abs(video_clock_t - target)))
+        err = float(video_clock_t[frame_index] - target)
+        if abs(err) > max_alignment_error_sec:
+            dropped += 1
+            continue
+        errors.append(err)
+        rows.append(
+            {
+                "video_path": video_path,
+                "sample_index": int(round((target - video_start) * STAGE3_OUTPUT_HZ)),
+                "target_timestamp": float(target),
+                "video_frame_index": frame_index,
+                "video_frame_timestamp": float(video_clock_t[frame_index]),
+                "video_pts_sec": float(video_pts_sec[frame_index]),
+                "alignment_error_sec": err,
+                "alignment_source": alignment_source,
+                "alignment_version": ALIGNMENT_VERSION,
+                "speed": float(speed[i]),
+                "acceleration": float(acceleration[i]),
+                "steering_angle": float(steering[i]),
+                "accel_label": int(accel_label[i]),
+                "steer_label": int(steer_label[i]),
+            }
+        )
+    return rows, AlignmentStats(len(target_t), len(rows), dropped, tuple(errors))
 
 
 def _segment_dirs(raw_root: Path) -> list[Path]:
@@ -156,19 +209,24 @@ def _segment_dirs(raw_root: Path) -> list[Path]:
     return segments
 
 
-def _local_rows(segment: Path, raw_root: Path, invert_steering: bool) -> list[dict]:
+def _local_rows(segment: Path, raw_root: Path, invert_steering: bool, allow_relative_pts_fallback: bool) -> tuple[list[dict], AlignmentStats]:
     video = _direct_video(segment)
-    frame_t = _frame_times(segment, video)
+    timing = _video_timing(video)
+    video_clock_t, alignment_source = _video_clock(segment, timing, allow_relative_pts_fallback)
     speed_t, speed_v = _series(segment, "speed")
     steer_t, steer_v = _series(segment, "steering_angle")
     rel_video = video.relative_to(raw_root) if video.is_relative_to(raw_root) else video
-    rows = _rows(str(rel_video), frame_t, speed_t, speed_v, steer_t, steer_v, invert_steering)
+    rows, stats = _rows(str(rel_video), video_clock_t, timing.pts_sec, speed_t, speed_v, steer_t, steer_v, invert_steering, alignment_source)
     route_id = segment.parent.name
     segment_id = segment.name
     for row in rows:
         row["route_id"] = route_id
         row["segment_id"] = segment_id
-    return rows
+        row["source"] = "comma2k19"
+        row["video_reported_fps"] = timing.reported_fps
+        row["video_decoded_frames"] = timing.decoded_frame_count
+        row["video_duration_sec"] = timing.duration
+    return rows, stats
 
 
 def _hf_video_path(row: dict, video_dir: Path) -> str:
@@ -197,18 +255,34 @@ def _hf_rows(split: str, limit: int | None, video_dir: Path, invert_steering: bo
     for row in ds:
         log = row["log"]
         video_path = _hf_video_path(row, video_dir)
-        rows.extend(
-            _rows(
-                video_path,
-                log["global_pose__frame_times"],
-                log["processed_log__CAN__speed__t"],
-                log["processed_log__CAN__speed__value"],
-                log["processed_log__CAN__steering_angle__t"],
-                log["processed_log__CAN__steering_angle__value"],
-                invert_steering,
-            )
+        video = Path(video_path)
+        timing = _video_timing(video)
+        frame_t = np.asarray(log["global_pose__frame_times"], dtype=float)
+        if len(frame_t) != timing.decoded_frame_count:
+            raise ValueError(f"HF frame_times length {len(frame_t)} != decoded frames {timing.decoded_frame_count}: {video_path}")
+        part, _ = _rows(
+            video_path,
+            frame_t,
+            timing.pts_sec,
+            log["processed_log__CAN__speed__t"],
+            log["processed_log__CAN__speed__value"],
+            log["processed_log__CAN__steering_angle__t"],
+            log["processed_log__CAN__steering_angle__value"],
+            invert_steering,
+            "global_pose__frame_times",
         )
+        rows.extend(part)
     return rows
+
+
+def _alignment_summary(df: pd.DataFrame) -> None:
+    if df.empty or "alignment_error_sec" not in df.columns:
+        return
+    err = df.alignment_error_sec.abs().to_numpy(float)
+    print(f"valid aligned samples: {len(df)}")
+    print(f"max alignment error: {err.max():.6f}")
+    print(f"mean alignment error: {err.mean():.6f}")
+    print(f"p95 alignment error: {np.percentile(err, 95):.6f}")
 
 
 def _write_splits(df: pd.DataFrame, out_dir: Path, val_ratio: float) -> tuple[Path, Path]:
@@ -222,6 +296,15 @@ def _write_splits(df: pd.DataFrame, out_dir: Path, val_ratio: float) -> tuple[Pa
     df["split"] = np.where(split_key.isin(val_routes), "val", "train")
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    schema = [
+        "route_id", "segment_id", "video_path", "sample_index", "target_timestamp",
+        "video_frame_index", "video_frame_timestamp", "alignment_error_sec", "alignment_version",
+        "speed", "steering_angle", "acceleration", "accel_label", "steer_label", "source", "split",
+    ]
+    for col in schema:
+        if col not in df.columns:
+            df[col] = "" if col in {"route_id", "segment_id", "source", "split", "alignment_version", "video_path"} else np.nan
+    df = df[schema]
     train_path, val_path = out_dir / "train.csv", out_dir / "val.csv"
     df[df.split == "train"].to_csv(train_path, index=False)
     df[df.split == "val"].to_csv(val_path, index=False)
@@ -230,10 +313,11 @@ def _write_splits(df: pd.DataFrame, out_dir: Path, val_ratio: float) -> tuple[Pa
         print(f"{split} routes: {part.route_id.nunique() if 'route_id' in part.columns else 'N/A'}")
         print("accel:", {ACCEL_NAMES[k]: int(v) for k, v in part.accel_label.value_counts().sort_index().items()})
         print("steer:", {STEER_NAMES[k]: int(v) for k, v in part.steer_label.value_counts().sort_index().items()})
+        _alignment_summary(part)
     return train_path, val_path
 
 
-def build_manifest(raw_root: Path, out_dir: Path, val_ratio: float, limit: int | None, invert_steering: bool, hf_split: str | None) -> tuple[Path, Path]:
+def build_manifest(raw_root: Path, out_dir: Path, val_ratio: float, limit: int | None, invert_steering: bool, hf_split: str | None, allow_relative_pts_fallback: bool = False) -> tuple[Path, Path]:
     if hf_split:
         rows = _hf_rows(hf_split, limit, out_dir.parent / "videos", invert_steering)
     else:
@@ -243,11 +327,24 @@ def build_manifest(raw_root: Path, out_dir: Path, val_ratio: float, limit: int |
         if not segments:
             raise FileNotFoundError(f"no comma2k19 Chunk_* segment directories found under {raw_root}")
         rows = []
+        total_candidates = total_valid = total_dropped = 0
+        all_errors = []
         for segment in segments:
             try:
-                rows.extend(_local_rows(segment, raw_root, invert_steering))
+                part, stats = _local_rows(segment, raw_root, invert_steering, allow_relative_pts_fallback)
+                rows.extend(part)
+                total_candidates += stats.candidates
+                total_valid += stats.valid
+                total_dropped += stats.dropped_no_video_frame
+                all_errors.extend(stats.errors)
             except Exception as exc:
-                warnings.warn(f"skip incomplete segment {segment}: {exc}")
+                warnings.warn(f"skip incomplete/unsynchronized segment {segment}: {exc}")
+        print(f"candidate 10Hz samples: {total_candidates}")
+        print(f"valid aligned samples: {total_valid}")
+        print(f"dropped because no video frame: {total_dropped}")
+        if all_errors:
+            err = np.abs(np.asarray(all_errors, dtype=float))
+            print(f"max / mean / p95 alignment error: {err.max():.6f} / {err.mean():.6f} / {np.percentile(err, 95):.6f}")
     return _write_splits(pd.DataFrame(rows), out_dir, val_ratio)
 
 
@@ -259,8 +356,9 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--hf-split", default=None, help="Use HuggingFace load_dataset('commaai/comma2k19', split=...) instead of local Chunk_* files.")
     parser.add_argument("--invert-steering", action="store_true")
+    parser.add_argument("--allow-relative-pts-fallback", action="store_true", help="Use video PTS relative time when no per-frame timestamp file exists. This assumes CAN/video starts are synchronized.")
     args = parser.parse_args()
-    build_manifest(args.raw_root, args.out_dir, args.val_ratio, args.limit, args.invert_steering, args.hf_split)
+    build_manifest(args.raw_root, args.out_dir, args.val_ratio, args.limit, args.invert_steering, args.hf_split, args.allow_relative_pts_fallback)
 
 
 if __name__ == "__main__":

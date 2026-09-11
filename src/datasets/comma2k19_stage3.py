@@ -10,10 +10,8 @@ import torch
 from torch.utils.data import Dataset
 
 from src.config import COMMA2K19_STAGE3_FRAME_CACHE, COMMA2K19_STAGE3_RAW, S3_MEAN, S3_STD, STAGE3_NUM_FRAMES, STAGE3_RAW
+from src.datasets.stage3_labels import ACCEL_TO_ID, STEER_TO_ID
 from src.utils import _crop_tensor, clip
-
-ACCEL_TO_ID = {"ACCELERATING": 0, "DECELERATING": 1, "CONSTANT": 2, "STOPPED": 3}
-STEER_TO_ID = {"LEFT": 0, "STRAIGHT": 1, "RIGHT": 2}
 
 
 def stage3_video_clip(path: str | Path, frame_index: int, frames: int = STAGE3_NUM_FRAMES) -> torch.Tensor:
@@ -102,7 +100,7 @@ class Comma2k19Stage3Dataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         row = self.df.iloc[index]
         video_path = self._video_path(str(row.video_path))
-        frame_index = int(row.frame_index)
+        frame_index = int(row.video_frame_index if "video_frame_index" in self.df.columns else row.frame_index)
         cache_dir = self._cache_dir(row)
         try:
             video = stage3_cached_clip(cache_dir, frame_index, self.frames) if cache_dir else stage3_video_clip(video_path, frame_index, self.frames)
@@ -114,7 +112,7 @@ class Comma2k19Stage3Dataset(Dataset):
             "video": video,
             "accel_label": int(row.accel_label),
             "steer_label": int(row.steer_label),
-            "timestamp": float(row.timestamp),
+            "timestamp": float(row.target_timestamp if "target_timestamp" in self.df.columns else row.timestamp),
             "video_path": str(video_path),
             "frame_index": frame_index,
             "route_id": str(row.route_id) if "route_id" in self.df.columns else "",

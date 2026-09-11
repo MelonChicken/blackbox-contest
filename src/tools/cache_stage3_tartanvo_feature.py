@@ -99,7 +99,7 @@ def _checkpoint_sha1(path: Path) -> str | None:
 
 
 def _row_frame_index(row) -> int:
-    return int(getattr(row, "frame_index", getattr(row, "frame_idx", -1)))
+    return int(getattr(row, "video_frame_index", getattr(row, "frame_index", getattr(row, "frame_idx", -1))))
 
 
 def _row_sequence_id(row):
@@ -138,7 +138,7 @@ def cache_split(split: str, feature: str, root: Path = STAGE3_TARTANVO_FEATURE_C
                 "steer_label": steer_label,
                 "sample_key": key,
                 "source": dataset,
-                "frame_index": _row_frame_index(row),
+                "video_frame_index": _row_frame_index(row),
             }
 
             for name in ("video_path", "image_path", "sequence_id", "scene", "timestamp", "frame_paths"):
@@ -161,7 +161,11 @@ def cache_split(split: str, feature: str, root: Path = STAGE3_TARTANVO_FEATURE_C
                 pending.append((ds[i], row, key, path, accel_label, steer_label))
                 if len(pending) >= batch_size:
                     flush()
-            rows.append({"sample_key": key, "feature_path": feature_path, "accel_label": accel_label, "steer_label": steer_label, "sequence_id": _row_sequence_id(row), "frame_index": _row_frame_index(row)})
+            out_row = {"sample_key": key, "feature_path": feature_path, "accel_label": accel_label, "steer_label": steer_label, "sequence_id": _row_sequence_id(row), "video_frame_index": _row_frame_index(row)}
+            for name in ("alignment_version", "alignment_source", "target_timestamp", "video_pts_sec", "alignment_error_sec"):
+                if hasattr(row, name):
+                    out_row[name] = getattr(row, name)
+            rows.append(out_row)
         flush()
     pd.DataFrame(rows).to_csv(base / f"{split}_index.csv", index=False)
     metadata = {
@@ -181,6 +185,7 @@ def cache_split(split: str, feature: str, root: Path = STAGE3_TARTANVO_FEATURE_C
         "temporal_length": STAGE3_NUM_FRAMES - 1,
         "split": split,
         "samples": len(rows),
+        "manifest_alignment_version": str(ds.df.alignment_version.iloc[0]) if "alignment_version" in ds.df.columns and len(ds.df) else None,
     }
     (base / f"{split}_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 

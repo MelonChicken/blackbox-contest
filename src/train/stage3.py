@@ -53,8 +53,6 @@ try:
 except ImportError:
     STAGE3_DATASET_MODE = STAGE3_DATASET
 from src.datasets.comma2k19_stage3 import ACCEL_TO_ID, STEER_TO_ID, Comma2k19Stage3Dataset, Stage3DaconDataset
-from src.datasets.kitti_stage3 import KittiStage3Dataset, _label_id
-from src.datasets.nuscenes_stage3 import NuScenesStage3Dataset
 from src.datasets.stage3_tartanvo_pose import Stage3MixedTartanFeatureDataset, Stage3TartanFeatureDataset
 from src.models import Stage3MViT, Stage3ResNetGRU, Stage3TartanVOGRU
 from src.utils import set_seed
@@ -138,6 +136,10 @@ def _limited_dataset(dataset, stride: int, limit: int | None):
     return dataset, before, len(dataset)
 
 
+def _label_id(value, mapping: dict[str, int]) -> int:
+    return int(value) if not isinstance(value, str) else mapping[value]
+
+
 def _source_limit(source: str, split: str) -> int | None:
     if source == "kitti":
         return STAGE3_KITTI_TRAIN_SAMPLE_LIMIT if split == "train" else STAGE3_KITTI_VAL_SAMPLE_LIMIT
@@ -191,6 +193,8 @@ def _raw_datasets():
             val_sets.append(("DACON", ds)); val_sources["DACON"] = len(ds); summary["dacon_val"] = len(ds)
 
     if STAGE3_DATASET_MODE in {"kitti", "mixed"}:
+        from src.datasets.kitti_stage3 import KittiStage3Dataset
+
         if KITTI_STAGE3_TRAIN_MANIFEST.is_file():
             ds, before, after = _limited_dataset(KittiStage3Dataset(KITTI_STAGE3_TRAIN_MANIFEST), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_KITTI_TRAIN_SAMPLE_LIMIT)
             train_sets.append(ds); train_sources["KITTI"] = len(ds); summary.update(kitti_train_before=before, kitti_train_after=after)
@@ -199,6 +203,8 @@ def _raw_datasets():
             val_sets.append(("KITTI", ds)); val_sources["KITTI"] = len(ds); summary.update(kitti_val_before=before, kitti_val_after=after)
 
     if STAGE3_DATASET_MODE == "nuscenes":
+        from src.datasets.nuscenes_stage3 import NuScenesStage3Dataset
+
         if STAGE3_NUSCENES_MANIFEST.is_file():
             df = pd.read_csv(STAGE3_NUSCENES_MANIFEST)
             if "split" not in df.columns:
@@ -211,6 +217,8 @@ def _raw_datasets():
                 ds, before, after = _limited_dataset(NuScenesStage3Dataset(val_df, root=STAGE3_NUSCENES_ROOT), STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_NUSCENES_SAMPLE_LIMIT)
                 val_sets.append(("nuScenes", ds)); val_sources["nuScenes"] = len(ds); summary.update(nuscenes_val_before=before, nuscenes_val_after=after)
     elif STAGE3_DATASET_MODE == "mixed":
+        from src.datasets.nuscenes_stage3 import NuScenesStage3Dataset
+
         if COMMA2K19_STAGE3_TRAIN_MANIFEST.is_file():
             ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(COMMA2K19_STAGE3_TRAIN_MANIFEST), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_COMMA_TRAIN_SAMPLE_LIMIT)
             train_sets.append(ds); train_sources["comma2k19"] = len(ds); summary.update(comma_train_before=before, comma_train_after=after)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -38,9 +39,16 @@ def _row_value(row, name: str):
     return row[name]
 
 
+def _row_frame_index(row) -> int:
+    try:
+        return int(_row_value(row, "video_frame_index"))
+    except (KeyError, AttributeError):
+        return int(_row_value(row, "frame_index"))
+
+
 def stage3_tartanvo_sample_key(row) -> str:
     try:
-        return sanitize_cache_filename(f"{_row_value(row, 'sequence_id')}__{int(_row_value(row, 'frame_index'))}")
+        return sanitize_cache_filename(f"{_row_value(row, 'sequence_id')}__{_row_frame_index(row)}")
     except (KeyError, AttributeError):
         pass
     try:
@@ -48,13 +56,13 @@ def stage3_tartanvo_sample_key(row) -> str:
     except (KeyError, AttributeError):
         pass
     try:
-        return sanitize_cache_filename(f"{_row_value(row, 'ID')}__{int(_row_value(row, 'frame_index'))}")
+        return sanitize_cache_filename(f"{_row_value(row, 'ID')}__{_row_frame_index(row)}")
     except (KeyError, AttributeError):
         pass
     try:
-        return sanitize_cache_filename(f"{_row_value(row, 'route_id')}__{_row_value(row, 'segment_id')}__{int(_row_value(row, 'frame_index'))}")
+        return sanitize_cache_filename(f"{_row_value(row, 'route_id')}__{_row_value(row, 'segment_id')}__{_row_frame_index(row)}")
     except (KeyError, AttributeError):
-        value = f"{_row_value(row, 'video_path')}|{int(_row_value(row, 'frame_index'))}"
+        value = f"{_row_value(row, 'video_path')}|{_row_frame_index(row)}"
         return hashlib.sha1(value.encode("utf-8")).hexdigest()
 
 
@@ -74,7 +82,18 @@ class Stage3TartanFeatureDataset(Dataset):
         self.index_path = self.base / f"{split}_index.csv"
         if not self.index_path.is_file():
             raise FileNotFoundError(f"TartanVO {feature} cache index not found: {self.index_path}")
+        self._check_alignment_metadata(dataset)
         self.df = _limit_df(pd.read_csv(self.index_path), limit)
+
+    def _check_alignment_metadata(self, dataset: str) -> None:
+        if dataset != "comma2k19":
+            return
+        meta_path = self.base / f"{self.split}_metadata.json"
+        if not meta_path.is_file():
+            raise RuntimeError(f"comma2k19 TartanVO cache is invalid until regenerated with video_pts_nearest_v1 alignment: {self.index_path}")
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("manifest_alignment_version") != "video_pts_nearest_v1":
+            raise RuntimeError(f"comma2k19 TartanVO cache is invalid until regenerated with video_pts_nearest_v1 alignment: {self.index_path}")
 
     def _base_dir(self, dataset: str, feature: str) -> Path:
         source_base = self.root / feature / dataset
@@ -113,7 +132,7 @@ class Stage3TartanFeatureDataset(Dataset):
         accel = int(item.get("accel", item["accel_label"]))
         steer = int(item.get("steer", item["steer_label"]))
         sequence_id = item.get("sequence_id", getattr(row, "sequence_id", ""))
-        frame_index = item.get("frame_index", getattr(row, "frame_index", -1))
+        frame_index = item.get("video_frame_index", item.get("frame_index", getattr(row, "video_frame_index", getattr(row, "frame_index", -1))))
         return {
             "feature": feature.to(torch.float32),
             "accel": accel,

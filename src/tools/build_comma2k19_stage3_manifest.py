@@ -11,10 +11,12 @@ import pandas as pd
 from src.config import (
     COMMA2K19_STAGE3_MANIFEST,
     COMMA2K19_STAGE3_RAW,
+    STAGE3_ACCEL_LABEL_MODE,
     STAGE3_ACCEL_THRESHOLD,
+    STAGE3_ACCEL_WINDOW_SECONDS,
     STAGE3_DECEL_THRESHOLD,
     STAGE3_OUTPUT_HZ,
-    STAGE3_STEER_THRESHOLD,
+    STAGE3_STEER_THRESHOLD_DEG,
     STAGE3_STOP_SPEED_THRESHOLD,
 )
 
@@ -85,8 +87,25 @@ def _smooth(values: np.ndarray, width: int = 5) -> np.ndarray:
     return np.convolve(values, np.ones(width, dtype=float) / width, mode="same")
 
 
-def _labels(speed: np.ndarray, steering: np.ndarray, invert_steering: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    accel = np.gradient(_smooth(speed), 1.0 / STAGE3_OUTPUT_HZ)
+def _window_regression_accel(speed: np.ndarray, hz: float, half_window_seconds: float) -> np.ndarray:
+    times = np.arange(len(speed), dtype=float) / hz
+    out = np.zeros(len(speed), dtype=float)
+    for i, t in enumerate(times):
+        mask = np.abs(times - t) <= half_window_seconds
+        if mask.sum() < 2:
+            out[i] = 0.0
+        else:
+            out[i] = float(np.polyfit(times[mask] - t, speed[mask], 1)[0])
+    return out
+
+
+def _labels(speed: np.ndarray, steering: np.ndarray, invert_steering: bool, accel_mode: str = STAGE3_ACCEL_LABEL_MODE) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if accel_mode == "current":
+        accel = np.gradient(_smooth(speed), 1.0 / STAGE3_OUTPUT_HZ)
+    elif accel_mode == "window_regression":
+        accel = _window_regression_accel(np.asarray(speed, dtype=float), STAGE3_OUTPUT_HZ, STAGE3_ACCEL_WINDOW_SECONDS)
+    else:
+        raise ValueError(f"unknown STAGE3_ACCEL_LABEL_MODE: {accel_mode}")
     accel_label = np.full(len(speed), 2, dtype=np.int64)
     accel_label[accel > STAGE3_ACCEL_THRESHOLD] = 0
     accel_label[accel < -STAGE3_DECEL_THRESHOLD] = 1
@@ -94,8 +113,8 @@ def _labels(speed: np.ndarray, steering: np.ndarray, invert_steering: bool) -> t
 
     steering = -steering if invert_steering else steering
     steer_label = np.full(len(steering), 1, dtype=np.int64)
-    steer_label[steering > STAGE3_STEER_THRESHOLD] = 0
-    steer_label[steering < -STAGE3_STEER_THRESHOLD] = 2
+    steer_label[steering > STAGE3_STEER_THRESHOLD_DEG] = 0
+    steer_label[steering < -STAGE3_STEER_THRESHOLD_DEG] = 2
     return accel, accel_label, steer_label
 
 

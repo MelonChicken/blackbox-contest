@@ -39,7 +39,10 @@ from src.config import (
     STAGE3_SOURCE_BALANCED_SAMPLING,
     STAGE3_TARTANVO_FEATURE,
     STAGE3_TARTANVO_FEATURE_CACHE,
+    STAGE3_TARTANVO_MODE,
     STAGE3_TARTANVO_USE_FEATURE_CACHE,
+    STAGE3_TARTANVO_LR,
+    STAGE3_HEAD_LR,
     STAGE3_TRAIN_SAMPLE_LIMIT,
     STAGE3_TRAIN_TEMPORAL_STRIDE,
     STAGE3_VAL_SAMPLE_LIMIT,
@@ -140,6 +143,8 @@ def _source_limit(source: str, split: str) -> int | None:
         return STAGE3_KITTI_TRAIN_SAMPLE_LIMIT if split == "train" else STAGE3_KITTI_VAL_SAMPLE_LIMIT
     if STAGE3_DATASET_MODE == "mixed_features":
         return None
+    if STAGE3_DATASET_MODE == "comma_only" and source == "comma2k19":
+        return STAGE3_COMMA_TRAIN_SAMPLE_LIMIT if split == "train" else STAGE3_COMMA_VAL_SAMPLE_LIMIT
     if source == "nuscenes":
         return STAGE3_NUSCENES_SAMPLE_LIMIT
     if STAGE3_DATASET_MODE == "mixed":
@@ -162,7 +167,7 @@ def _feature_datasets():
         train = Stage3MixedTartanFeatureDataset("train", STAGE3_TARTANVO_FEATURE, root=STAGE3_TARTANVO_FEATURE_CACHE, sources=train_sources)
         val = {source: _feature_dataset(source, "val") for source in val_sources}
         return train, val, {"cache": True, "mixed": True, "train_sources": train.source_counts, "val_sources": {k: len(v) for k, v in val.items()}}
-    source = STAGE3_DATASET_MODE
+    source = "comma2k19" if STAGE3_DATASET_MODE == "comma_only" else STAGE3_DATASET_MODE
     train = _feature_dataset(source, "train")
     val = _feature_dataset(source, "val")
     return train, {source: val}, {"cache": True, "mixed": False, "train_sources": {source: len(train)}, "val_sources": {source: len(val)}}
@@ -216,7 +221,7 @@ def _raw_datasets():
             ds = NuScenesStage3Dataset(STAGE3_NUSCENES_TRAIN_MANIFEST, root=STAGE3_NUSCENES_ROOT)
             train_sets.append(ds); train_sources["nuScenes"] = len(ds); summary.update(nuscenes_train_before=len(ds), nuscenes_train_after=len(ds))
         summary["nuscenes_val_manifest"] = str(STAGE3_NUSCENES_VAL_MANIFEST)
-    elif STAGE3_DATASET_MODE == "comma2k19":
+    elif STAGE3_DATASET_MODE in {"comma2k19", "comma_only"}:
         if COMMA2K19_STAGE3_TRAIN_MANIFEST.is_file():
             ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(COMMA2K19_STAGE3_TRAIN_MANIFEST), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_TRAIN_SAMPLE_LIMIT)
             train_sets.append(ds); train_sources["comma2k19"] = len(ds); summary.update(comma_train_before=before, comma_train_after=after)
@@ -237,7 +242,7 @@ def _datasets():
         return _feature_datasets()
     if STAGE3_DATASET_MODE in {"mixed", "nuscenes"}:
         return _raw_datasets()
-    if STAGE3_ARCH == "tartanvo_gru" and STAGE3_TARTANVO_USE_FEATURE_CACHE:
+    if STAGE3_ARCH == "tartanvo_gru" and STAGE3_TARTANVO_MODE == "cached" and STAGE3_TARTANVO_USE_FEATURE_CACHE:
         return _feature_datasets()
     return _raw_datasets()
 
@@ -282,12 +287,13 @@ def _print_one_distribution(name: str, dataset) -> None:
 
 def _print_dataset_summary(train_dataset, val_datasets: dict[str, object], summary: dict) -> None:
     print("=== Stage 3 Dataset ===")
+    print(f"Dataset mode: {STAGE3_DATASET_MODE}")
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {sum(len(v) for v in val_datasets.values())}")
-    print(f"Batch size: {BATCH_SIZE}")
     print(f"Architecture: {STAGE3_ARCH}")
-    print(f"Dataset mode: {STAGE3_DATASET_MODE}")
+    print(f"TartanVO feature mode: {STAGE3_TARTANVO_MODE}/{STAGE3_TARTANVO_FEATURE}")
     print(f"TartanVO feature cache: {bool(summary.get('cache'))}")
+    print(f"Batch size: {BATCH_SIZE}")
     if summary.get("cache"):
         print("feature: [15, 1536]")
     if hasattr(train_dataset, "source_counts"):
@@ -372,7 +378,7 @@ def _validate_all(model, loaders: dict[str, DataLoader]) -> dict:
 
 
 def _source_balanced_sampler(dataset):
-    if STAGE3_DATASET_MODE in {"mixed", "mixed_features"} or not STAGE3_SOURCE_BALANCED_SAMPLING or not hasattr(dataset, "source_counts"):
+    if STAGE3_DATASET_MODE in {"mixed", "mixed_features", "comma_only"} or not STAGE3_SOURCE_BALANCED_SAMPLING or not hasattr(dataset, "source_counts"):
         return None
     return SourceBalancedSampler(dataset)
 
@@ -490,9 +496,23 @@ def fit_stage3():
     print(f"Trainable parameters: {_param_count(model, True)}")
     print(f"Frozen parameters: {_param_count(model, False)}")
     if STAGE3_ARCH == "tartanvo_gru":
-        print(f"TartanVO feature mode: {STAGE3_TARTANVO_FEATURE}")
+        print(f"TartanVO feature mode: {STAGE3_TARTANVO_MODE}/{STAGE3_TARTANVO_FEATURE}")
+        print(f"TartanVO unfreeze: {model.tartanvo_unfreeze}")
+        print(f"feature dimension: {model.feature_dim}")
+        print("sequence length: 15")
         print(f"TartanVO pretrained loaded: {model.tartanvo.pretrained_loaded}")
-    opt = torch.optim.AdamW(trainable_params, 1e-4)
+    if STAGE3_ARCH == "tartanvo_gru" and STAGE3_TARTANVO_MODE == "finetune":
+        tartan_params = [p for p in model.tartanvo.parameters() if p.requires_grad]
+        head_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("tartanvo.")]
+        groups = []
+        if tartan_params:
+            groups.append({"params": tartan_params, "lr": STAGE3_TARTANVO_LR})
+        if head_params:
+            groups.append({"params": head_params, "lr": STAGE3_HEAD_LR})
+        opt = torch.optim.AdamW(groups)
+        print(f"Optimizer LR: tartanvo={STAGE3_TARTANVO_LR} head={STAGE3_HEAD_LR}")
+    else:
+        opt = torch.optim.AdamW(trainable_params, STAGE3_HEAD_LR)
     accel_class_weights = _class_weights("accel")
     steer_class_weights = _class_weights("steer")
     best = -1.0

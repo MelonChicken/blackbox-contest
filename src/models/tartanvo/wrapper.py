@@ -13,23 +13,25 @@ class TartanVOEncoder(nn.Module):
     pose_std = torch.tensor([0.13, 0.13, 0.13, 0.013, 0.013, 0.013], dtype=torch.float32)
     latent_dim = 1536
 
-    def __init__(self, checkpoint: str | Path | None = None, load_pretrained: bool = True, height: int = 448, width: int = 640):
+    def __init__(self, checkpoint: str | Path | None = None, load_pretrained: bool = True, height: int = 448, width: int = 640, trainable: bool = False):
         super().__init__()
         self.vonet = VONet()
         self.height = int(height)
         self.width = int(width)
         self.pretrained_loaded = False
+        self.trainable = bool(trainable)
         if load_pretrained:
             if checkpoint is None or not Path(checkpoint).is_file():
                 raise FileNotFoundError(f"TartanVO checkpoint not found: {checkpoint}")
             self.load_pretrained(checkpoint)
         for p in self.vonet.parameters():
-            p.requires_grad = False
-        self.vonet.eval()
+            p.requires_grad = self.trainable
+        if not self.trainable:
+            self.vonet.eval()
 
     def train(self, mode: bool = True):
         super().train(mode)
-        self.vonet.eval()
+        self.vonet.train(mode if self.trainable else False)
         return self
 
     def load_pretrained(self, checkpoint: str | Path) -> None:
@@ -81,10 +83,9 @@ class TartanVOEncoder(nn.Module):
         img2 = resized[:, 1:].reshape(b * (t - 1), c, self.height, self.width).contiguous()
         pair_intrinsics = intrinsics.repeat_interleave(t - 1, dim=0) if intrinsics is not None and intrinsics.ndim == 2 else intrinsics
         intrinsic = self._intrinsic(img1.shape[0], img1.device, img1.dtype, pair_intrinsics)
-        with torch.no_grad():
-            if feature == "latent":
-                _, _, latent = self.vonet([img1, img2, intrinsic], return_latent=True)
-                return latent.reshape(b, t - 1, self.latent_dim)
-            _, pose = self.vonet([img1, img2, intrinsic])
-            pose = pose * self.pose_std.to(device=pose.device, dtype=pose.dtype)
+        if feature == "latent":
+            _, _, latent = self.vonet([img1, img2, intrinsic], return_latent=True)
+            return latent.reshape(b, t - 1, self.latent_dim)
+        _, pose = self.vonet([img1, img2, intrinsic])
+        pose = pose * self.pose_std.to(device=pose.device, dtype=pose.dtype)
         return pose.reshape(b, t - 1, 6)

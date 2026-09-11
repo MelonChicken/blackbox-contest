@@ -116,4 +116,7 @@ class Comma2k19Stage3Dataset(Dataset):
             "steer_label": int(row.steer_label),
             "timestamp": float(row.timestamp),
             "video_path": str(video_path),
+            "frame_index": frame_index,
+            "route_id": str(row.route_id) if "route_id" in self.df.columns else "",
+            "segment_id": str(row.segment_id) if "segment_id" in self.df.columns else "",
         }

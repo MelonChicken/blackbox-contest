@@ -4,6 +4,7 @@ import argparse
 import py_compile
 import re
 import sys
+import tokenize
 import zipfile
 from pathlib import Path
 
@@ -31,18 +32,17 @@ def validate_inference(path: Path) -> None:
     if not path.is_file():
         raise FileNotFoundError(path)
 
-    text = path.read_text(encoding="utf-8")
+    with tokenize.open(path) as f:
+        text = f.read()
     for name in ("predict_stage1", "predict_stage2", "predict_stage3"):
         if not re.search(rf"^def\s+{name}\s*\(", text, flags=re.MULTILINE):
             raise RuntimeError(f"missing function: {name}")
 
     if re.search(r"^\s*(from\s+src\.|import\s+src\.)", text, flags=re.MULTILINE):
-        raise RuntimeError(
-            "submission/inference.py must be self-contained; found a src.* import"
-        )
+        raise RuntimeError("submission/inference.py must not import repo-local src.*")
 
-    if re.search(r"\bResNet18_Weights\b|\bresnet18\b|resnet18-f37072fd\.pth", text):
-        raise RuntimeError("submission/inference.py still references the old Stage 2 ResNet path")
+    if re.search(r"\bResNet18_Weights\b|resnet18-f37072fd\.pth", text):
+        raise RuntimeError("submission/inference.py still references downloadable ResNet weights")
 
     compile(text, str(path), "exec")
 
@@ -79,10 +79,15 @@ def _iter_submission_files():
     for path in sorted(SUBMISSION_DIR.rglob("*")):
         if not path.is_file():
             continue
-        rel = path.relative_to(SUBMISSION_DIR).as_posix()
-        if "__pycache__" in path.parts or path.suffix in {".pyc", ".ipynb"}:
+        if "__pycache__" in path.parts or path.suffix in {".pyc", ".ipynb", ".zip"}:
             continue
-        yield path
+        yield path, path.relative_to(SUBMISSION_DIR).as_posix()
+
+
+def _iter_extra_model_files():
+    path = PROJECT_ROOT / "model" / "stage3" / "tartanvo_best.pt"
+    if path.is_file() and not (MODEL_DIR / "stage3" / "best.pt").is_file():
+        yield path, "model/stage3/best.pt"
 
 
 def build_zip() -> Path:
@@ -90,8 +95,10 @@ def build_zip() -> Path:
         SUBMIT_ZIP.unlink()
 
     with zipfile.ZipFile(SUBMIT_ZIP, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for path in _iter_submission_files():
-            zf.write(path, path.relative_to(SUBMISSION_DIR).as_posix())
+        for path, arcname in _iter_submission_files():
+            zf.write(path, arcname)
+        for path, arcname in _iter_extra_model_files():
+            zf.write(path, arcname)
 
     validate_zip(SUBMIT_ZIP)
     return SUBMIT_ZIP
@@ -117,6 +124,17 @@ def validate_zip(path: Path) -> None:
         "model/stage1/best.pt",
         "model/stage2/best.pt",
         "model/stage3/best.pt",
+        "model/__init__.py",
+        "model/stage1/__init__.py",
+        "model/stage1/mvit.py",
+        "model/stage2/__init__.py",
+        "model/stage2/videomae.py",
+        "model/stage3/__init__.py",
+        "model/stage3/heads.py",
+        "model/stage3/tartanvo.py",
+        "model/stage3/tartanvo_wrapper.py",
+        "model/stage3/tartanvo_network.py",
+        "model/stage3/tartanvo_correlation.py",
     }
     missing = sorted(required - set(names))
     if missing:

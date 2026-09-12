@@ -1,3 +1,4 @@
+# -*- coding: latin-1 -*-
 from __future__ import annotations
 
 import re
@@ -11,17 +12,11 @@ import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 
 from PIL import Image
-from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from torchvision.models import resnet18
-from torchvision.models.video import mvit_v2_s
 from torchvision.transforms import InterpolationMode
-from transformers import VideoMAEConfig, VideoMAEModel
-
-try:
-    from src.models.stage3 import Stage3TartanVOGRU as SrcStage3TartanVOGRU
-except Exception:
-    SrcStage3TartanVOGRU = None
+from model.stage1 import Stage1MViT
+from model.stage2 import LegacyStage2VideoMAE, Stage2VideoMAE
+from model.stage3 import Stage3MViT, Stage3ResNetGRU, Stage3TartanVOGRU
 
 
 # ============================================================
@@ -81,6 +76,10 @@ STEER = [
 
 cv2.setNumThreads(1)
 
+STAGE3_ENSEMBLE = True
+STAGE3_MVIT_CHECKPOINT = "mvit_best.pt"
+STAGE3_RESNET_GRU_CHECKPOINT = "resnet_gru_best.pt"
+
 
 # ============================================================
 # Common
@@ -115,120 +114,32 @@ def _video_paths(
 # Models
 # ============================================================
 
-class Stage1MViT(nn.Module):
-    """
-    Stage 1 ORIGINAL / RERECORDED
-    binary classification model.
-    """
-
-    def __init__(self):
-        super().__init__()
-
-        # Evaluation environment??????internet?????????????癲??됀??
-        # checkpoint?????ル뒌?? ?????獄쏅챶留??network state??????????
-        # pretrained weights??????????????댄뱼???????Β?ル윲?????????獄쏅챶留???????뀀??????쎛 ????癲ル슢?뤸뤃??
-        self.net = mvit_v2_s(
-            weights=None
-        )
-
-        self.net.head[1] = nn.Linear(
-            self.net.head[1].in_features,
-            2,
-        )
-
-    def forward(
-        self,
-        x,
-    ):
-        return self.net(x)
+def _tartanvo_config(checkpoint: dict) -> dict:
+    config = dict(checkpoint.get("model_config") or {})
+    state = checkpoint.get("model", {})
+    input_size = state.get("gru.weight_ih_l0")
+    if input_size is not None:
+        config.setdefault("tartanvo_feature", "pose" if input_size.shape[1] == 6 else "latent")
+    if "feature_norm.weight" in state:
+        config.setdefault("tartanvo_feature_norm", "layernorm")
+    if "pose_norm.weight" in state:
+        config.setdefault("tartanvo_pose_norm", "layernorm")
+    return config
 
 
-class Stage3MViT(nn.Module):
-    """
-    Stage 3:
-    Vehicle acceleration and steering classification.
-    """
-
-    def __init__(self):
-        super().__init__()
-
-        self.backbone = mvit_v2_s(
-            weights=None
-        )
-
-        dim = (
-            self.backbone
-            .head[1]
-            .in_features
-        )
-
-        self.backbone.head = (
-            nn.Identity()
-        )
-
-        self.accel = nn.Linear(
-            dim,
-            4,
-        )
-
-        self.steer = nn.Linear(
-            dim,
-            3,
-        )
-
-    def forward(
-        self,
-        x,
-    ):
-        z = self.backbone(x)
-
-        return (
-            self.accel(z),
-            self.steer(z),
-        )
+def _stage3_checkpoint_path(model_dir) -> Path:
+    root = Path(model_dir)
+    tartan = root / "tartanvo_best.pt"
+    return tartan if tartan.is_file() else root / "best.pt"
 
 
-class Stage3ResNetGRU(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int = 256,
-        num_layers: int = 1,
-        dropout: float = 0.2,
-    ):
-        super().__init__()
-        backbone = resnet18(weights=None)
-        feature_dim = backbone.fc.in_features
-        backbone.fc = nn.Identity()
-        self.backbone = backbone
-        self.gru = nn.GRU(
-            input_size=feature_dim,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.accel = nn.Linear(hidden_size, 4)
-        self.steer = nn.Linear(hidden_size, 3)
-
-    def forward(self, x):
-        b, c, t, h, w = x.shape
-        x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
-        features = self.backbone(x).reshape(b, t, -1)
-        temporal, _ = self.gru(features)
-        z = self.dropout(temporal.mean(dim=1))
-        return self.accel(z), self.steer(z)
-
-
-def _stage3_model(arch: str):
+def _stage3_model(arch: str, checkpoint: dict | None = None):
     if arch == "mvit":
         return Stage3MViT()
     if arch == "resnet18_gru":
         return Stage3ResNetGRU()
     if arch == "tartanvo_gru":
-        if SrcStage3TartanVOGRU is None:
-            raise RuntimeError("Stage3TartanVOGRU is unavailable in this submission runtime.")
-        return SrcStage3TartanVOGRU(load_pretrained=False)
+        return Stage3TartanVOGRU(load_pretrained=False, model_config=_tartanvo_config(checkpoint or {}))
     raise ValueError(f"Unknown Stage3 arch: {arch}")
 
 
@@ -243,8 +154,8 @@ def _clip_ids(
     slots: int = 1,
 ):
     """
-    AIHubStage1Dataset?????????살퓢????????산뭐??
-    ?????筌뤾퍓愿???????獄쏅챶留??????n?????ル뒌????frame?????癲???쭕?앷괌???濡ル젗?sampling???轅붽틓?????
+    AIHubStage1Dataset??????????�퓢?????????�뭐??
+    ?????筌뤾?�愿????????�쏅챶留??????n??????�뒌????frame?????????�??�괌???濡ル??sampling???轅붽??????
     """
 
     cap = cv2.VideoCapture(
@@ -271,7 +182,7 @@ def _clip_ids(
             f"invalid frame count: {path.name}"
         )
 
-    # Training Dataset?????????살퓢????????산뭐??
+    # Training Dataset??????????�퓢?????????�뭐??
     # torch.linspace + round ????
     return (
         torch.linspace(
@@ -295,7 +206,7 @@ def _decode_stage1_clip(
     Stage 1 inference preprocessing.
 
     AIHubStage1Dataset??validation ORIGINAL path??
-    ???????살퓢???spatial preprocessing????????轅붽틓?????
+    ????????�퓢???spatial preprocessing????????轅붽??????
 
         video decode
             ??
@@ -353,7 +264,7 @@ def _decode_stage1_clip(
             # ------------------------------
             # Shared intermediate resize
             #
-            # Training / validation??ORIGINAL?????????살퓢??
+            # Training / validation??ORIGINAL??????????�퓢??
             # ------------------------------
 
             rgb = cv2.resize(
@@ -397,8 +308,8 @@ def _decode_stage1_clip(
             f"cannot decode video: {path.name}"
         )
 
-    # ??? selected frame??decode??? ??? ??汝뷴젆?琉????
-    # ?耀붾굝??????????饔낅떽????????怨룸선?frame?????????????獄쏅챶留???clip ???雅?굛肄?????????援????????
+    # ??? selected frame??decode??? ??? ??汝뷴??�????
+    # ??�붾굝??????????饔낅??????????�룸??frame??????????????�쏅챶留???clip ?????굛肄??????????????????
     while len(frames) < len(frame_ids):
 
         frames.append(
@@ -416,7 +327,7 @@ def _decode_stage1_clip(
 
     # ------------------------------
     # Dataset._resize_to_model_size()
-    # ?? ???????살퓢???resize
+    # ?? ????????�퓢???resize
     #
     # [T,C,320,320]
     # ->
@@ -568,8 +479,8 @@ def predict_stage1(
     #     recapture_size = 320
     #
     # ????????checkpoint:
-    #     key?????ル뒌?? ???????ㅻ쑄?癲ル슢흮獒뺣끆????紐꾨열????size???????
-    #     ????????source -> 224 preprocessing????饔낅떽???嶺뚮슢梨뜹ㅇ??
+    #     key??????�뒌?? ????????�쑄??�ル??��?�뺣?????紐꾨?????size???????
+    #     ????????source -> 224 preprocessing????饔낅????嶺뚮??��?�ㅇ??
     recapture_size = int(
         checkpoint.get(
             "recapture_size",
@@ -686,11 +597,11 @@ def predict_stage1(
         scores,
     ):
 
-        # ??饔낅떽????????怨룸선???????살몝?轅붽틓??筌뚮랭沅??decode??prediction??????⑥ル??????????
-        # probability ????????????轅붽틓?????
+        # ??饔낅??????????�룸?????????�몝?轅붽???筌뚮??��??decode??prediction???????�???????????
+        # probability ????????????轅붽??????
         #
-        # ?????獄쏅챶留???decode????????癲ル슢?????????筌뤾퍓愿???fallback??
-        # ?????獄쏅챶留????????????饔낅떽??????????????轅붽틓?????
+        # ??????�쏅챶留???decode?????????�ル??????????筌뤾?�愿???fallback??
+        # ??????�쏅챶留????????????饔낅???????????????轅붽??????
         probability = (
             float(
                 np.mean(values)
@@ -734,85 +645,6 @@ def predict_stage1(
 
 VIDEOMAE_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 VIDEOMAE_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
-
-
-class Stage2VideoMAE(nn.Module):
-    def __init__(self, model_config: dict):
-        super().__init__()
-        self.num_frames = int(model_config.get("num_frames", 16))
-        self.image_size = int(model_config.get("image_size", 224))
-        self.direction_classes = int(model_config.get("direction_classes", 2))
-        self.avoidance_classes = int(model_config.get("avoidance_classes", 2))
-        self.dropout = float(model_config.get("dropout", 0.2))
-        hf_config = model_config.get("hf_config")
-        if hf_config is None:
-            raise KeyError("Stage 2 checkpoint model_config must contain hf_config.")
-        self.backbone = VideoMAEModel(VideoMAEConfig.from_dict(hf_config))
-        hidden_size = int(self.backbone.config.hidden_size)
-        self.head_dropout = nn.Dropout(self.dropout)
-        self.collision_head = nn.Linear(hidden_size, 1)
-        self.entry_head = nn.Linear(hidden_size, 1)
-        self.direction_head = nn.Linear(hidden_size, self.direction_classes)
-        self.avoidance_head = nn.Linear(hidden_size, self.avoidance_classes)
-
-    def forward(self, pixel_values: torch.Tensor) -> dict:
-        outputs = self.backbone(pixel_values=pixel_values)
-        tokens = outputs.last_hidden_state
-        batch_size, token_count, hidden_size = tokens.shape
-        temporal_count = max(1, self.num_frames // int(self.backbone.config.tubelet_size))
-        spatial_count = max(1, token_count // temporal_count)
-        temporal = tokens[:, : temporal_count * spatial_count].reshape(
-            batch_size, temporal_count, spatial_count, hidden_size
-        ).mean(dim=2)
-        temporal = self.head_dropout(temporal)
-        collision_logits = self.collision_head(temporal).squeeze(-1)
-        entry_logits = self.entry_head(temporal).squeeze(-1)
-        if collision_logits.shape[1] != self.num_frames:
-            collision_logits = F.interpolate(
-                collision_logits.unsqueeze(1), size=self.num_frames, mode="linear", align_corners=False
-            ).squeeze(1)
-            entry_logits = F.interpolate(
-                entry_logits.unsqueeze(1), size=self.num_frames, mode="linear", align_corners=False
-            ).squeeze(1)
-        global_feature = self.head_dropout(temporal.mean(dim=1))
-        return {
-            "collision_logits": collision_logits,
-            "entry_logits": entry_logits,
-            "direction_logits": self.direction_head(global_feature),
-            "avoidance_logits": self.avoidance_head(global_feature),
-        }
-
-
-class LegacyStage2VideoMAE(nn.Module):
-    def __init__(self, model_config: dict):
-        super().__init__()
-        hf_config = model_config["hf_config"]
-        self.encoder = VideoMAEModel(VideoMAEConfig.from_dict(hf_config))
-        config = self.encoder.config
-        self.hidden_size = int(config.hidden_size)
-        self.patch_size = int(config.patch_size)
-        self.tubelet_size = int(config.tubelet_size)
-        self.image_size = int(config.image_size)
-        self.num_frames = int(model_config.get("num_frames", 16))
-        spatial_size = self.image_size // self.patch_size
-        self.num_spatial_tokens = spatial_size * spatial_size
-        self.num_temporal_tokens = self.num_frames // self.tubelet_size
-        self.temporal_norm = nn.LayerNorm(self.hidden_size)
-        self.collision_head = nn.Sequential(nn.Dropout(0.2), nn.Linear(self.hidden_size, 1))
-        self.side_head = nn.Sequential(nn.LayerNorm(self.hidden_size), nn.Dropout(0.2), nn.Linear(self.hidden_size, 2))
-
-    def forward(self, video: torch.Tensor) -> dict:
-        outputs = self.encoder(pixel_values=video)
-        batch_size = outputs.last_hidden_state.shape[0]
-        temporal = outputs.last_hidden_state.reshape(
-            batch_size, self.num_temporal_tokens, self.num_spatial_tokens, self.hidden_size
-        ).mean(dim=2)
-        temporal = self.temporal_norm(temporal)
-        collision_logits = self.collision_head(temporal).squeeze(-1)
-        collision_logits = F.interpolate(
-            collision_logits.unsqueeze(1), size=self.num_frames, mode="linear", align_corners=False
-        ).squeeze(1)
-        return {"collision_logits": collision_logits, "side_logits": self.side_head(temporal.mean(dim=1))}
 
 
 def _stage2_model_config_from_checkpoint(checkpoint: dict):
@@ -1036,6 +868,19 @@ def _stage3_frames(
     )
 
 
+def _load_stage3_checkpoint(model_dir, filename, expected_arch):
+    checkpoint = torch.load(
+        Path(model_dir) / filename,
+        map_location="cpu",
+        weights_only=False,
+    )
+    arch = checkpoint.get("arch") or "mvit"
+    if arch != expected_arch:
+        raise ValueError(f"{filename} arch mismatch: expected {expected_arch}, got {arch}")
+    model = _stage3_model(arch, checkpoint)
+    model.load_state_dict(checkpoint["model"], strict=True)
+    return model
+
 def predict_stage3(
     data_dir,
     model_dir,
@@ -1043,21 +888,21 @@ def predict_stage3(
     device = _device()
 
     checkpoint = torch.load(
-        Path(model_dir)
-        / "best.pt",
+        _stage3_checkpoint_path(model_dir),
         map_location="cpu",
         weights_only=False,
     )
+    arch = checkpoint.get("arch") or "mvit"
+    use_ensemble = STAGE3_ENSEMBLE and arch != "tartanvo_gru"
 
-    model = _stage3_model(checkpoint.get("arch", "mvit"))
-
-    model.load_state_dict(
-        checkpoint["model"]
-    )
-
-    model.to(
-        device
-    ).eval()
+    if use_ensemble:
+        mvit_model = _load_stage3_checkpoint(model_dir, STAGE3_MVIT_CHECKPOINT, "mvit").to(device).eval()
+        resnet_model = _load_stage3_checkpoint(model_dir, STAGE3_RESNET_GRU_CHECKPOINT, "resnet18_gru").to(device).eval()
+        model = None
+    else:
+        model = _stage3_model(arch, checkpoint)
+        model.load_state_dict(checkpoint["model"], strict=True)
+        model.to(device).eval()
 
     videos = _video_paths(
         Path(data_dir)
@@ -1086,16 +931,17 @@ def predict_stage3(
 
             accel_predictions = []
             steer_predictions = []
+            window_batch = 1 if arch == "tartanvo_gru" else 8
 
             for start in range(
                 0,
                 count,
-                8,
+                window_batch,
             ):
 
                 center = centers[
                     start:
-                    start + 8
+                    start + window_batch
                 ]
 
                 indices = np.clip(
@@ -1158,12 +1004,16 @@ def predict_stage3(
                     dtype=torch.float16,
                 ):
 
-                    (
-                        accel_logits,
-                        steer_logits,
-                    ) = model(
-                        clips
-                    )
+                    if use_ensemble:
+                        accel_logits, _ = mvit_model(clips)
+                        _, steer_logits = resnet_model(clips)
+                    else:
+                        (
+                            accel_logits,
+                            steer_logits,
+                        ) = model(
+                            clips
+                        )
 
                 accel_predictions.extend(
                     accel_logits

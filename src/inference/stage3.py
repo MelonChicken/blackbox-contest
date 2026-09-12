@@ -43,21 +43,55 @@ def _stage3_frames(path: Path):
     return torch.stack(frames)
 
 
-def _stage3_model(arch: str):
+def _tartanvo_config(checkpoint: dict) -> dict:
+    config = dict(checkpoint.get("model_config") or {})
+    state = checkpoint.get("model", {})
+    input_size = state.get("gru.weight_ih_l0")
+    if input_size is not None:
+        config.setdefault("tartanvo_feature", "pose" if input_size.shape[1] == 6 else "latent")
+    config.setdefault("tartanvo_feature_norm", config.get("tartanvo_pose_norm", "none"))
+    return config
+
+
+def _stage3_state_dict(checkpoint: dict) -> dict:
+    state = dict(checkpoint["model"])
+    if "pose_norm.weight" in state and "feature_norm.weight" not in state:
+        state["feature_norm.weight"] = state.pop("pose_norm.weight")
+        state["feature_norm.bias"] = state.pop("pose_norm.bias")
+    return state
+
+
+def _stage3_checkpoint_path(model_dir) -> Path:
+    root = Path(model_dir)
+    tartan = root / "tartanvo_best.pt"
+    return tartan if tartan.is_file() else root / "best.pt"
+
+
+def _stage3_model(arch: str, checkpoint: dict | None = None):
     if arch == "mvit":
         return Stage3MViT(pretrained=False)
     if arch == "resnet18_gru":
         return Stage3ResNetGRU(pretrained=False)
     if arch == "tartanvo_gru":
-        return Stage3TartanVOGRU(load_pretrained=False)
+        config = _tartanvo_config(checkpoint or {})
+        return Stage3TartanVOGRU(
+            load_pretrained=False,
+            feature=config.get("tartanvo_feature", "pose"),
+            feature_norm=config.get("tartanvo_feature_norm", "none"),
+            hidden_size=int(config.get("gru_hidden_size", 256)),
+            num_layers=int(config.get("gru_num_layers", 1)),
+            dropout=float(config.get("dropout", 0.2)),
+            height=int(config.get("tartanvo_height", 448)),
+            width=int(config.get("tartanvo_width", 640)),
+        )
     raise ValueError(f"Unknown Stage3 arch: {arch}")
 
 
 def predict_stage3(data_dir, model_dir):
     device = _device()
-    checkpoint = torch.load(Path(model_dir) / "best.pt", map_location="cpu", weights_only=False)
-    model = _stage3_model(checkpoint.get("arch", "mvit"))
-    model.load_state_dict(checkpoint["model"], strict=True)
+    checkpoint = torch.load(_stage3_checkpoint_path(model_dir), map_location="cpu", weights_only=False)
+    model = _stage3_model(checkpoint.get("arch", "mvit"), checkpoint)
+    model.load_state_dict(_stage3_state_dict(checkpoint), strict=True)
     model.to(device).eval()
     videos = _video_paths(Path(data_dir) / "videos")
     rows = []
@@ -67,8 +101,9 @@ def predict_stage3(data_dir, model_dir):
             count = len(frames)
             centers = np.arange(count)
             accel_predictions, steer_predictions = [], []
-            for start in range(0, count, 8):
-                center = centers[start : start + 8]
+            window_batch = 1 if arch == "tartanvo_gru" else 8
+            for start in range(0, count, window_batch):
+                center = centers[start : start + window_batch]
                 indices = np.clip(center[:, None] - 8 + np.arange(16)[None, :], 0, count - 1)
                 clips = frames[torch.from_numpy(indices)].permute(0, 2, 1, 3, 4).float() / 255.0
                 clips = (clips - S3_MEAN[None, :, None, :, :]) / S3_STD[None, :, None, :, :]

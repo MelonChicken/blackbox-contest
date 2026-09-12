@@ -15,6 +15,8 @@ from src.config import (
     STAGE3_NUM_FRAMES,
     STAGE3_SEGMENT_FEATURE_LRU_SIZE,
     STAGE3_TARTANVO_FEATURE_CACHE,
+    STAGE3_TRAIN_TEMPORAL_STRIDE,
+    STAGE3_VAL_TEMPORAL_STRIDE,
 )
 from src.tools.stage3_comma_manifest import active_manifest_path, active_subset_name, segment_cache_index_name
 

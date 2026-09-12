@@ -41,6 +41,7 @@ from src.config import (
     STAGE3_TARTANVO_FEATURE,
     STAGE3_TARTANVO_FEATURE_CACHE,
     STAGE3_TARTANVO_MODE,
+    STAGE3_TARTANVO_UNFREEZE,
     STAGE3_TARTANVO_USE_FEATURE_CACHE,
     STAGE3_TARTANVO_LR,
     STAGE3_HEAD_LR,
@@ -257,6 +258,12 @@ def _raw_datasets():
     return train, dict(val_sets), summary
 
 def _datasets():
+    if STAGE3_TARTANVO_UNFREEZE == "full" and (
+        STAGE3_TARTANVO_MODE != "finetune"
+        or STAGE3_DATASET_MODE == "mixed_features"
+        or (STAGE3_TARTANVO_MODE == "cached" and STAGE3_TARTANVO_USE_FEATURE_CACHE)
+    ):
+        raise RuntimeError('full TartanVO fine-tuning requires STAGE3_TARTANVO_MODE="finetune" and raw video datasets')
     if STAGE3_DATASET_MODE == "mixed_features":
         return _feature_datasets()
     if STAGE3_DATASET_MODE in {"mixed", "nuscenes"}:
@@ -370,6 +377,12 @@ def _loss(accel, steer, batch, accel_weight=None, steer_weight=None):
     return total, loss_accel.detach(), loss_steer.detach()
 
 
+def _selection_score(accel_f1: float, steer_f1: float) -> float:
+    accel_w = float(STAGE3_LOSS_WEIGHTS.get("accel", 1.0))
+    steer_w = float(STAGE3_LOSS_WEIGHTS.get("steer", 1.0))
+    return ((accel_w * accel_f1) + (steer_w * steer_f1)) / max(1e-12, accel_w + steer_w)
+
+
 def _validate(model, loader):
     model.eval()
     accel_pred, accel_target, steer_pred, steer_target = [], [], [], []
@@ -382,7 +395,7 @@ def _validate(model, loader):
             steer_target.extend(batch["steer_label"].tolist())
     accel_metrics = _classification_metrics(accel_pred, accel_target, 4)
     steer_metrics = _classification_metrics(steer_pred, steer_target, 3)
-    return {"accel": accel_metrics, "steer": steer_metrics, "selection": (accel_metrics["macro_f1"] + steer_metrics["macro_f1"]) / 2}
+    return {"accel": accel_metrics, "steer": steer_metrics, "selection": _selection_score(accel_metrics["macro_f1"], steer_metrics["macro_f1"])}
 
 
 def _validate_all(model, loaders: dict[str, DataLoader]) -> dict:
@@ -491,7 +504,7 @@ def _checkpoint_payload(model, epoch: int, train_loss: float, metrics=None, hist
 
 
 def _print_metrics_table(metrics: dict, prefix: str = "") -> None:
-    print(prefix + "Source      Accel F1   Steer F1   Selection")
+    print(prefix + "Source      Accel F1   Steer F1   Weighted")
     print(prefix + "-------------------------------------------")
     for name, label in (("comma2k19", "comma val"), ("kitti", "KITTI val"), ("nuscenes", "nuScenes"), ("overall", "overall")):
         if name in metrics:
@@ -513,14 +526,22 @@ def fit_stage3():
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if not trainable_params:
         raise RuntimeError("Stage3 model has no trainable parameters.")
-    print(f"Trainable parameters: {_param_count(model, True)}")
+    print(f"Total trainable parameters: {_param_count(model, True)}")
     print(f"Frozen parameters: {_param_count(model, False)}")
     if STAGE3_ARCH == "tartanvo_gru":
+        tartan_trainable = sum(p.numel() for p in model.tartanvo.parameters() if p.requires_grad)
+        tartan_frozen = sum(p.numel() for p in model.tartanvo.parameters() if not p.requires_grad)
+        print(f"TartanVO mode: {STAGE3_TARTANVO_MODE}")
         print(f"TartanVO feature mode: {STAGE3_TARTANVO_MODE}/{STAGE3_TARTANVO_FEATURE}")
         print(f"TartanVO unfreeze: {model.tartanvo_unfreeze}")
+        print(f"Trainable TartanVO parameters: {tartan_trainable}")
+        print(f"Frozen TartanVO parameters: {tartan_frozen}")
         print(f"feature dimension: {model.feature_dim}")
         print("sequence length: 15")
         print(f"TartanVO pretrained loaded: {model.tartanvo.pretrained_loaded}")
+        if model.tartanvo_unfreeze == "full":
+            assert all(p.requires_grad for p in model.tartanvo.parameters())
+            assert tartan_frozen == 0
     if STAGE3_ARCH == "tartanvo_gru" and STAGE3_TARTANVO_MODE == "finetune":
         tartan_params = [p for p in model.tartanvo.parameters() if p.requires_grad]
         head_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("tartanvo.")]

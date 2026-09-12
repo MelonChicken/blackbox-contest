@@ -102,14 +102,21 @@ class Stage3TartanVOGRU(nn.Module):
         return self
 
     def apply_tartanvo_unfreeze(self, mode: str) -> None:
-        if mode not in {"none", "last_block", "last_2_blocks"}:
+        if mode not in {"none", "last_block", "last_2_blocks", "full"}:
             raise ValueError(f"unknown STAGE3_TARTANVO_UNFREEZE: {mode}")
+        if mode == "full" and self.tartanvo_mode != "finetune":
+            raise ValueError('STAGE3_TARTANVO_UNFREEZE="full" requires STAGE3_TARTANVO_MODE="finetune"')
         for p in self.tartanvo.parameters():
             p.requires_grad = False
         if self.tartanvo_mode != "finetune" or mode == "none":
             self.tartanvo.trainable = False
             return
         self.tartanvo.trainable = True
+        if mode == "full":
+            for p in self.tartanvo.parameters():
+                p.requires_grad = True
+            assert all(p.requires_grad for p in self.tartanvo.parameters())
+            return
         modules = [self.tartanvo.vonet.flowPoseNet.layer5]
         if mode == "last_2_blocks":
             modules.insert(0, self.tartanvo.vonet.flowPoseNet.layer4)

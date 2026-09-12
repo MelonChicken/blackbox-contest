@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from src.config import (
+    COMMA2K19_STAGE3_MANIFEST,
     COMMA2K19_STAGE3_RAW,
     COMMA2K19_STAGE3_SUBSET_MANIFEST,
     COMMA2K19_STAGE3_TRAIN_MANIFEST,
@@ -100,15 +101,60 @@ def _distribution(df: pd.DataFrame, col: str) -> dict[str, int]:
     return {str(k): int(v) for k, v in df[col].value_counts().sort_index().items()} if col in df.columns else {}
 
 
+def _segment_metadata() -> dict[str, int]:
+    path = COMMA2K19_STAGE3_MANIFEST / "video_metadata.csv"
+    if not path.is_file():
+        return {}
+    meta = pd.read_csv(path)
+    if "segment_id" not in meta.columns or "decoded_frame_count" not in meta.columns:
+        return {}
+    out = {}
+    for row in meta.itertuples(index=False):
+        count = int(getattr(row, "decoded_frame_count", 0) or 0)
+        if count > 0:
+            key = str(getattr(row, "segment_id"))
+            out[key] = count
+            out[Path(key).name] = count
+    return out
+
+
+def _frame_times_count(row) -> int:
+    video = abs_video_path(row)
+    segment = video.parent
+    for rel in ("global_pose/frame_times.npy", "global_pose/frame_times", "global_pos/frame_times.npy", "global_pos/frame_times", "frame_times.npy", "frame_times"):
+        path = segment / rel
+        if path.is_file():
+            return int(len(np.asarray(np.load(path, allow_pickle=False)).squeeze()))
+    return 0
+
+
+def _segment_count_key(row) -> str:
+    video = Path(str(row.video_path))
+    return str(video.parent).replace("\\", "/")
+
+
+def _estimated_pairs(df: pd.DataFrame) -> int:
+    keys = segment_key_columns(df)
+    meta = _segment_metadata()
+    total = 0
+    for row in df.drop_duplicates(keys).itertuples(index=False):
+        count = 0
+        if hasattr(row, "video_decoded_frames") and pd.notna(getattr(row, "video_decoded_frames")):
+            count = int(getattr(row, "video_decoded_frames") or 0)
+        if count <= 0:
+            count = int(meta.get(_segment_count_key(row), meta.get(str(getattr(row, "segment_id", "")), 0)))
+        if count <= 0:
+            count = _frame_times_count(row)
+        total += max(0, count - 1)
+    return int(total)
+
+
 def _summary(df: pd.DataFrame) -> dict:
     keys = segment_key_columns(df)
-    segments = df[keys].drop_duplicates().shape[0]
-    pair_estimate = 0
-    if "video_decoded_frames" in df.columns:
-        pair_estimate = int(df[keys + ["video_decoded_frames"]].drop_duplicates()["video_decoded_frames"].astype(int).sub(1).clip(lower=0).sum())
+    pair_estimate = _estimated_pairs(df)
     return {
         "routes": int(route_series(df).nunique()),
-        "segments": int(segments),
+        "segments": int(df[keys].drop_duplicates().shape[0]),
         "samples": int(len(df)),
         "accel": _distribution(df, "accel_label"),
         "steer": _distribution(df, "steer_label"),

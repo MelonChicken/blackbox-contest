@@ -161,6 +161,14 @@ def _feature_dataset(source: str, split: str):
     return Stage3TartanFeatureDataset(split, STAGE3_TARTANVO_FEATURE, root=STAGE3_TARTANVO_FEATURE_CACHE, dataset=source, limit=_source_limit(source, split))
 
 
+def _comma_manifest_path(split: str):
+    path = active_manifest_path(split)
+    if path.is_file() and path.stat().st_size > 0:
+        return path
+    fallback = COMMA2K19_STAGE3_TRAIN_MANIFEST if split == "train" else COMMA2K19_STAGE3_VAL_MANIFEST
+    return fallback if fallback.is_file() and fallback.stat().st_size > 0 else path
+
+
 def _available_feature_sources(split: str, sources: tuple[str, ...]) -> tuple[str, ...]:
     def has_cache(source: str) -> bool:
         if source == "comma2k19" and STAGE3_TARTANVO_FEATURE == "latent":
@@ -227,11 +235,11 @@ def _raw_datasets():
     elif STAGE3_DATASET_MODE == "mixed":
         from src.datasets.nuscenes_stage3 import NuScenesStage3Dataset
 
-        train_manifest = active_manifest_path("train")
+        train_manifest = _comma_manifest_path("train")
         if train_manifest.is_file():
             ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(train_manifest), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_COMMA_TRAIN_SAMPLE_LIMIT)
             train_sets.append(ds); train_sources["comma2k19"] = len(ds); summary.update(comma_train_before=before, comma_train_after=after)
-        val_manifest = active_manifest_path("val")
+        val_manifest = _comma_manifest_path("val")
         if val_manifest.is_file():
             ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(val_manifest), STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_COMMA_VAL_SAMPLE_LIMIT)
             val_sets.append(("comma2k19", ds)); val_sources["comma2k19"] = len(ds); summary.update(comma_val_before=before, comma_val_after=after)
@@ -240,11 +248,11 @@ def _raw_datasets():
             train_sets.append(ds); train_sources["nuScenes"] = len(ds); summary.update(nuscenes_train_before=len(ds), nuscenes_train_after=len(ds))
         summary["nuscenes_val_manifest"] = str(STAGE3_NUSCENES_VAL_MANIFEST)
     elif STAGE3_DATASET_MODE in {"comma2k19", "comma_only"}:
-        train_manifest = active_manifest_path("train")
+        train_manifest = _comma_manifest_path("train")
         if train_manifest.is_file():
             ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(train_manifest), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_TRAIN_SAMPLE_LIMIT)
             train_sets.append(ds); train_sources["comma2k19"] = len(ds); summary.update(comma_train_before=before, comma_train_after=after)
-        val_manifest = active_manifest_path("val")
+        val_manifest = _comma_manifest_path("val")
         if val_manifest.is_file():
             ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(val_manifest), STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_VAL_SAMPLE_LIMIT)
             val_sets.append(("comma2k19", ds)); val_sources["comma2k19"] = len(ds); summary.update(comma_val_before=before, comma_val_after=after)
@@ -520,6 +528,8 @@ def fit_stage3():
     history_path = loss_path = metrics_path = None
     train_dataset, val_datasets, summary = _datasets()
     _print_dataset_summary(train_dataset, val_datasets, summary)
+    if STAGE3_TARTANVO_MODE == "finetune" and sum(len(v) for v in val_datasets.values()) == 0:
+        raise RuntimeError("Stage3 finetune requires validation samples; build the val manifest/subset or use a profile with val data.")
     train_loader = _loader(train_dataset, shuffle=True)
     val_loaders = {name: _loader(ds, shuffle=False) for name, ds in val_datasets.items()}
     model = _build_stage3_model(pretrained=True).to(DEVICE)

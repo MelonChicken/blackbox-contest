@@ -2,16 +2,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
+from collections import OrderedDict
 from pathlib import Path
 
 import pandas as pd
 import torch
 from torch.utils.data import ConcatDataset, Dataset
 
-from src.config import SEED, STAGE3_TARTANVO_FEATURE_CACHE
+from src.config import (
+    COMMA2K19_STAGE3_TRAIN_MANIFEST,
+    COMMA2K19_STAGE3_VAL_MANIFEST,
+    SEED,
+    STAGE3_NUM_FRAMES,
+    STAGE3_SEGMENT_FEATURE_LRU_SIZE,
+    STAGE3_TARTANVO_FEATURE_CACHE,
+    STAGE3_TRAIN_TEMPORAL_STRIDE,
+    STAGE3_VAL_TEMPORAL_STRIDE,
+)
 
 
 WINDOWS_INVALID_FILENAME_CHARS = set('<>:"/\\|?*')
+TARTANVO_ALIGNMENT_VERSION = "comma_frame_times_nearest_v1"
+TARTANVO_SEGMENT_FEATURE_VERSION = "tartanvo_segment_latent_v1"
+TARTANVO_SEGMENT_LAYOUT = "segment"
 
 
 def sanitize_cache_filename(name: str) -> str:
@@ -20,6 +34,15 @@ def sanitize_cache_filename(name: str) -> str:
 
 def stage3_tartanvo_feature_path(split: str, sample_key: str) -> str:
     return str(Path(split) / f"{sanitize_cache_filename(sample_key)}.pt")
+
+
+def stage3_tartanvo_segment_key(row) -> str:
+    return sanitize_cache_filename(f"{_row_value(row, 'route_id')}__{_row_value(row, 'segment_id')}")
+
+
+def stage3_tartanvo_window(frame_index: int, frames: int = STAGE3_NUM_FRAMES) -> tuple[int, int]:
+    start = int(frame_index) - frames // 2
+    return start, start + frames - 1
 
 
 def stage3_tartanvo_legacy_join_path(split: str, sample_key: str) -> str:
@@ -72,6 +95,14 @@ def _limit_df(df: pd.DataFrame, limit: int | None) -> pd.DataFrame:
     return df.sample(n=limit, random_state=SEED).sort_index().reset_index(drop=True)
 
 
+def _stride_manifest(df: pd.DataFrame, stride: int) -> pd.DataFrame:
+    if stride <= 1 or df.empty:
+        return df.reset_index(drop=True)
+    key = ["route_id", "segment_id"] if {"route_id", "segment_id"}.issubset(df.columns) else "segment_id" if "segment_id" in df.columns else "video_path"
+    parts = [part.iloc[::stride] for _, part in df.groupby(key, sort=False)]
+    return pd.concat(parts, ignore_index=True) if parts else df.reset_index(drop=True)
+
+
 class Stage3TartanFeatureDataset(Dataset):
     def __init__(self, split: str, feature: str = "pose", root: str | Path = STAGE3_TARTANVO_FEATURE_CACHE, dataset: str = "comma2k19", limit: int | None = None):
         self.split = split
@@ -79,11 +110,55 @@ class Stage3TartanFeatureDataset(Dataset):
         self.source = dataset
         self.root = Path(root)
         self.base = self._base_dir(dataset, feature)
+        self.segment_layout = dataset == "comma2k19" and feature == "latent" and self.base.parent.name == "segment_latent"
+        self._segment_cache: OrderedDict[str, tuple[torch.Tensor, dict]] = OrderedDict()
+        if self.segment_layout:
+            self._init_segment_layout(limit)
+            return
         self.index_path = self.base / f"{split}_index.csv"
         if not self.index_path.is_file():
             raise FileNotFoundError(f"TartanVO {feature} cache index not found: {self.index_path}")
         self._check_alignment_metadata(dataset)
         self.df = _limit_df(pd.read_csv(self.index_path), limit)
+
+    def _init_segment_layout(self, limit: int | None) -> None:
+        self.index_path = self.base / f"{self.split}_index.csv"
+        meta_path = self.base / "metadata.json"
+        if not self.index_path.is_file() or not meta_path.is_file():
+            raise FileNotFoundError(f"comma2k19 segment TartanVO cache not found: {self.index_path}")
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("cache_layout") != TARTANVO_SEGMENT_LAYOUT or meta.get("feature_version") != TARTANVO_SEGMENT_FEATURE_VERSION:
+            raise RuntimeError(f"comma2k19 TartanVO segment cache version mismatch: {meta_path}")
+        if meta.get("alignment_version") != TARTANVO_ALIGNMENT_VERSION:
+            raise RuntimeError(f"comma2k19 TartanVO cache alignment mismatch: {meta_path}")
+        index = pd.read_csv(self.index_path)
+        self.segment_index = {str(row.segment_key): row.to_dict() for row in index.itertuples(index=False)}
+        manifest = COMMA2K19_STAGE3_TRAIN_MANIFEST if self.split == "train" else COMMA2K19_STAGE3_VAL_MANIFEST
+        df = pd.read_csv(manifest)
+        versions = set(df.get("alignment_version", pd.Series(dtype=str)).dropna().astype(str))
+        if versions != {TARTANVO_ALIGNMENT_VERSION}:
+            raise RuntimeError(f"comma2k19 manifest must use {TARTANVO_ALIGNMENT_VERSION}; found {sorted(versions) or [None]}")
+        stride = STAGE3_TRAIN_TEMPORAL_STRIDE if self.split == "train" else STAGE3_VAL_TEMPORAL_STRIDE
+        df = _stride_manifest(df, stride)
+        df["segment_key"] = [stage3_tartanvo_segment_key(row) for row in df.itertuples(index=False)]
+        starts, ends, valids = [], [], []
+        for row in df.itertuples(index=False):
+            start, end = stage3_tartanvo_window(_row_frame_index(row))
+            entry = self.segment_index.get(str(row.segment_key))
+            valid = entry is not None and start >= 0 and end <= int(entry["num_pairs"])
+            starts.append(start)
+            ends.append(end)
+            valids.append(valid)
+        df["tartanvo_window_start"] = starts
+        df["tartanvo_window_end"] = ends
+        df["tartanvo_valid"] = valids
+        dropped = int((~df["tartanvo_valid"]).sum())
+        if dropped:
+            warnings.warn(f"ignored {dropped} comma2k19 samples whose 16-frame TartanVO window crosses segment cache bounds")
+        old_index = self.root / self.feature / self.source / f"{self.split}_index.csv"
+        if old_index.is_file():
+            warnings.warn(f"ignoring legacy sample-level comma2k19 TartanVO cache: {old_index}")
+        self.df = _limit_df(df[df.tartanvo_valid].reset_index(drop=True), limit)
 
     def _check_alignment_metadata(self, dataset: str) -> None:
         if dataset != "comma2k19":
@@ -92,10 +167,13 @@ class Stage3TartanFeatureDataset(Dataset):
         if not meta_path.is_file():
             raise RuntimeError(f"comma2k19 TartanVO cache is invalid until regenerated with comma_frame_times_nearest_v1 alignment: {self.index_path}")
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if meta.get("manifest_alignment_version") != "comma_frame_times_nearest_v1":
+        if meta.get("manifest_alignment_version") != TARTANVO_ALIGNMENT_VERSION:
             raise RuntimeError(f"comma2k19 TartanVO cache is invalid until regenerated with comma_frame_times_nearest_v1 alignment: {self.index_path}")
 
     def _base_dir(self, dataset: str, feature: str) -> Path:
+        segment_base = self.root / "segment_latent" / dataset
+        if dataset == "comma2k19" and feature == "latent" and segment_base.joinpath(f"{self.split}_index.csv").is_file():
+            return segment_base
         source_base = self.root / feature / dataset
         if source_base.joinpath(f"{self.split}_index.csv").is_file():
             return source_base
@@ -110,6 +188,8 @@ class Stage3TartanFeatureDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, index: int) -> dict:
+        if self.segment_layout:
+            return self._getitem_segment(index)
         row = self.df.iloc[index]
         raw_key = str(row.sample_key)
         candidates = []
@@ -143,6 +223,45 @@ class Stage3TartanFeatureDataset(Dataset):
             "sample_key": sample_key,
             "sequence_id": "" if sequence_id is None else str(sequence_id),
             "frame_index": -1 if frame_index is None else int(frame_index),
+        }
+
+    def _load_segment(self, segment_key: str) -> tuple[torch.Tensor, dict]:
+        if segment_key in self._segment_cache:
+            self._segment_cache.move_to_end(segment_key)
+            return self._segment_cache[segment_key]
+        entry = self.segment_index[segment_key]
+        path = self.base / str(entry["feature_path"])
+        item = torch.load(path, map_location="cpu", weights_only=False)
+        if item.get("alignment_version") != TARTANVO_ALIGNMENT_VERSION or item.get("feature_version") != TARTANVO_SEGMENT_FEATURE_VERSION:
+            raise RuntimeError(f"TartanVO segment cache version mismatch: {path}")
+        features = item["features"].to(torch.float32)
+        if features.ndim != 2 or int(features.shape[-1]) != 1536:
+            raise RuntimeError(f"invalid TartanVO segment feature shape {tuple(features.shape)}: {path}")
+        self._segment_cache[segment_key] = (features, item)
+        while len(self._segment_cache) > STAGE3_SEGMENT_FEATURE_LRU_SIZE:
+            self._segment_cache.popitem(last=False)
+        return features, item
+
+    def _getitem_segment(self, index: int) -> dict:
+        row = self.df.iloc[index]
+        segment_key = str(row.segment_key)
+        features, _ = self._load_segment(segment_key)
+        start, end = int(row.tartanvo_window_start), int(row.tartanvo_window_end)
+        feature = features[start:end]
+        if tuple(feature.shape) != (STAGE3_NUM_FRAMES - 1, 1536):
+            raise RuntimeError(f"bad TartanVO slice shape {tuple(feature.shape)} for {segment_key}:{start}:{end}")
+        accel = int(row.accel_label)
+        steer = int(row.steer_label)
+        return {
+            "feature": feature,
+            "accel": accel,
+            "steer": steer,
+            "accel_label": accel,
+            "steer_label": steer,
+            "source": self.source,
+            "sample_key": stage3_tartanvo_sample_key(row),
+            "sequence_id": segment_key,
+            "frame_index": _row_frame_index(row),
         }
 
 

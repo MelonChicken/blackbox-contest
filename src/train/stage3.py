@@ -114,7 +114,7 @@ def _classification_metrics(pred: list[int], target: list[int], num_classes: int
 def _stride_manifest(df: pd.DataFrame, stride: int) -> pd.DataFrame:
     if stride <= 1 or df.empty:
         return df.reset_index(drop=True)
-    key = "segment_id" if "segment_id" in df.columns else "sequence_id" if "sequence_id" in df.columns else "scene" if "scene" in df.columns else "video_path"
+    key = ["route_id", "segment_id"] if {"route_id", "segment_id"}.issubset(df.columns) else "segment_id" if "segment_id" in df.columns else "sequence_id" if "sequence_id" in df.columns else "scene" if "scene" in df.columns else "video_path"
     parts = [part.iloc[::stride] for _, part in df.groupby(key, sort=False)]
     return pd.concat(parts, ignore_index=True) if parts else df.reset_index(drop=True)
 
@@ -159,7 +159,7 @@ def _feature_dataset(source: str, split: str):
 
 
 def _available_feature_sources(split: str, sources: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(source for source in sources if (STAGE3_TARTANVO_FEATURE_CACHE / STAGE3_TARTANVO_FEATURE / source / f"{split}_index.csv").is_file())
+    return tuple(source for source in sources if ((STAGE3_TARTANVO_FEATURE_CACHE / "segment_latent" / source / f"{split}_index.csv").is_file() if source == "comma2k19" and STAGE3_TARTANVO_FEATURE == "latent" else (STAGE3_TARTANVO_FEATURE_CACHE / STAGE3_TARTANVO_FEATURE / source / f"{split}_index.csv").is_file()))
 
 
 def _feature_datasets():

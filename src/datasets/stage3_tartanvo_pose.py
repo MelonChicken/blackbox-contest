@@ -132,7 +132,7 @@ class Stage3TartanFeatureDataset(Dataset):
         if meta.get("alignment_version") != TARTANVO_ALIGNMENT_VERSION:
             raise RuntimeError(f"comma2k19 TartanVO cache alignment mismatch: {meta_path}")
         index = pd.read_csv(self.index_path)
-        self.segment_index = {str(row.segment_key): row.to_dict() for row in index.itertuples(index=False)}
+        self.segment_index = {str(row.segment_key): row._asdict() for row in index.itertuples(index=False)}
         manifest = COMMA2K19_STAGE3_TRAIN_MANIFEST if self.split == "train" else COMMA2K19_STAGE3_VAL_MANIFEST
         df = pd.read_csv(manifest)
         versions = set(df.get("alignment_version", pd.Series(dtype=str)).dropna().astype(str))

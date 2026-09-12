@@ -8,6 +8,7 @@ from pathlib import Path
 import av
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from src.config import COMMA2K19_STAGE3_MANIFEST, COMMA2K19_STAGE3_RAW, STAGE3_ACCEL_LABEL_MODE, STAGE3_OUTPUT_HZ
 from src.datasets.stage3_labels import ACCEL_NAMES, STEER_NAMES, derive_accel_label, derive_acceleration, derive_steer_label
@@ -15,6 +16,21 @@ from src.datasets.stage3_labels import ACCEL_NAMES, STEER_NAMES, derive_accel_la
 VIDEO_EXT = {".hevc", ".mp4", ".mkv", ".avi", ".mov"}
 ALIGNMENT_VERSION = "comma_frame_times_nearest_v1"
 DEFAULT_MAX_ALIGNMENT_ERROR_SEC = 0.06
+VIDEO_METADATA_COLUMNS = [
+    "segment_id",
+    "decoded_frame_count",
+    "frame_times_count",
+    "frame_times_start",
+    "frame_times_end",
+    "frame_times_median_dt",
+    "valid",
+]
+
+
+class VideoMetadataError(Exception):
+    def __init__(self, original: Exception, metadata: dict):
+        super().__init__(str(original))
+        self.metadata = metadata
 
 
 @dataclass(frozen=True)
@@ -115,15 +131,55 @@ def _frame_time_arrays(segment: Path) -> list[tuple[str, np.ndarray]]:
     return out
 
 
-def _video_clock(segment: Path, timing: VideoTiming) -> tuple[np.ndarray, str]:
+def _video_clock_for_count(segment: Path, decoded_frame_count: int) -> tuple[np.ndarray, str]:
     for name, values in _frame_time_arrays(segment):
         values = np.asarray(values, dtype=float).squeeze()
-        if len(values) == timing.decoded_frame_count:
+        if len(values) == decoded_frame_count:
             return values, name
     raise FileNotFoundError(
-        f"no frame timestamp array with decoded frame count={timing.decoded_frame_count} under {segment}; "
+        f"no frame timestamp array with decoded frame count={decoded_frame_count} under {segment}; "
         "refusing to use HEVC PTS as the synchronization clock"
     )
+
+
+def _video_clock(segment: Path, timing: VideoTiming) -> tuple[np.ndarray, str]:
+    return _video_clock_for_count(segment, timing.decoded_frame_count)
+
+
+def _metadata_segment_id(segment: Path, raw_root: Path) -> str:
+    return str(segment.relative_to(raw_root) if segment.is_relative_to(raw_root) else segment)
+
+
+def _read_video_metadata(path: Path) -> dict[str, dict]:
+    if not path.is_file():
+        return {}
+    df = pd.read_csv(path)
+    return {str(row["segment_id"]): row.to_dict() for _, row in df.iterrows()}
+
+
+def _write_video_metadata(path: Path, metadata: dict[str, dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(metadata.values(), columns=VIDEO_METADATA_COLUMNS).sort_values("segment_id").to_csv(path, index=False)
+
+
+def _is_valid_metadata(row: dict | None) -> bool:
+    if not row:
+        return False
+    value = row.get("valid", False)
+    return value if isinstance(value, bool) else str(value).lower() == "true"
+
+
+def _metadata_from_frame_times(segment_id: str, decoded_frame_count: int, frame_t: np.ndarray, valid: bool) -> dict:
+    frame_t = np.asarray(frame_t, dtype=float).squeeze()
+    return {
+        "segment_id": segment_id,
+        "decoded_frame_count": int(decoded_frame_count),
+        "frame_times_count": int(len(frame_t)),
+        "frame_times_start": float(frame_t[0]) if len(frame_t) else float("nan"),
+        "frame_times_end": float(frame_t[-1]) if len(frame_t) else float("nan"),
+        "frame_times_median_dt": float(np.median(np.diff(frame_t))) if len(frame_t) > 1 else float("nan"),
+        "valid": bool(valid),
+    }
 
 
 
@@ -210,10 +266,30 @@ def _segment_dirs(raw_root: Path) -> list[Path]:
     return segments
 
 
-def _local_rows(segment: Path, raw_root: Path, invert_steering: bool) -> tuple[list[dict], AlignmentStats]:
+def _local_rows(
+    segment: Path,
+    raw_root: Path,
+    invert_steering: bool,
+    cached_metadata: dict | None = None,
+) -> tuple[list[dict], AlignmentStats, dict | None]:
     video = _direct_video(segment)
-    timing = _video_timing(video)
-    video_clock_t, alignment_source = _video_clock(segment, timing)
+    metadata = None
+    if cached_metadata is not None and not _is_valid_metadata(cached_metadata):
+        raise ValueError("cached invalid video metadata")
+    if _is_valid_metadata(cached_metadata):
+        decoded_frame_count = int(cached_metadata["decoded_frame_count"])
+        timing = VideoTiming(reported_fps=float("nan"), pts_sec=np.full(decoded_frame_count, np.nan), time_base="")
+        video_clock_t, alignment_source = _video_clock_for_count(segment, decoded_frame_count)
+    else:
+        timing = _video_timing(video)
+        try:
+            video_clock_t, alignment_source = _video_clock(segment, timing)
+            metadata = _metadata_from_frame_times(_metadata_segment_id(segment, raw_root), timing.decoded_frame_count, video_clock_t, True)
+        except Exception as exc:
+            arrays = _frame_time_arrays(segment)
+            frame_t = arrays[0][1] if arrays else np.asarray([], dtype=float)
+            metadata = _metadata_from_frame_times(_metadata_segment_id(segment, raw_root), timing.decoded_frame_count, frame_t, False)
+            raise VideoMetadataError(exc, metadata) from exc
     speed_t, speed_v = _series(segment, "speed")
     steer_t, steer_v = _series(segment, "steering_angle")
     rel_video = video.relative_to(raw_root) if video.is_relative_to(raw_root) else video
@@ -227,7 +303,7 @@ def _local_rows(segment: Path, raw_root: Path, invert_steering: bool) -> tuple[l
         row["video_reported_fps"] = timing.reported_fps
         row["video_decoded_frames"] = timing.decoded_frame_count
         row["video_duration_sec"] = timing.duration
-    return rows, stats
+    return rows, stats, metadata
 
 
 def _hf_video_path(row: dict, video_dir: Path) -> str:
@@ -335,17 +411,39 @@ def build_manifest(raw_root: Path, out_dir: Path, val_ratio: float, limit: int |
             raise FileNotFoundError(f"no comma2k19 Chunk_* segment directories found under {raw_root}")
         rows = []
         total_candidates = total_valid = total_dropped = 0
+        valid_segments = invalid_segments = 0
         all_errors = []
-        for segment in segments:
+        metadata_path = out_dir / "video_metadata.csv"
+        metadata = _read_video_metadata(metadata_path)
+        routes = sorted({segment.parent.name for segment in segments})
+        val_count = max(1, int(round(len(routes) * val_ratio))) if val_ratio > 0 and len(routes) > 1 else 0
+        val_routes = set(routes[-val_count:]) if val_count else set()
+        progress = tqdm(segments, total=len(segments), unit="segment")
+        for segment in progress:
+            split = "val" if segment.parent.name in val_routes else "train"
+            progress.set_description(f"comma {split}")
+            segment_key = _metadata_segment_id(segment, raw_root)
             try:
-                part, stats = _local_rows(segment, raw_root, invert_steering)
+                part, stats, new_metadata = _local_rows(segment, raw_root, invert_steering, metadata.get(segment_key))
+                if new_metadata is not None:
+                    metadata[segment_key] = new_metadata
                 rows.extend(part)
                 total_candidates += stats.candidates
                 total_valid += stats.valid
                 total_dropped += stats.dropped_no_video_frame
+                valid_segments += 1
                 all_errors.extend(stats.errors)
-            except Exception as exc:
+            except VideoMetadataError as exc:
+                metadata[segment_key] = exc.metadata
+                invalid_segments += 1
                 warnings.warn(f"skip incomplete/unsynchronized segment {segment}: {exc}")
+            except Exception as exc:
+                invalid_segments += 1
+                warnings.warn(f"skip incomplete/unsynchronized segment {segment}: {exc}")
+            progress.set_postfix_str(
+                f"valid={valid_segments} invalid={invalid_segments} | rows={len(rows)} | dropped_out_of_range={total_dropped}"
+            )
+        _write_video_metadata(metadata_path, metadata)
         print(f"candidate 10Hz samples: {total_candidates}")
         print(f"valid aligned samples: {total_valid}")
         print(f"dropped because no video frame: {total_dropped}")

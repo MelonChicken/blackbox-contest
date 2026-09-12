@@ -11,15 +11,12 @@ import torch
 from torch.utils.data import ConcatDataset, Dataset
 
 from src.config import (
-    COMMA2K19_STAGE3_TRAIN_MANIFEST,
-    COMMA2K19_STAGE3_VAL_MANIFEST,
     SEED,
     STAGE3_NUM_FRAMES,
     STAGE3_SEGMENT_FEATURE_LRU_SIZE,
     STAGE3_TARTANVO_FEATURE_CACHE,
-    STAGE3_TRAIN_TEMPORAL_STRIDE,
-    STAGE3_VAL_TEMPORAL_STRIDE,
 )
+from src.tools.stage3_comma_manifest import active_manifest_path, active_subset_name, segment_cache_index_name
 
 
 WINDOWS_INVALID_FILENAME_CHARS = set('<>:"/\\|?*')
@@ -122,7 +119,8 @@ class Stage3TartanFeatureDataset(Dataset):
         self.df = _limit_df(pd.read_csv(self.index_path), limit)
 
     def _init_segment_layout(self, limit: int | None) -> None:
-        self.index_path = self.base / f"{self.split}_index.csv"
+        self.subset_name = active_subset_name(self.split)
+        self.index_path = self.base / segment_cache_index_name(self.split, self.subset_name)
         meta_path = self.base / "metadata.json"
         if not self.index_path.is_file() or not meta_path.is_file():
             raise FileNotFoundError(f"comma2k19 segment TartanVO cache not found: {self.index_path}")
@@ -133,7 +131,9 @@ class Stage3TartanFeatureDataset(Dataset):
             raise RuntimeError(f"comma2k19 TartanVO cache alignment mismatch: {meta_path}")
         index = pd.read_csv(self.index_path)
         self.segment_index = {str(row.segment_key): row._asdict() for row in index.itertuples(index=False)}
-        manifest = COMMA2K19_STAGE3_TRAIN_MANIFEST if self.split == "train" else COMMA2K19_STAGE3_VAL_MANIFEST
+        manifest = active_manifest_path(self.split)
+        if not manifest.is_file():
+            raise FileNotFoundError(f"missing comma2k19 Stage3 manifest for {self.split}: {manifest}")
         df = pd.read_csv(manifest)
         versions = set(df.get("alignment_version", pd.Series(dtype=str)).dropna().astype(str))
         if versions != {TARTANVO_ALIGNMENT_VERSION}:
@@ -172,7 +172,7 @@ class Stage3TartanFeatureDataset(Dataset):
 
     def _base_dir(self, dataset: str, feature: str) -> Path:
         segment_base = self.root / "segment_latent" / dataset
-        if dataset == "comma2k19" and feature == "latent" and segment_base.joinpath(f"{self.split}_index.csv").is_file():
+        if dataset == "comma2k19" and feature == "latent" and (segment_base.joinpath(segment_cache_index_name(self.split, active_subset_name(self.split))).is_file() or segment_base.joinpath(f"{self.split}_index.csv").is_file()):
             return segment_base
         source_base = self.root / feature / dataset
         if source_base.joinpath(f"{self.split}_index.csv").is_file():

@@ -2,15 +2,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import json
+import zlib
+
 import numpy as np
 import pandas as pd
 
 from src.config import (
     COMMA2K19_STAGE3_RAW,
+    COMMA2K19_STAGE3_SUBSET_MANIFEST,
     COMMA2K19_STAGE3_TRAIN_MANIFEST,
     COMMA2K19_STAGE3_VAL_MANIFEST,
+    STAGE3_COMMA_SUBSET_MODE,
     STAGE3_COMMA_TRAIN_SAMPLE_LIMIT,
+    STAGE3_COMMA_TRAIN_SEGMENTS_PER_ROUTE,
     STAGE3_COMMA_VAL_SAMPLE_LIMIT,
+    STAGE3_COMMA_VAL_SEGMENTS_PER_ROUTE,
     STAGE3_TARTANVO_FEATURE,
     STAGE3_TARTANVO_FEATURE_CACHE,
     STAGE3_TRAIN_TEMPORAL_STRIDE,
@@ -38,6 +45,135 @@ def _balanced_limit(df: pd.DataFrame, limit: int | None) -> pd.DataFrame:
     out = df.groupby(key, group_keys=False).sample(frac=1.0, random_state=SEED).groupby(key, group_keys=False).head(per_group)
     return out.head(limit).sort_index().reset_index(drop=True)
 
+
+
+def segment_key_columns(df: pd.DataFrame) -> list[str]:
+    return ["route_id", "segment_id"] if {"route_id", "segment_id"}.issubset(df.columns) else ["video_path"]
+
+
+def subset_name(split: str, segments_per_route: int | None = None) -> str:
+    n = segments_per_route if segments_per_route is not None else (STAGE3_COMMA_TRAIN_SEGMENTS_PER_ROUTE if split == "train" else STAGE3_COMMA_VAL_SEGMENTS_PER_ROUTE)
+    return f"{split}_r{int(n)}"
+
+
+def subset_manifest_path(split: str, name: str | None = None) -> Path:
+    if name == "all" or (name is None and STAGE3_COMMA_SUBSET_MODE == "all"):
+        return COMMA2K19_STAGE3_TRAIN_MANIFEST if split == "train" else COMMA2K19_STAGE3_VAL_MANIFEST
+    if name in {None, ""}:
+        name = subset_name(split)
+    return COMMA2K19_STAGE3_SUBSET_MANIFEST / f"{name}.csv"
+
+
+def active_subset_name(split: str) -> str | None:
+    if STAGE3_COMMA_SUBSET_MODE == "all":
+        return None
+    if STAGE3_COMMA_SUBSET_MODE != "route_balanced":
+        raise ValueError(f"unknown STAGE3_COMMA_SUBSET_MODE: {STAGE3_COMMA_SUBSET_MODE}")
+    return subset_name(split)
+
+
+def active_manifest_path(split: str) -> Path:
+    name = active_subset_name(split)
+    if name is None:
+        return COMMA2K19_STAGE3_TRAIN_MANIFEST if split == "train" else COMMA2K19_STAGE3_VAL_MANIFEST
+    return subset_manifest_path(split, name)
+
+
+def segment_cache_index_name(split: str, subset: str | None = None) -> str:
+    return f"{subset}_index.csv" if subset not in {None, "", "all"} else f"{split}_index.csv"
+
+
+def route_balanced_subset(df: pd.DataFrame, segments_per_route: int, seed: int = SEED) -> pd.DataFrame:
+    keys = segment_key_columns(df)
+    segments = df[keys].drop_duplicates().copy()
+    segments["route"] = route_series(segments if "route_id" in segments.columns else df.loc[segments.index])
+    picked = []
+    for route, part in segments.groupby("route", sort=True):
+        route_seed = int(seed) + zlib.crc32(str(route).encode("utf-8"))
+        sample = part.sample(n=min(int(segments_per_route), len(part)), random_state=route_seed).sort_values(keys).drop(columns="route")
+        picked.append(sample)
+    chosen = pd.concat(picked, ignore_index=True) if picked else segments[keys].head(0)
+    return df.merge(chosen, on=keys, how="inner").reset_index(drop=True)
+
+
+def _distribution(df: pd.DataFrame, col: str) -> dict[str, int]:
+    return {str(k): int(v) for k, v in df[col].value_counts().sort_index().items()} if col in df.columns else {}
+
+
+def _summary(df: pd.DataFrame) -> dict:
+    keys = segment_key_columns(df)
+    segments = df[keys].drop_duplicates().shape[0]
+    pair_estimate = 0
+    if "video_decoded_frames" in df.columns:
+        pair_estimate = int(df[keys + ["video_decoded_frames"]].drop_duplicates()["video_decoded_frames"].astype(int).sub(1).clip(lower=0).sum())
+    return {
+        "routes": int(route_series(df).nunique()),
+        "segments": int(segments),
+        "samples": int(len(df)),
+        "accel": _distribution(df, "accel_label"),
+        "steer": _distribution(df, "steer_label"),
+        "estimated_pairs": int(pair_estimate),
+        "estimated_cache_mb_fp32": float(pair_estimate * 1536 * 4 / 1024 / 1024),
+    }
+
+
+def _dist_delta(full: dict[str, int], subset: dict[str, int]) -> dict[str, float]:
+    labels = sorted(set(full) | set(subset))
+    ft, st = max(1, sum(full.values())), max(1, sum(subset.values()))
+    return {label: (subset.get(label, 0) / st) - (full.get(label, 0) / ft) for label in labels}
+
+
+def build_route_balanced_subsets(
+    train_segments_per_route: int = STAGE3_COMMA_TRAIN_SEGMENTS_PER_ROUTE,
+    val_segments_per_route: int = STAGE3_COMMA_VAL_SEGMENTS_PER_ROUTE,
+    seed: int = SEED,
+) -> dict:
+    COMMA2K19_STAGE3_SUBSET_MANIFEST.mkdir(parents=True, exist_ok=True)
+    config = {"train": int(train_segments_per_route), "val": int(val_segments_per_route)}
+    metadata = {"mode": "route_balanced", "seed": int(seed), "splits": {}}
+    for split, per_route in config.items():
+        full = read_manifest(split)
+        subset = route_balanced_subset(full, per_route, seed)
+        name = subset_name(split, per_route)
+        path = subset_manifest_path(split, name)
+        subset.to_csv(path, index=False)
+        full_summary, subset_summary = _summary(full), _summary(subset)
+        metadata["splits"][split] = {
+            "name": name,
+            "path": str(path),
+            "segments_per_route": int(per_route),
+            "full": full_summary,
+            "subset": subset_summary,
+            "accel_delta": _dist_delta(full_summary["accel"], subset_summary["accel"]),
+            "steer_delta": _dist_delta(full_summary["steer"], subset_summary["steer"]),
+        }
+    meta_path = COMMA2K19_STAGE3_SUBSET_MANIFEST / f"metadata_r{int(train_segments_per_route)}_r{int(val_segments_per_route)}.json"
+    meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    return metadata
+
+
+def print_subset_summary(metadata: dict, seconds_per_segment: float | None = None, mb_per_segment: float | None = None) -> None:
+    total_segments = 0
+    for split, info in metadata["splits"].items():
+        sub = info["subset"]
+        total_segments += sub["segments"]
+        print(f"[{split} subset: {info['name']}]")
+        print(f"routes: {sub['routes']}")
+        print(f"segments: {sub['segments']}")
+        print(f"samples: {sub['samples']}")
+        print(f"accel: {sub['accel']}")
+        print(f"steer: {sub['steer']}")
+        print(f"estimated_pairs: {sub['estimated_pairs']}")
+        print(f"estimated_cache_mb_fp32: {sub['estimated_cache_mb_fp32']:.2f}")
+        print(f"accel_delta_vs_full: {info['accel_delta']}")
+        print(f"steer_delta_vs_full: {info['steer_delta']}")
+    total_mb = sum(info["subset"]["estimated_cache_mb_fp32"] for info in metadata["splits"].values())
+    print(f"total_segments: {total_segments}")
+    print(f"total_estimated_cache_mb_fp32: {total_mb:.2f}")
+    if mb_per_segment is not None:
+        print(f"estimated_cache_size_mb: {total_segments * float(mb_per_segment):.2f}")
+    if seconds_per_segment is not None:
+        print(f"estimated_cache_time_sec: {total_segments * float(seconds_per_segment):.1f}")
 
 def read_manifest(split: str) -> pd.DataFrame:
     path = COMMA2K19_STAGE3_TRAIN_MANIFEST if split == "train" else COMMA2K19_STAGE3_VAL_MANIFEST

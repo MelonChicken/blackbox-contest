@@ -45,6 +45,7 @@ from src.datasets.stage3_tartanvo_pose import (
 )
 from src.models import Stage3TartanVOGRU
 from src.tools.build_comma2k19_stage3_manifest import ALIGNMENT_VERSION
+from src.tools.stage3_comma_manifest import active_manifest_path, active_subset_name, segment_cache_index_name, subset_manifest_path
 from src.utils import _crop_tensor
 
 CACHE_VERSION = 2
@@ -189,8 +190,10 @@ def cache_segment_split(
     overwrite: bool = False,
     pair_batch_size: int = STAGE3_TARTANVO_CACHE_PAIR_BATCH_SIZE,
     max_segments: int | None = None,
+    manifest_subset: str | None = None,
 ) -> None:
-    manifest, _, _ = _split_config("comma2k19", split)
+    subset = active_subset_name(split) if manifest_subset is None else manifest_subset
+    manifest = active_manifest_path(split) if manifest_subset is None else subset_manifest_path(split, manifest_subset)
     df = pd.read_csv(manifest)
     versions = set(df.get("alignment_version", pd.Series(dtype=str)).dropna().astype(str))
     if versions != {ALIGNMENT_VERSION}:
@@ -261,7 +264,7 @@ def cache_segment_split(
             progress.set_postfix_str(
                 f"{n}/{len(groups)} {key} frames={num_frames} pairs={num_pairs} elapsed={elapsed:.1f}s ETA={eta/60:.1f}m cached={cached} skipped={skipped} failed={failed}"
             )
-    pd.DataFrame(rows).to_csv(base / f"{split}_index.csv", index=False)
+    pd.DataFrame(rows).to_csv(base / segment_cache_index_name(split, subset), index=False)
     metadata = {
         "alignment_version": ALIGNMENT_VERSION,
         "cache_layout": SEGMENT_CACHE_LAYOUT,
@@ -273,6 +276,8 @@ def cache_segment_split(
         "feature_version": TARTANVO_SEGMENT_FEATURE_VERSION,
         "pair_batch_size": int(pair_batch_size),
         "dataset": "comma2k19",
+        "manifest": str(manifest),
+        "manifest_subset": subset or "all",
         "splits": {split: {"segments": len(rows), "cached": cached, "skipped": skipped, "failed": failed}},
     }
     (base / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -376,11 +381,12 @@ def main() -> None:
     parser.add_argument("--pair-batch-size", type=int, default=STAGE3_TARTANVO_CACHE_PAIR_BATCH_SIZE)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--max-segments", type=int)
+    parser.add_argument("--manifest-subset", default=None, help="comma2k19 subset name such as train_r2/val_r1; default follows STAGE3_COMMA_SUBSET_MODE")
     args = parser.parse_args()
     if args.cache_layout == "segment":
         if args.dataset != "comma2k19" or args.feature != "latent":
             raise ValueError("--cache-layout segment is only implemented for comma2k19 latent")
-        cache_segment_split(args.split, overwrite=args.overwrite, pair_batch_size=args.pair_batch_size, max_segments=args.max_segments)
+        cache_segment_split(args.split, overwrite=args.overwrite, pair_batch_size=args.pair_batch_size, max_segments=args.max_segments, manifest_subset=args.manifest_subset)
         return
     cache_split(args.split, args.feature, overwrite=args.overwrite, dataset=args.dataset, batch_size=args.batch_size, max_samples=args.max_samples)
 

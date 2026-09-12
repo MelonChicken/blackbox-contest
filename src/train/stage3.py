@@ -55,6 +55,7 @@ except ImportError:
 from src.datasets.comma2k19_stage3 import ACCEL_TO_ID, STEER_TO_ID, Comma2k19Stage3Dataset, Stage3DaconDataset
 from src.datasets.stage3_tartanvo_pose import Stage3MixedTartanFeatureDataset, Stage3TartanFeatureDataset
 from src.models import Stage3MViT, Stage3ResNetGRU, Stage3TartanVOGRU
+from src.tools.stage3_comma_manifest import active_manifest_path, active_subset_name, segment_cache_index_name
 from src.utils import set_seed
 
 set_seed(SEED)
@@ -159,7 +160,12 @@ def _feature_dataset(source: str, split: str):
 
 
 def _available_feature_sources(split: str, sources: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(source for source in sources if ((STAGE3_TARTANVO_FEATURE_CACHE / "segment_latent" / source / f"{split}_index.csv").is_file() if source == "comma2k19" and STAGE3_TARTANVO_FEATURE == "latent" else (STAGE3_TARTANVO_FEATURE_CACHE / STAGE3_TARTANVO_FEATURE / source / f"{split}_index.csv").is_file()))
+    def has_cache(source: str) -> bool:
+        if source == "comma2k19" and STAGE3_TARTANVO_FEATURE == "latent":
+            index = segment_cache_index_name(split, active_subset_name(split))
+            return (STAGE3_TARTANVO_FEATURE_CACHE / "segment_latent" / source / index).is_file()
+        return (STAGE3_TARTANVO_FEATURE_CACHE / STAGE3_TARTANVO_FEATURE / source / f"{split}_index.csv").is_file()
+    return tuple(source for source in sources if has_cache(source))
 
 
 def _feature_datasets():
@@ -219,22 +225,26 @@ def _raw_datasets():
     elif STAGE3_DATASET_MODE == "mixed":
         from src.datasets.nuscenes_stage3 import NuScenesStage3Dataset
 
-        if COMMA2K19_STAGE3_TRAIN_MANIFEST.is_file():
-            ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(COMMA2K19_STAGE3_TRAIN_MANIFEST), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_COMMA_TRAIN_SAMPLE_LIMIT)
+        train_manifest = active_manifest_path("train")
+        if train_manifest.is_file():
+            ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(train_manifest), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_COMMA_TRAIN_SAMPLE_LIMIT)
             train_sets.append(ds); train_sources["comma2k19"] = len(ds); summary.update(comma_train_before=before, comma_train_after=after)
-        if COMMA2K19_STAGE3_VAL_MANIFEST.is_file():
-            ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(COMMA2K19_STAGE3_VAL_MANIFEST), STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_COMMA_VAL_SAMPLE_LIMIT)
+        val_manifest = active_manifest_path("val")
+        if val_manifest.is_file():
+            ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(val_manifest), STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_COMMA_VAL_SAMPLE_LIMIT)
             val_sets.append(("comma2k19", ds)); val_sources["comma2k19"] = len(ds); summary.update(comma_val_before=before, comma_val_after=after)
         if STAGE3_NUSCENES_TRAIN_MANIFEST.is_file():
             ds = NuScenesStage3Dataset(STAGE3_NUSCENES_TRAIN_MANIFEST, root=STAGE3_NUSCENES_ROOT)
             train_sets.append(ds); train_sources["nuScenes"] = len(ds); summary.update(nuscenes_train_before=len(ds), nuscenes_train_after=len(ds))
         summary["nuscenes_val_manifest"] = str(STAGE3_NUSCENES_VAL_MANIFEST)
     elif STAGE3_DATASET_MODE in {"comma2k19", "comma_only"}:
-        if COMMA2K19_STAGE3_TRAIN_MANIFEST.is_file():
-            ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(COMMA2K19_STAGE3_TRAIN_MANIFEST), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_TRAIN_SAMPLE_LIMIT)
+        train_manifest = active_manifest_path("train")
+        if train_manifest.is_file():
+            ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(train_manifest), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_TRAIN_SAMPLE_LIMIT)
             train_sets.append(ds); train_sources["comma2k19"] = len(ds); summary.update(comma_train_before=before, comma_train_after=after)
-        if COMMA2K19_STAGE3_VAL_MANIFEST.is_file():
-            ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(COMMA2K19_STAGE3_VAL_MANIFEST), STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_VAL_SAMPLE_LIMIT)
+        val_manifest = active_manifest_path("val")
+        if val_manifest.is_file():
+            ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(val_manifest), STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_VAL_SAMPLE_LIMIT)
             val_sets.append(("comma2k19", ds)); val_sources["comma2k19"] = len(ds); summary.update(comma_val_before=before, comma_val_after=after)
     elif STAGE3_DATASET_MODE != "kitti":
         raise ValueError(f"Unknown STAGE3_DATASET_MODE: {STAGE3_DATASET_MODE}")

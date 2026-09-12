@@ -30,6 +30,7 @@ from src.config import (
     STAGE3_LOSS_WEIGHTS,
     STAGE3_MODEL,
     STAGE3_NUM_WORKERS,
+    STAGE3_SAMPLE_PROFILE,
     STAGE3_NUSCENES_MANIFEST,
     STAGE3_NUSCENES_ROOT,
     STAGE3_NUSCENES_SAMPLE_LIMIT,
@@ -306,6 +307,7 @@ def _print_one_distribution(name: str, dataset) -> None:
 def _print_dataset_summary(train_dataset, val_datasets: dict[str, object], summary: dict) -> None:
     print("=== Stage 3 Dataset ===")
     print(f"Dataset mode: {STAGE3_DATASET_MODE}")
+    print(f"Sample profile: {STAGE3_SAMPLE_PROFILE}")
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {sum(len(v) for v in val_datasets.values())}")
     print(f"Architecture: {STAGE3_ARCH}")

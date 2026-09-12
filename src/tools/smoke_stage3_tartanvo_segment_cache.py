@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 import torch
+import torch.nn.functional as F
 
 from src.config import (
     COMMA2K19_STAGE3_RAW,
@@ -38,15 +39,34 @@ def _direct_clip(video_path: Path, indices: list[int]) -> torch.Tensor:
     return torch.stack([_crop_tensor(frames[i]) for i in indices], dim=1)
 
 
+def _normalized(raw_clip: torch.Tensor) -> torch.Tensor:
+    return (raw_clip - S3_MEAN[:, None, :, :]) / S3_STD[:, None, :, :]
+
+
+def _vonet_inputs(model: Stage3TartanVOGRU, normalized_clip: torch.Tensor, pair: int = 0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    frames = (normalized_clip.unsqueeze(0).to(DEVICE) * model.s3_std + model.s3_mean).clamp(0.0, 1.0)
+    b, c, t, h, w = frames.shape
+    resized = F.interpolate(frames.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w), size=(model.tartanvo.height, model.tartanvo.width), mode="bilinear", align_corners=False)
+    resized = resized.reshape(b, t, c, model.tartanvo.height, model.tartanvo.width)
+    img1 = resized[:, pair].contiguous()
+    img2 = resized[:, pair + 1].contiguous()
+    intrinsic = model.tartanvo._intrinsic(1, img1.device, img1.dtype)
+    return img1.cpu(), img2.cpu(), intrinsic.cpu()
+
+
+def _describe_tensor(name: str, x: torch.Tensor) -> None:
+    print(name, "shape", tuple(x.shape), "dtype", str(x.dtype), "min", float(x.min()), "max", float(x.max()), "mean", float(x.mean()))
+
+
 def _direct_feature(model: Stage3TartanVOGRU, clip: torch.Tensor, pair_batch_size: int | None = None) -> torch.Tensor:
-    video = ((clip - S3_MEAN[:, None, :, :]) / S3_STD[:, None, :, :]).unsqueeze(0).to(DEVICE)
+    video = _normalized(clip).unsqueeze(0).to(DEVICE)
     if pair_batch_size is None:
         return model.feature_sequence(video).squeeze(0).cpu()
     outs = []
     raw = (video * model.s3_std + model.s3_mean).clamp(0.0, 1.0).squeeze(0).cpu()
     for start in range(0, raw.shape[1] - 1, pair_batch_size):
         chunk = raw[:, start : min(start + pair_batch_size + 1, raw.shape[1])]
-        norm = ((chunk - S3_MEAN[:, None, :, :]) / S3_STD[:, None, :, :]).unsqueeze(0).to(DEVICE)
+        norm = _normalized(chunk).unsqueeze(0).to(DEVICE)
         outs.append(model.feature_sequence(norm).squeeze(0).cpu())
     return torch.cat(outs, dim=0)
 
@@ -101,10 +121,13 @@ def main() -> None:
     with torch.inference_mode():
         direct_clip = raw_direct[0]["video"]
         default_clip = raw_default[0]["video"]
-        segment_clip = _direct_clip(video_path, frame_indices)
+        segment_raw_clip = _direct_clip(video_path, frame_indices)
+        segment_clip = _normalized(segment_raw_clip)
+        direct_img1, direct_img2, direct_intrinsic = _vonet_inputs(model, direct_clip)
+        segment_img1, segment_img2, segment_intrinsic = _vonet_inputs(model, segment_clip)
         legacy = model.feature_sequence(direct_clip.unsqueeze(0).to(DEVICE)).squeeze(0).cpu()
-        segment_bs1 = _direct_feature(model, segment_clip, 1)
-        segment_bs16 = _direct_feature(model, segment_clip, 16)
+        segment_bs1 = _direct_feature(model, segment_raw_clip, 1)
+        segment_bs16 = _direct_feature(model, segment_raw_clip, 16)
         accel, steer = model.forward_feature(batch["feature"].to(DEVICE))
 
     print("center_frame", center)
@@ -113,9 +136,18 @@ def main() -> None:
     print("segment_slice_start_end", start, end)
     print("segment_pair_indices", pair_indices)
     print("legacy_default_frame_source", "jpeg_frame_cache" if default_cache_dir else "direct_video")
+    print("input_channel_order", "RGB")
+    print("direct_input_normalized", True, "segment_input_normalized", True)
+    _describe_tensor("direct_final_img1", direct_img1)
+    _describe_tensor("segment_final_img1", segment_img1)
+    _describe_tensor("direct_final_intrinsic", direct_intrinsic)
+    _describe_tensor("segment_final_intrinsic", segment_intrinsic)
     if default_cache_dir:
-        _print_diff("default_cached_input_vs_direct_input", default_clip, direct_clip)
-    _print_diff("direct_input_vs_segment_input", direct_clip, segment_clip)
+        _print_diff("default_cached_normalized_clip_vs_direct_normalized_clip", default_clip, direct_clip)
+    _print_diff("direct_normalized_clip_vs_segment_normalized_clip", direct_clip, segment_clip)
+    _print_diff("direct_final_img1_vs_segment_final_img1", direct_img1, segment_img1)
+    _print_diff("direct_final_img2_vs_segment_final_img2", direct_img2, segment_img2)
+    _print_diff("direct_final_intrinsic_vs_segment_final_intrinsic", direct_intrinsic, segment_intrinsic)
     _print_diff("legacy_vs_segment_cache", legacy, sample["feature"])
     _print_diff("legacy_vs_segment_bs1", legacy, segment_bs1)
     _print_diff("legacy_vs_segment_bs16", legacy, segment_bs16)

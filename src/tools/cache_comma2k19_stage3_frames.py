@@ -18,6 +18,7 @@ from src.config import (
     COMMA2K19_STAGE3_TRAIN_MANIFEST,
     DEVICE,
     STAGE3_FRAME_CACHE_JPEG_QUALITY,
+    STAGE3_FRAME_CACHE_SIZE,
     STAGE3_NUM_FRAMES,
     STAGE3_TRAIN_TEMPORAL_STRIDE,
 )
@@ -25,6 +26,14 @@ from src.datasets.comma2k19_stage3 import Comma2k19Stage3Dataset
 from src.models import Stage3MViT
 from src.train.stage3 import _loss, _stride_manifest
 
+
+def _resize_center_crop_bgr(frame: np.ndarray, size: int = STAGE3_FRAME_CACHE_SIZE) -> np.ndarray:
+    h, w = frame.shape[:2]
+    scale = size / min(h, w)
+    nh, nw = max(size, round(h * scale)), max(size, round(w * scale))
+    frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+    y, x = (nh - size) // 2, (nw - size) // 2
+    return frame[y:y + size, x:x + size]
 
 def _video_path(raw_root: Path, value: str) -> Path:
     path = Path(value)
@@ -80,7 +89,7 @@ def cache_segment(group: pd.DataFrame, raw_root: Path, cache_root: Path, jpeg_qu
             decoded += 1
             if idx in required_set:
                 name = f"{idx:06d}.jpg"
-                ok = cv2.imwrite(str(out_dir / name), frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
+                ok = cv2.imwrite(str(out_dir / name), _resize_center_crop_bgr(frame), [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
                 if not ok:
                     raise ValueError(f"cannot write cached frame: {out_dir / name}")
                 rows.append({"original_frame_index": idx, "cached_path": name, "timestamp": float(ts[idx])})
@@ -188,3 +197,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

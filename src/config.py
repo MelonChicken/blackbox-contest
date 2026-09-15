@@ -2,7 +2,11 @@ import os
 import platform
 from pathlib import Path
 
+for _name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_name, "1")
+
 import torch
+torch.set_num_threads(1)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ROOT = PROJECT_ROOT
@@ -112,7 +116,7 @@ BATCH_SIZE = 2
 STAGE3_DATASET = "comma_only"
 STAGE3_DATASET_MODE = STAGE3_DATASET
 STAGE3_EPOCHS = 3
-STAGE3_ARCH = "tartanvo_gru"
+STAGE3_ARCH = "mvit_v2_s"
 STAGE3_MVIT_PRETRAINED = True
 STAGE3_MVIT_PRETRAINED_WEIGHTS = "KINETICS400_V1"
 STAGE3_MVIT_PREPROCESS = "stage3_default"
@@ -129,7 +133,7 @@ STAGE3_SEGMENT_FEATURE_LRU_SIZE = 32
 STAGE3_COMMA_SUBSET_MODE = "route_balanced"
 STAGE3_COMMA_TRAIN_SEGMENTS_PER_ROUTE = 2
 STAGE3_COMMA_VAL_SEGMENTS_PER_ROUTE = 1
-STAGE3_SAMPLE_PROFILE = "full_ft_smoke"
+STAGE3_SAMPLE_PROFILE = "mvit_full"
 STAGE3_SAMPLE_PROFILES = {
     "r2_baseline_3k": {
         "train_stride": 50,
@@ -150,6 +154,14 @@ STAGE3_SAMPLE_PROFILES = {
         "val_sample_limit": 1000,
         "comma_train_limit": 3000,
         "comma_val_limit": 1000,
+    },
+    "mvit_full": {
+        "train_stride": 8,
+        "val_stride": 8,
+        "train_sample_limit": None,
+        "val_sample_limit": None,
+        "comma_train_limit": None,
+        "comma_val_limit": None,
     },
 }
 _STAGE3_SAMPLE_PROFILE = STAGE3_SAMPLE_PROFILES[STAGE3_SAMPLE_PROFILE]
@@ -176,13 +188,15 @@ STAGE3_CLASS_WEIGHTS = {"accel": None,
 STAGE3_TRAIN_TEMPORAL_STRIDE = _STAGE3_SAMPLE_PROFILE["train_stride"]
 STAGE3_VAL_TEMPORAL_STRIDE = _STAGE3_SAMPLE_PROFILE["val_stride"]
 STAGE3_NUM_WORKERS = 1
+STAGE3_PREFETCH_FACTOR = 1
 COMMA2K19_STAGE3_FRAME_CACHE = STAGE3_PROCESSED / "comma2k19_frames"
 STAGE3_FRAME_CACHE_JPEG_QUALITY = 92
+STAGE3_FRAME_CACHE_SIZE = 224
 STAGE3_TRAIN_SAMPLE_LIMIT = _STAGE3_SAMPLE_PROFILE.get("train_sample_limit", 3000)
 STAGE3_VAL_SAMPLE_LIMIT = _STAGE3_SAMPLE_PROFILE.get("val_sample_limit", 500)
 STAGE3_COMMA_TRAIN_SAMPLE_LIMIT = _STAGE3_SAMPLE_PROFILE["comma_train_limit"]
 STAGE3_COMMA_VAL_SAMPLE_LIMIT = _STAGE3_SAMPLE_PROFILE["comma_val_limit"]
-STAGE3_SOURCE_BALANCED_SAMPLING = True
+STAGE3_SOURCE_BALANCED_SAMPLING = False
 STAGE3_KITTI_TRAIN_SAMPLE_LIMIT = 5000
 STAGE3_KITTI_VAL_SAMPLE_LIMIT = 1000
 STAGE3_NUSCENES_SAMPLE_LIMIT = 1000
@@ -203,6 +217,7 @@ S3_MEAN = torch.tensor([0.45, 0.45, 0.45])[:, None, None]
 S3_STD = torch.tensor([0.225, 0.225, 0.225])[:, None, None]
 
 SEED = 42
+
 
 
 

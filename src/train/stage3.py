@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import cv2
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -10,6 +11,8 @@ import torch
 from torch import nn
 from torch.utils.data import ConcatDataset, DataLoader, Sampler
 from tqdm import tqdm
+
+cv2.setNumThreads(0)
 
 from src.config import (
     BATCH_SIZE,
@@ -34,6 +37,7 @@ from src.config import (
     STAGE3_MVIT_PREPROCESS,
     STAGE3_MODEL,
     STAGE3_NUM_WORKERS,
+    STAGE3_PREFETCH_FACTOR,
     STAGE3_SAMPLE_PROFILE,
     STAGE3_NUSCENES_MANIFEST,
     STAGE3_NUSCENES_ROOT,
@@ -444,9 +448,18 @@ def _stage3_collate(batch: list[dict]) -> dict:
 
 def _loader(dataset, shuffle: bool):
     sampler = _source_balanced_sampler(dataset) if shuffle else None
-    return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=shuffle and sampler is None, sampler=sampler, num_workers=STAGE3_NUM_WORKERS, pin_memory=torch.cuda.is_available(), persistent_workers=STAGE3_NUM_WORKERS > 0, collate_fn=_stage3_collate)
-
-
+    kwargs = {
+        "batch_size": BATCH_SIZE,
+        "shuffle": shuffle and sampler is None,
+        "sampler": sampler,
+        "num_workers": STAGE3_NUM_WORKERS,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": STAGE3_NUM_WORKERS > 0,
+        "collate_fn": _stage3_collate,
+    }
+    if STAGE3_NUM_WORKERS > 0:
+        kwargs["prefetch_factor"] = STAGE3_PREFETCH_FACTOR
+    return DataLoader(dataset, **kwargs)
 def _param_count(model, trainable: bool) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad is trainable)
 
@@ -648,6 +661,8 @@ def fit_stage3():
             if source in best_metrics:
                 print(f"{source} selection delta vs reference: {best_metrics[source]['selection'] - ref:+.5f}")
         print(f"mixed_source_selection={best:.5f}")
+
+
 
 
 

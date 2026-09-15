@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from src.config import COMMA2K19_STAGE3_FRAME_CACHE, COMMA2K19_STAGE3_RAW, S3_MEAN, S3_STD, STAGE3_NUM_FRAMES, STAGE3_RAW
+from src.config import COMMA2K19_STAGE3_FRAME_CACHE, COMMA2K19_STAGE3_RAW, S3_MEAN, S3_STD, SIZE, STAGE3_NUM_FRAMES, STAGE3_RAW
 from src.datasets.stage3_labels import ACCEL_TO_ID, STEER_TO_ID
 from src.utils import _crop_tensor, clip
 
@@ -42,7 +42,11 @@ def stage3_cached_clip(cache_dir: str | Path, frame_index: int, frames: int = ST
         bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if bgr is None:
             raise ValueError(f"cannot read cached frame: {path}")
-        tensors.append(_crop_tensor(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)))
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        if rgb.shape[:2] == (SIZE, SIZE):
+            tensors.append(torch.from_numpy(rgb.copy()).permute(2, 0, 1).float() / 255.0)
+        else:
+            tensors.append(_crop_tensor(rgb))
     x = torch.stack(tensors, dim=1)
     return (x - S3_MEAN[:, None, :, :]) / S3_STD[:, None, :, :]
 
@@ -118,3 +122,4 @@ class Comma2k19Stage3Dataset(Dataset):
             "route_id": str(row.route_id) if "route_id" in self.df.columns else "",
             "segment_id": str(row.segment_id) if "segment_id" in self.df.columns else "",
         }
+

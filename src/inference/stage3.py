@@ -68,7 +68,7 @@ def _stage3_checkpoint_path(model_dir) -> Path:
 
 
 def _stage3_model(arch: str, checkpoint: dict | None = None):
-    if arch == "mvit":
+    if arch in {"mvit_v2_s", "mvit"}:
         return Stage3MViT(pretrained=False)
     if arch == "resnet18_gru":
         return Stage3ResNetGRU(pretrained=False)
@@ -90,7 +90,8 @@ def _stage3_model(arch: str, checkpoint: dict | None = None):
 def predict_stage3(data_dir, model_dir):
     device = _device()
     checkpoint = torch.load(_stage3_checkpoint_path(model_dir), map_location="cpu", weights_only=False)
-    model = _stage3_model(checkpoint.get("arch", "mvit"), checkpoint)
+    arch = checkpoint.get("arch", "mvit_v2_s")
+    model = _stage3_model(arch, checkpoint)
     model.load_state_dict(_stage3_state_dict(checkpoint), strict=True)
     model.to(device).eval()
     videos = _video_paths(Path(data_dir) / "videos")
@@ -123,3 +124,4 @@ def predict_stage3(data_dir, model_dir):
     del model
     torch.cuda.empty_cache()
     return pd.DataFrame(rows, columns=["ID", "sample_index", "accel_label", "steer_label"])
+

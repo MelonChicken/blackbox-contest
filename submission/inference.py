@@ -134,7 +134,7 @@ def _stage3_checkpoint_path(model_dir) -> Path:
 
 
 def _stage3_model(arch: str, checkpoint: dict | None = None):
-    if arch == "mvit":
+    if arch in {"mvit_v2_s", "mvit"}:
         return Stage3MViT()
     if arch == "resnet18_gru":
         return Stage3ResNetGRU()
@@ -874,8 +874,8 @@ def _load_stage3_checkpoint(model_dir, filename, expected_arch):
         map_location="cpu",
         weights_only=False,
     )
-    arch = checkpoint.get("arch") or "mvit"
-    if arch != expected_arch:
+    arch = checkpoint.get("arch") or "mvit_v2_s"
+    if (arch, expected_arch) not in {(expected_arch, expected_arch), ("mvit", "mvit_v2_s")}:
         raise ValueError(f"{filename} arch mismatch: expected {expected_arch}, got {arch}")
     model = _stage3_model(arch, checkpoint)
     model.load_state_dict(checkpoint["model"], strict=True)
@@ -892,11 +892,11 @@ def predict_stage3(
         map_location="cpu",
         weights_only=False,
     )
-    arch = checkpoint.get("arch") or "mvit"
+    arch = checkpoint.get("arch") or "mvit_v2_s"
     use_ensemble = STAGE3_ENSEMBLE and arch != "tartanvo_gru"
 
     if use_ensemble:
-        mvit_model = _load_stage3_checkpoint(model_dir, STAGE3_MVIT_CHECKPOINT, "mvit").to(device).eval()
+        mvit_model = _load_stage3_checkpoint(model_dir, STAGE3_MVIT_CHECKPOINT, "mvit_v2_s").to(device).eval()
         resnet_model = _load_stage3_checkpoint(model_dir, STAGE3_RESNET_GRU_CHECKPOINT, "resnet18_gru").to(device).eval()
         model = None
     else:
@@ -1075,6 +1075,7 @@ def predict_stage3(
             "steer_label",
         ],
     )
+
 
 
 

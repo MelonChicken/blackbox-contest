@@ -28,6 +28,10 @@ from src.config import (
     STAGE3_KITTI_TRAIN_SAMPLE_LIMIT,
     STAGE3_KITTI_VAL_SAMPLE_LIMIT,
     STAGE3_LOSS_WEIGHTS,
+    STAGE3_MVIT_BACKBONE_LR,
+    STAGE3_MVIT_PRETRAINED,
+    STAGE3_MVIT_PRETRAINED_WEIGHTS,
+    STAGE3_MVIT_PREPROCESS,
     STAGE3_MODEL,
     STAGE3_NUM_WORKERS,
     STAGE3_SAMPLE_PROFILE,
@@ -282,7 +286,7 @@ def _datasets():
 
 
 def _build_stage3_model(pretrained: bool = True):
-    if STAGE3_ARCH == "mvit":
+    if STAGE3_ARCH in {"mvit_v2_s", "mvit"}:
         return Stage3MViT(pretrained=pretrained)
     if STAGE3_ARCH == "resnet18_gru":
         return Stage3ResNetGRU(pretrained=pretrained)
@@ -326,6 +330,9 @@ def _print_dataset_summary(train_dataset, val_datasets: dict[str, object], summa
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {sum(len(v) for v in val_datasets.values())}")
     print(f"Architecture: {STAGE3_ARCH}")
+    if STAGE3_ARCH in {"mvit_v2_s", "mvit"}:
+        print(f"MViT pretrained: {STAGE3_MVIT_PRETRAINED} ({STAGE3_MVIT_PRETRAINED_WEIGHTS})")
+        print(f"MViT preprocessing: {STAGE3_MVIT_PREPROCESS} mean=[0.45, 0.45, 0.45] std=[0.225, 0.225, 0.225] resize=256 crop=224")
     print(f"TartanVO feature mode: {STAGE3_TARTANVO_MODE}/{STAGE3_TARTANVO_FEATURE}")
     print(f"TartanVO feature cache: {bool(summary.get('cache'))}")
     print(f"Batch size: {BATCH_SIZE}")
@@ -391,33 +398,34 @@ def _selection_score(accel_f1: float, steer_f1: float) -> float:
     return ((accel_w * accel_f1) + (steer_w * steer_f1)) / max(1e-12, accel_w + steer_w)
 
 
-def _validate(model, loader):
+def _validate(model, loader, accel_weight=None, steer_weight=None):
     model.eval()
     accel_pred, accel_target, steer_pred, steer_target = [], [], [], []
+    total_loss = 0.0
     with torch.inference_mode():
         for batch in loader:
             accel, steer = _model_outputs(model, batch)
+            loss, _, _ = _loss(accel, steer, batch, accel_weight, steer_weight)
+            total_loss += float(loss.cpu())
             accel_pred.extend(accel.argmax(1).cpu().tolist())
             steer_pred.extend(steer.argmax(1).cpu().tolist())
             accel_target.extend(batch["accel_label"].tolist())
             steer_target.extend(batch["steer_label"].tolist())
     accel_metrics = _classification_metrics(accel_pred, accel_target, 4)
     steer_metrics = _classification_metrics(steer_pred, steer_target, 3)
-    return {"accel": accel_metrics, "steer": steer_metrics, "selection": _selection_score(accel_metrics["macro_f1"], steer_metrics["macro_f1"])}
+    return {"loss": total_loss / max(1, len(loader)), "accel": accel_metrics, "steer": steer_metrics, "selection": _selection_score(accel_metrics["macro_f1"], steer_metrics["macro_f1"])}
 
 
-def _validate_all(model, loaders: dict[str, DataLoader]) -> dict:
-    metrics = {source: _validate(model, loader) for source, loader in loaders.items()}
+def _validate_all(model, loaders: dict[str, DataLoader], accel_weight=None, steer_weight=None) -> dict:
+    metrics = {source: _validate(model, loader, accel_weight, steer_weight) for source, loader in loaders.items()}
     if len(loaders) > 1:
-        metrics["overall"] = _validate(model, DataLoader(ConcatDataset([loader.dataset for loader in loaders.values()]), batch_size=BATCH_SIZE, shuffle=False, num_workers=0))
+        metrics["overall"] = _validate(model, DataLoader(ConcatDataset([loader.dataset for loader in loaders.values()]), batch_size=BATCH_SIZE, shuffle=False, num_workers=0, collate_fn=_stage3_collate), accel_weight, steer_weight)
         metrics["mixed_source_selection"] = sum(metrics[s]["selection"] for s in loaders) / len(loaders)
     else:
         only = next(iter(metrics.values())) if metrics else {"selection": float("nan")}
         metrics["overall"] = only
         metrics["mixed_source_selection"] = only["selection"]
     return metrics
-
-
 def _source_balanced_sampler(dataset):
     if STAGE3_DATASET_MODE in {"mixed", "mixed_features", "comma_only"} or not STAGE3_SOURCE_BALANCED_SAMPLING or not hasattr(dataset, "source_counts"):
         return None
@@ -444,23 +452,36 @@ def _param_count(model, trainable: bool) -> int:
 
 
 def _history_keys() -> list[str]:
-    keys = ["epoch", "arch", "dataset_mode", "batch_size", "train_loss", "train_accel_loss", "train_steer_loss", "val_accel_accuracy", "val_accel_macro_f1", "val_steer_accuracy", "val_steer_macro_f1", "selection"]
+    keys = [
+        "epoch", "arch", "dataset_mode", "batch_size", "selection_metric_name", "selection_metric",
+        "train_loss", "val_loss", "train_accel_loss", "train_steer_loss",
+        "train_accel_accuracy", "val_accel_accuracy", "train_accel_macro_f1", "val_accel_macro_f1",
+        "train_steer_accuracy", "val_steer_accuracy", "train_steer_macro_f1", "val_steer_macro_f1",
+        "selection",
+    ]
     for source, prefix in (("comma2k19", "comma"), ("kitti", "kitti"), ("nuscenes", "nuscenes")):
         keys += [f"{prefix}_val_accel_accuracy", f"{prefix}_val_accel_macro_f1", f"{prefix}_val_steer_accuracy", f"{prefix}_val_steer_macro_f1", f"{prefix}_selection"]
     keys.append("mixed_source_selection")
     return keys
 
 
-def _append_history(history: dict, epoch: int, train_loss: float, train_accel_loss: float, train_steer_loss: float, metrics: dict) -> None:
+def _append_history(history: dict, epoch: int, train_loss: float, train_accel_loss: float, train_steer_loss: float, train_metrics: dict, metrics: dict, selection_metric_name: str, selection_metric: float) -> None:
     overall = metrics["overall"]
     row = {
         "epoch": epoch,
-        "arch": STAGE3_ARCH,
+        "arch": "mvit_v2_s" if STAGE3_ARCH == "mvit" else STAGE3_ARCH,
         "dataset_mode": STAGE3_DATASET_MODE,
         "batch_size": BATCH_SIZE,
+        "selection_metric_name": selection_metric_name,
+        "selection_metric": selection_metric,
         "train_loss": train_loss,
+        "val_loss": overall.get("loss", float("nan")),
         "train_accel_loss": train_accel_loss,
         "train_steer_loss": train_steer_loss,
+        "train_accel_accuracy": train_metrics["accel"]["accuracy"],
+        "train_accel_macro_f1": train_metrics["accel"]["macro_f1"],
+        "train_steer_accuracy": train_metrics["steer"]["accuracy"],
+        "train_steer_macro_f1": train_metrics["steer"]["macro_f1"],
         "val_accel_accuracy": overall["accel"]["accuracy"],
         "val_accel_macro_f1": overall["accel"]["macro_f1"],
         "val_steer_accuracy": overall["steer"]["accuracy"],
@@ -477,7 +498,6 @@ def _append_history(history: dict, epoch: int, train_loss: float, train_accel_lo
         row[f"{prefix}_selection"] = m["selection"] if m else float("nan")
     for key in history:
         history[key].append(row.get(key, float("nan")))
-
 def _save_history(history: dict, run_id: str) -> tuple:
     history_dir = STAGE3_MODEL / "history"
     history_dir.mkdir(parents=True, exist_ok=True)
@@ -487,12 +507,12 @@ def _save_history(history: dict, run_id: str) -> tuple:
     df = pd.DataFrame(history)
     df.to_csv(history_path, index=False)
     plt.figure()
-    for name in ("train_loss", "train_accel_loss", "train_steer_loss"):
+    for name in ("train_loss", "val_loss", "train_accel_loss", "train_steer_loss"):
         plt.plot(df["epoch"], df[name], marker="o", label=name)
     plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title(f"Stage3 Training Loss - {STAGE3_ARCH}"); plt.legend(); plt.grid(True)
     plt.savefig(loss_path, bbox_inches="tight"); plt.close()
     plt.figure()
-    for name in ("val_accel_macro_f1", "val_steer_macro_f1", "selection", "mixed_source_selection", "comma_selection", "kitti_selection"):
+    for name in ("train_accel_macro_f1", "val_accel_macro_f1", "train_steer_macro_f1", "val_steer_macro_f1", "selection", "mixed_source_selection", "comma_selection", "kitti_selection"):
         if name in df and not df[name].isna().all():
             plt.plot(df["epoch"], df[name], marker="o", label=name)
     plt.xlabel("Epoch"); plt.ylabel("Score"); plt.ylim(0, 1); plt.title(f"Stage3 Validation Metrics - {STAGE3_ARCH}"); plt.legend(); plt.grid(True)
@@ -501,7 +521,17 @@ def _save_history(history: dict, run_id: str) -> tuple:
 
 
 def _checkpoint_payload(model, epoch: int, train_loss: float, metrics=None, history=None) -> dict:
-    payload = {"model": model.state_dict(), "arch": STAGE3_ARCH, "epoch": epoch, "train_loss": train_loss, "dataset_mode": STAGE3_DATASET_MODE}
+    selection_metric_name = "mixed_source_selection" if STAGE3_DATASET_MODE in {"mixed", "mixed_features"} else "overall.selection"
+    selection_metric = float(metrics["mixed_source_selection"] if STAGE3_DATASET_MODE in {"mixed", "mixed_features"} else metrics["overall"]["selection"]) if metrics else float("nan")
+    payload = {
+        "model": model.state_dict(),
+        "arch": "mvit_v2_s" if STAGE3_ARCH == "mvit" else STAGE3_ARCH,
+        "epoch": epoch,
+        "train_loss": train_loss,
+        "dataset_mode": STAGE3_DATASET_MODE,
+        "selection_metric_name": selection_metric_name,
+        "selection_metric": selection_metric,
+    }
     if metrics is not None:
         payload["metrics"] = metrics
     if history is not None:
@@ -509,8 +539,6 @@ def _checkpoint_payload(model, epoch: int, train_loss: float, metrics=None, hist
     if hasattr(model, "model_config"):
         payload["model_config"] = model.model_config()
     return payload
-
-
 def _print_metrics_table(metrics: dict, prefix: str = "") -> None:
     print(prefix + "Source      Accel F1   Steer F1   Weighted")
     print(prefix + "-------------------------------------------")
@@ -532,7 +560,7 @@ def fit_stage3():
         raise RuntimeError("Stage3 finetune requires validation samples; build the val manifest/subset or use a profile with val data.")
     train_loader = _loader(train_dataset, shuffle=True)
     val_loaders = {name: _loader(ds, shuffle=False) for name, ds in val_datasets.items()}
-    model = _build_stage3_model(pretrained=True).to(DEVICE)
+    model = _build_stage3_model(pretrained=STAGE3_MVIT_PRETRAINED if STAGE3_ARCH in {"mvit_v2_s", "mvit"} else True).to(DEVICE)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if not trainable_params:
         raise RuntimeError("Stage3 model has no trainable parameters.")
@@ -562,6 +590,12 @@ def fit_stage3():
             groups.append({"params": head_params, "lr": STAGE3_HEAD_LR})
         opt = torch.optim.AdamW(groups)
         print(f"Optimizer LR: tartanvo={STAGE3_TARTANVO_LR} head={STAGE3_HEAD_LR}")
+    elif STAGE3_ARCH in {"mvit_v2_s", "mvit"}:
+        opt = torch.optim.AdamW([
+            {"params": model.backbone.parameters(), "lr": STAGE3_MVIT_BACKBONE_LR},
+            {"params": list(model.accel.parameters()) + list(model.steer.parameters()), "lr": STAGE3_HEAD_LR},
+        ])
+        print(f"Optimizer LR: backbone={STAGE3_MVIT_BACKBONE_LR} head={STAGE3_HEAD_LR}")
     else:
         opt = torch.optim.AdamW(trainable_params, STAGE3_HEAD_LR)
     accel_class_weights = _class_weights("accel")
@@ -573,21 +607,33 @@ def fit_stage3():
     for epoch in range(STAGE3_EPOCHS):
         model.train()
         total_loss = total_accel_loss = total_steer_loss = 0.0
+        train_accel_pred, train_accel_target, train_steer_pred, train_steer_target = [], [], [], []
         progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{STAGE3_EPOCHS} Train")
         for batch in progress:
             accel, steer = _model_outputs(model, batch)
             loss, loss_accel, loss_steer = _loss(accel, steer, batch, accel_class_weights, steer_class_weights)
             opt.zero_grad(); loss.backward(); opt.step()
             total_loss += float(loss.detach().cpu()); total_accel_loss += float(loss_accel.cpu()); total_steer_loss += float(loss_steer.cpu())
+            train_accel_pred.extend(accel.argmax(1).detach().cpu().tolist())
+            train_steer_pred.extend(steer.argmax(1).detach().cpu().tolist())
+            train_accel_target.extend(batch["accel_label"].tolist())
+            train_steer_target.extend(batch["steer_label"].tolist())
             progress.set_postfix(loss=f"{float(loss.detach().cpu()):.4f}")
         steps = max(1, len(train_loader))
         train_loss = total_loss / steps; train_accel_loss = total_accel_loss / steps; train_steer_loss = total_steer_loss / steps
+        train_metrics = {
+            "accel": _classification_metrics(train_accel_pred, train_accel_target, 4),
+            "steer": _classification_metrics(train_steer_pred, train_steer_target, 3),
+        }
+        train_metrics["selection"] = _selection_score(train_metrics["accel"]["macro_f1"], train_metrics["steer"]["macro_f1"])
         print(f"[Stage 3] Epoch {epoch + 1}/{STAGE3_EPOCHS} | train_loss={train_loss:.5f} | train_accel_loss={train_accel_loss:.5f} | train_steer_loss={train_steer_loss:.5f}")
-        metrics = _validate_all(model, val_loaders) if val_loaders else {"overall": {"accel": {"accuracy": float("nan"), "macro_f1": float("nan")}, "steer": {"accuracy": float("nan"), "macro_f1": float("nan")}, "selection": float("nan")}, "mixed_source_selection": float("nan")}
+        metrics = _validate_all(model, val_loaders, accel_class_weights, steer_class_weights) if val_loaders else {"overall": {"loss": float("nan"), "accel": {"accuracy": float("nan"), "macro_f1": float("nan")}, "steer": {"accuracy": float("nan"), "macro_f1": float("nan")}, "selection": float("nan")}, "mixed_source_selection": float("nan")}
         _print_metrics_table(metrics, prefix=f"epoch={epoch + 1} ")
-        _append_history(history, epoch + 1, train_loss, train_accel_loss, train_steer_loss, metrics)
-        history_path, loss_path, metrics_path = _save_history(history, run_id)
+        select_name = "mixed_source_selection" if STAGE3_DATASET_MODE in {"mixed", "mixed_features"} else "overall.selection"
         select = metrics["mixed_source_selection"] if STAGE3_DATASET_MODE in {"mixed", "mixed_features"} else metrics["overall"]["selection"]
+        print(f"selection_metric_name={select_name} selection_metric={select:.5f}")
+        _append_history(history, epoch + 1, train_loss, train_accel_loss, train_steer_loss, train_metrics, metrics, select_name, select)
+        history_path, loss_path, metrics_path = _save_history(history, run_id)
         if select > best:
             best = select; best_epoch = epoch + 1; best_metrics = metrics
             torch.save(_checkpoint_payload(model, epoch + 1, train_loss, metrics, history), out / "best.pt")
@@ -602,4 +648,12 @@ def fit_stage3():
             if source in best_metrics:
                 print(f"{source} selection delta vs reference: {best_metrics[source]['selection'] - ref:+.5f}")
         print(f"mixed_source_selection={best:.5f}")
+
+
+
+
+
+
+
+
 

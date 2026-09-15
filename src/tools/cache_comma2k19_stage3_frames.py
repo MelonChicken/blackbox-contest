@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 import warnings
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import cv2
 import numpy as np
 import pandas as pd
 import torch
-from torch import nn
 from torch.utils.data import DataLoader
 
 from src.config import (
@@ -35,9 +39,18 @@ def _resize_center_crop_bgr(frame: np.ndarray, size: int = STAGE3_FRAME_CACHE_SI
     y, x = (nh - size) // 2, (nw - size) // 2
     return frame[y:y + size, x:x + size]
 
+
 def _video_path(raw_root: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else raw_root / path
+
+
+def _frame_index_column(df: pd.DataFrame) -> str:
+    return "video_frame_index" if "video_frame_index" in df.columns else "frame_index"
+
+
+def _timestamp_column(df: pd.DataFrame) -> str:
+    return "target_timestamp" if "target_timestamp" in df.columns else "timestamp"
 
 
 def _clip_indices(center: int, frames: int = STAGE3_NUM_FRAMES) -> np.ndarray:
@@ -46,14 +59,16 @@ def _clip_indices(center: int, frames: int = STAGE3_NUM_FRAMES) -> np.ndarray:
 
 def _needed_frames(df: pd.DataFrame) -> np.ndarray:
     needed = set()
-    for frame_index in df.frame_index.astype(int):
+    for frame_index in df[_frame_index_column(df)].astype(int):
         needed.update(_clip_indices(frame_index).tolist())
     return np.asarray(sorted(needed), dtype=np.int64)
 
 
 def _timestamps(df: pd.DataFrame, needed: np.ndarray) -> np.ndarray:
-    source = df.sort_values("frame_index").drop_duplicates("frame_index")
-    return np.interp(needed, source.frame_index.to_numpy(dtype=float), source.timestamp.to_numpy(dtype=float))
+    frame_col = _frame_index_column(df)
+    time_col = _timestamp_column(df)
+    source = df.sort_values(frame_col).drop_duplicates(frame_col)
+    return np.interp(needed, source[frame_col].to_numpy(dtype=float), source[time_col].to_numpy(dtype=float))
 
 
 def _cache_dir(cache_root: Path, group: pd.DataFrame, video: Path) -> Path:
@@ -113,7 +128,7 @@ def cache_segment(group: pd.DataFrame, raw_root: Path, cache_root: Path, jpeg_qu
 
 def cache_manifest(manifest: Path, raw_root: Path, cache_root: Path, stride: int, limit_segments: int | None, jpeg_quality: int) -> list[tuple[int, Path]]:
     df = _stride_manifest(pd.read_csv(manifest), stride)
-    key = "segment_id" if "segment_id" in df.columns else "video_path"
+    key = ["route_id", "segment_id"] if {"route_id", "segment_id"}.issubset(df.columns) else "segment_id" if "segment_id" in df.columns else "video_path"
     groups = [part for _, part in df.groupby(key, sort=False)]
     if limit_segments:
         groups = groups[:limit_segments]
@@ -163,7 +178,7 @@ def smoke(manifest: Path, raw_root: Path, cache_root: Path, stride: int) -> None
     dataset.df = _stride_manifest(dataset.df, stride)
     dataset = _take(dataset, 1)
     batch = next(iter(DataLoader(dataset, batch_size=1, num_workers=0)))
-    model = Stage3MViT().to(DEVICE).eval()
+    model = Stage3MViT(pretrained=False).to(DEVICE).eval()
     with torch.inference_mode():
         accel, steer = model(batch["video"].to(DEVICE))
         loss, accel_loss, steer_loss = _loss(accel, steer, batch)
@@ -197,4 +212,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

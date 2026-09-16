@@ -17,16 +17,9 @@ from src.config import (
     COMMA2K19_STAGE3_TRAIN_MANIFEST,
     COMMA2K19_STAGE3_VAL_MANIFEST,
     DEVICE,
-    KITTI_STAGE3_TRAIN_MANIFEST,
-    KITTI_STAGE3_VAL_MANIFEST,
     SEED,
     STAGE3_COMMA_TRAIN_SAMPLE_LIMIT,
     STAGE3_COMMA_VAL_SAMPLE_LIMIT,
-    STAGE3_KITTI_TRAIN_SAMPLE_LIMIT,
-    STAGE3_KITTI_VAL_SAMPLE_LIMIT,
-    STAGE3_NUSCENES_ROOT,
-    STAGE3_NUSCENES_TRAIN_MANIFEST,
-    STAGE3_NUSCENES_VAL_MANIFEST,
     STAGE3_NUM_FRAMES,
     STAGE3_TARTANVO_CACHE_PAIR_BATCH_SIZE,
     STAGE3_TARTANVO_FEATURE_CACHE,
@@ -35,8 +28,6 @@ from src.config import (
     TARTANVO_CHECKPOINT,
 )
 from src.datasets.comma2k19_stage3 import ACCEL_TO_ID, STEER_TO_ID, Comma2k19Stage3Dataset
-from src.datasets.kitti_stage3 import KittiStage3Dataset, _label_id
-from src.datasets.nuscenes_stage3 import NuScenesStage3Dataset
 from src.datasets.stage3_tartanvo_pose import (
     TARTANVO_SEGMENT_FEATURE_VERSION,
     stage3_tartanvo_feature_path,
@@ -70,29 +61,22 @@ def _balanced_limit(df: pd.DataFrame, limit: int | None) -> pd.DataFrame:
 
 
 def _split_config(dataset: str, split: str):
-    if dataset == "kitti":
-        if split == "train":
-            return KITTI_STAGE3_TRAIN_MANIFEST, STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_KITTI_TRAIN_SAMPLE_LIMIT
-        if split == "val":
-            return KITTI_STAGE3_VAL_MANIFEST, STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_KITTI_VAL_SAMPLE_LIMIT
     if dataset == "comma2k19":
         if split == "train":
             return COMMA2K19_STAGE3_TRAIN_MANIFEST, STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_COMMA_TRAIN_SAMPLE_LIMIT
         if split == "val":
             return COMMA2K19_STAGE3_VAL_MANIFEST, STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_COMMA_VAL_SAMPLE_LIMIT
-    if dataset == "nuscenes":
-        return (STAGE3_NUSCENES_TRAIN_MANIFEST if split == "train" else STAGE3_NUSCENES_VAL_MANIFEST), 1, None
     raise ValueError(f"unknown dataset/split: {dataset}/{split}")
 
 
 def _dataset(dataset: str, manifest: Path, split: str):
-    if dataset == "kitti":
-        return KittiStage3Dataset(manifest)
     if dataset == "comma2k19":
         return Comma2k19Stage3Dataset(manifest)
-    if dataset == "nuscenes":
-        return NuScenesStage3Dataset(manifest, root=STAGE3_NUSCENES_ROOT)
     raise ValueError(f"unknown dataset: {dataset}")
+
+
+def _label_id(value, mapping: dict[str, int]) -> int:
+    return int(value) if not isinstance(value, str) else mapping[value]
 
 
 def _cache_base(root: Path, feature: str, dataset: str) -> Path:
@@ -374,7 +358,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Cache frozen TartanVO features for Stage3.")
     parser.add_argument("--split", choices=["train", "val"], required=True)
     parser.add_argument("--feature", choices=["pose", "latent"], default="latent")
-    parser.add_argument("--dataset", choices=["comma2k19", "kitti", "nuscenes"], default="comma2k19")
+    parser.add_argument("--dataset", choices=["comma2k19"], default="comma2k19")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--cache-layout", choices=["sample", "segment"], default="segment")

@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 from torch import nn
-from torch.utils.data import ConcatDataset, DataLoader, Sampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 cv2.setNumThreads(0)
@@ -19,17 +19,11 @@ from src.config import (
     COMMA2K19_STAGE3_TRAIN_MANIFEST,
     COMMA2K19_STAGE3_VAL_MANIFEST,
     DEVICE,
-    KITTI_STAGE3_TRAIN_MANIFEST,
-    KITTI_STAGE3_VAL_MANIFEST,
     SEED,
     STAGE3_ARCH,
     STAGE3_CLASS_WEIGHTS,
-    STAGE3_COMMA_TRAIN_SAMPLE_LIMIT,
-    STAGE3_COMMA_VAL_SAMPLE_LIMIT,
     STAGE3_DATASET,
     STAGE3_EPOCHS,
-    STAGE3_KITTI_TRAIN_SAMPLE_LIMIT,
-    STAGE3_KITTI_VAL_SAMPLE_LIMIT,
     STAGE3_LOSS_WEIGHTS,
     STAGE3_MVIT_BACKBONE_LR,
     STAGE3_MVIT_PRETRAINED,
@@ -39,13 +33,6 @@ from src.config import (
     STAGE3_NUM_WORKERS,
     STAGE3_PREFETCH_FACTOR,
     STAGE3_SAMPLE_PROFILE,
-    STAGE3_NUSCENES_MANIFEST,
-    STAGE3_NUSCENES_ROOT,
-    STAGE3_NUSCENES_SAMPLE_LIMIT,
-    STAGE3_NUSCENES_TRAIN_MANIFEST,
-    STAGE3_NUSCENES_VAL_MANIFEST,
-    STAGE3_RAW,
-    STAGE3_SOURCE_BALANCED_SAMPLING,
     STAGE3_TARTANVO_FEATURE,
     STAGE3_TARTANVO_FEATURE_CACHE,
     STAGE3_TARTANVO_MODE,
@@ -62,40 +49,14 @@ try:
     from src.config import STAGE3_DATASET_MODE
 except ImportError:
     STAGE3_DATASET_MODE = STAGE3_DATASET
-from src.datasets.comma2k19_stage3 import ACCEL_TO_ID, STEER_TO_ID, Comma2k19Stage3Dataset, Stage3DaconDataset
-from src.datasets.stage3_tartanvo_pose import Stage3MixedTartanFeatureDataset, Stage3TartanFeatureDataset
+from src.datasets.comma2k19_stage3 import ACCEL_TO_ID, STEER_TO_ID, Comma2k19Stage3Dataset
+from src.datasets.stage3_tartanvo_pose import Stage3TartanFeatureDataset
 from src.models import Stage3MViT, Stage3ResNetGRU, Stage3TartanVOGRU
 from src.tools.stage3_comma_manifest import active_manifest_path, active_subset_name, segment_cache_index_name
 from src.utils import set_seed
 
 set_seed(SEED)
-SOURCE_REFS = {"comma2k19": 0.75, "kitti": 0.8887}
-
-
-class SourceBalancedSampler(Sampler[int]):
-    def __init__(self, dataset, seed: int = SEED):
-        self.lengths = [len(ds) for ds in dataset.datasets]
-        self.offsets = [0]
-        for n in self.lengths[:-1]:
-            self.offsets.append(self.offsets[-1] + n)
-        self.samples_per_source = max(self.lengths) if self.lengths else 0
-        self.seed = int(seed)
-
-    def __len__(self) -> int:
-        return self.samples_per_source * len(self.lengths)
-
-    def __iter__(self):
-        g = torch.Generator().manual_seed(self.seed + torch.initial_seed() % 100000)
-        indices = []
-        for offset, length in zip(self.offsets, self.lengths):
-            if length <= 0:
-                continue
-            base = torch.randperm(length, generator=g).tolist()
-            while len(base) < self.samples_per_source:
-                base.extend(torch.randperm(length, generator=g).tolist())
-            indices.extend(offset + j for j in base[:self.samples_per_source])
-        order = torch.randperm(len(indices), generator=g).tolist()
-        return iter([indices[j] for j in order])
+SOURCE_REFS = {"comma2k19": 0.75}
 
 
 def _classification_metrics(pred: list[int], target: list[int], num_classes: int) -> dict:
@@ -125,7 +86,7 @@ def _classification_metrics(pred: list[int], target: list[int], num_classes: int
 def _stride_manifest(df: pd.DataFrame, stride: int) -> pd.DataFrame:
     if stride <= 1 or df.empty:
         return df.reset_index(drop=True)
-    key = ["route_id", "segment_id"] if {"route_id", "segment_id"}.issubset(df.columns) else "segment_id" if "segment_id" in df.columns else "sequence_id" if "sequence_id" in df.columns else "scene" if "scene" in df.columns else "video_path"
+    key = ["route_id", "segment_id"] if {"route_id", "segment_id"}.issubset(df.columns) else "segment_id" if "segment_id" in df.columns else "video_path"
     parts = [part.iloc[::stride] for _, part in df.groupby(key, sort=False)]
     return pd.concat(parts, ignore_index=True) if parts else df.reset_index(drop=True)
 
@@ -133,7 +94,7 @@ def _stride_manifest(df: pd.DataFrame, stride: int) -> pd.DataFrame:
 def _balanced_limit(df: pd.DataFrame, limit: int | None) -> pd.DataFrame:
     if not limit or limit <= 0 or len(df) <= limit:
         return df.reset_index(drop=True)
-    key = "sequence_id" if "sequence_id" in df.columns else "segment_id" if "segment_id" in df.columns else "scene" if "scene" in df.columns else None
+    key = "segment_id" if "segment_id" in df.columns else None
     if key is None:
         return df.sample(n=limit, random_state=SEED).sort_index().reset_index(drop=True)
     per_group = max(1, limit // df[key].nunique() + 1)
@@ -151,22 +112,9 @@ def _label_id(value, mapping: dict[str, int]) -> int:
     return int(value) if not isinstance(value, str) else mapping[value]
 
 
-def _source_limit(source: str, split: str) -> int | None:
-    if source == "kitti":
-        return STAGE3_KITTI_TRAIN_SAMPLE_LIMIT if split == "train" else STAGE3_KITTI_VAL_SAMPLE_LIMIT
-    if STAGE3_DATASET_MODE == "mixed_features":
-        return None
-    if STAGE3_DATASET_MODE == "comma_only" and source == "comma2k19":
-        return STAGE3_COMMA_TRAIN_SAMPLE_LIMIT if split == "train" else STAGE3_COMMA_VAL_SAMPLE_LIMIT
-    if source == "nuscenes":
-        return STAGE3_NUSCENES_SAMPLE_LIMIT
-    if STAGE3_DATASET_MODE == "mixed":
-        return STAGE3_COMMA_TRAIN_SAMPLE_LIMIT if split == "train" else STAGE3_COMMA_VAL_SAMPLE_LIMIT
-    return STAGE3_TRAIN_SAMPLE_LIMIT if split == "train" else STAGE3_VAL_SAMPLE_LIMIT
-
-
-def _feature_dataset(source: str, split: str):
-    return Stage3TartanFeatureDataset(split, STAGE3_TARTANVO_FEATURE, root=STAGE3_TARTANVO_FEATURE_CACHE, dataset=source, limit=_source_limit(source, split))
+def _feature_dataset(split: str):
+    limit = STAGE3_TRAIN_SAMPLE_LIMIT if split == "train" else STAGE3_VAL_SAMPLE_LIMIT
+    return Stage3TartanFeatureDataset(split, STAGE3_TARTANVO_FEATURE, root=STAGE3_TARTANVO_FEATURE_CACHE, dataset="comma2k19", limit=limit)
 
 
 def _comma_manifest_path(split: str):
@@ -177,113 +125,40 @@ def _comma_manifest_path(split: str):
     return fallback if fallback.is_file() and fallback.stat().st_size > 0 else path
 
 
-def _available_feature_sources(split: str, sources: tuple[str, ...]) -> tuple[str, ...]:
-    def has_cache(source: str) -> bool:
-        if source == "comma2k19" and STAGE3_TARTANVO_FEATURE == "latent":
-            index = segment_cache_index_name(split, active_subset_name(split))
-            return (STAGE3_TARTANVO_FEATURE_CACHE / "segment_latent" / source / index).is_file()
-        return (STAGE3_TARTANVO_FEATURE_CACHE / STAGE3_TARTANVO_FEATURE / source / f"{split}_index.csv").is_file()
-    return tuple(source for source in sources if has_cache(source))
+def _has_feature_cache(split: str) -> bool:
+    if STAGE3_TARTANVO_FEATURE == "latent":
+        index = segment_cache_index_name(split, active_subset_name(split))
+        return (STAGE3_TARTANVO_FEATURE_CACHE / "segment_latent" / "comma2k19" / index).is_file()
+    return (STAGE3_TARTANVO_FEATURE_CACHE / STAGE3_TARTANVO_FEATURE / "comma2k19" / f"{split}_index.csv").is_file()
 
 
 def _feature_datasets():
-    if STAGE3_DATASET_MODE == "mixed_features":
-        train_sources = _available_feature_sources("train", ("comma2k19", "kitti", "nuscenes"))
-        val_sources = _available_feature_sources("val", ("comma2k19", "kitti"))
-        train = Stage3MixedTartanFeatureDataset("train", STAGE3_TARTANVO_FEATURE, root=STAGE3_TARTANVO_FEATURE_CACHE, sources=train_sources)
-        val = {source: _feature_dataset(source, "val") for source in val_sources}
-        return train, val, {"cache": True, "mixed": True, "train_sources": train.source_counts, "val_sources": {k: len(v) for k, v in val.items()}}
-    source = "comma2k19" if STAGE3_DATASET_MODE == "comma_only" else STAGE3_DATASET_MODE
-    train = _feature_dataset(source, "train")
-    val = _feature_dataset(source, "val")
-    return train, {source: val}, {"cache": True, "mixed": False, "train_sources": {source: len(train)}, "val_sources": {source: len(val)}}
+    train = _feature_dataset("train")
+    val = {"comma2k19": _feature_dataset("val")} if _has_feature_cache("val") else {}
+    return train, val, {"cache": True, "train_sources": {"comma2k19": len(train)}, "val_sources": {k: len(v) for k, v in val.items()}}
 
 
 def _raw_datasets():
-    train_sets, val_sets = [], []
-    train_sources, val_sources = {}, {}
-    summary = {"dacon_train": 0, "dacon_val": 0, "train_sources": train_sources, "val_sources": val_sources}
-    labels_paths = [STAGE3_RAW / "labels.csv", STAGE3_RAW / "stage3" / "labels.csv"]
-    labels_path = next((path for path in labels_paths if path.is_file()), labels_paths[0])
+    train_manifest = _comma_manifest_path("train")
+    if not train_manifest.is_file():
+        raise FileNotFoundError(f"missing comma2k19 Stage3 train manifest: {train_manifest}")
+    train, before, after = _limited_dataset(Comma2k19Stage3Dataset(train_manifest), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_TRAIN_SAMPLE_LIMIT)
+    summary = {"train_sources": {"comma2k19": len(train)}, "val_sources": {}, "comma_train_before": before, "comma_train_after": after}
+    val = {}
+    val_manifest = _comma_manifest_path("val")
+    if val_manifest.is_file():
+        ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(val_manifest), STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_VAL_SAMPLE_LIMIT)
+        val["comma2k19"] = ds
+        summary.update(comma_val_before=before, comma_val_after=after)
+        summary["val_sources"]["comma2k19"] = len(ds)
+    return train, val, summary
 
-    if STAGE3_DATASET_MODE in {"comma2k19", "mixed"} and labels_path.is_file():
-        df = pd.read_csv(labels_path).sample(frac=1.0, random_state=SEED).reset_index(drop=True)
-        split = max(1, int(len(df) * 0.8)) if len(df) > 1 else len(df)
-        video_root = labels_path.parent / "videos"
-        ds = Stage3DaconDataset(df.iloc[:split], video_root=video_root)
-        train_sets.append(ds); train_sources["DACON"] = len(ds); summary["dacon_train"] = len(ds)
-        if split < len(df):
-            ds = Stage3DaconDataset(df.iloc[split:], video_root=video_root)
-            val_sets.append(("DACON", ds)); val_sources["DACON"] = len(ds); summary["dacon_val"] = len(ds)
-
-    if STAGE3_DATASET_MODE in {"kitti", "mixed"}:
-        from src.datasets.kitti_stage3 import KittiStage3Dataset
-
-        if KITTI_STAGE3_TRAIN_MANIFEST.is_file():
-            ds, before, after = _limited_dataset(KittiStage3Dataset(KITTI_STAGE3_TRAIN_MANIFEST), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_KITTI_TRAIN_SAMPLE_LIMIT)
-            train_sets.append(ds); train_sources["KITTI"] = len(ds); summary.update(kitti_train_before=before, kitti_train_after=after)
-        if KITTI_STAGE3_VAL_MANIFEST.is_file():
-            ds, before, after = _limited_dataset(KittiStage3Dataset(KITTI_STAGE3_VAL_MANIFEST), STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_KITTI_VAL_SAMPLE_LIMIT)
-            val_sets.append(("KITTI", ds)); val_sources["KITTI"] = len(ds); summary.update(kitti_val_before=before, kitti_val_after=after)
-
-    if STAGE3_DATASET_MODE == "nuscenes":
-        from src.datasets.nuscenes_stage3 import NuScenesStage3Dataset
-
-        if STAGE3_NUSCENES_MANIFEST.is_file():
-            df = pd.read_csv(STAGE3_NUSCENES_MANIFEST)
-            if "split" not in df.columns:
-                df["split"] = "train"
-            train_df = df[df.split == "train"].reset_index(drop=True)
-            val_df = df[df.split == "val"].reset_index(drop=True)
-            ds, before, after = _limited_dataset(NuScenesStage3Dataset(train_df, root=STAGE3_NUSCENES_ROOT), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_NUSCENES_SAMPLE_LIMIT)
-            train_sets.append(ds); train_sources["nuScenes"] = len(ds); summary.update(nuscenes_train_before=before, nuscenes_train_after=after)
-            if len(val_df):
-                ds, before, after = _limited_dataset(NuScenesStage3Dataset(val_df, root=STAGE3_NUSCENES_ROOT), STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_NUSCENES_SAMPLE_LIMIT)
-                val_sets.append(("nuScenes", ds)); val_sources["nuScenes"] = len(ds); summary.update(nuscenes_val_before=before, nuscenes_val_after=after)
-    elif STAGE3_DATASET_MODE == "mixed":
-        from src.datasets.nuscenes_stage3 import NuScenesStage3Dataset
-
-        train_manifest = _comma_manifest_path("train")
-        if train_manifest.is_file():
-            ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(train_manifest), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_COMMA_TRAIN_SAMPLE_LIMIT)
-            train_sets.append(ds); train_sources["comma2k19"] = len(ds); summary.update(comma_train_before=before, comma_train_after=after)
-        val_manifest = _comma_manifest_path("val")
-        if val_manifest.is_file():
-            ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(val_manifest), STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_COMMA_VAL_SAMPLE_LIMIT)
-            val_sets.append(("comma2k19", ds)); val_sources["comma2k19"] = len(ds); summary.update(comma_val_before=before, comma_val_after=after)
-        if STAGE3_NUSCENES_TRAIN_MANIFEST.is_file():
-            ds = NuScenesStage3Dataset(STAGE3_NUSCENES_TRAIN_MANIFEST, root=STAGE3_NUSCENES_ROOT)
-            train_sets.append(ds); train_sources["nuScenes"] = len(ds); summary.update(nuscenes_train_before=len(ds), nuscenes_train_after=len(ds))
-        summary["nuscenes_val_manifest"] = str(STAGE3_NUSCENES_VAL_MANIFEST)
-    elif STAGE3_DATASET_MODE in {"comma2k19", "comma_only"}:
-        train_manifest = _comma_manifest_path("train")
-        if train_manifest.is_file():
-            ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(train_manifest), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_TRAIN_SAMPLE_LIMIT)
-            train_sets.append(ds); train_sources["comma2k19"] = len(ds); summary.update(comma_train_before=before, comma_train_after=after)
-        val_manifest = _comma_manifest_path("val")
-        if val_manifest.is_file():
-            ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(val_manifest), STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_VAL_SAMPLE_LIMIT)
-            val_sets.append(("comma2k19", ds)); val_sources["comma2k19"] = len(ds); summary.update(comma_val_before=before, comma_val_after=after)
-    elif STAGE3_DATASET_MODE != "kitti":
-        raise ValueError(f"Unknown STAGE3_DATASET_MODE: {STAGE3_DATASET_MODE}")
-
-    if not train_sets:
-        raise FileNotFoundError("No Stage3 training data found.")
-    train = ConcatDataset(train_sets)
-    train.source_counts = dict(train_sources)
-    return train, dict(val_sets), summary
 
 def _datasets():
-    if STAGE3_TARTANVO_UNFREEZE == "full" and (
-        STAGE3_TARTANVO_MODE != "finetune"
-        or STAGE3_DATASET_MODE == "mixed_features"
-        or (STAGE3_TARTANVO_MODE == "cached" and STAGE3_TARTANVO_USE_FEATURE_CACHE)
-    ):
+    if STAGE3_DATASET_MODE not in {"comma2k19", "comma_only"}:
+        raise ValueError(f"Stage3 now supports only comma2k19/comma_only, got: {STAGE3_DATASET_MODE}")
+    if STAGE3_TARTANVO_UNFREEZE == "full" and (STAGE3_TARTANVO_MODE != "finetune" or (STAGE3_TARTANVO_MODE == "cached" and STAGE3_TARTANVO_USE_FEATURE_CACHE)):
         raise RuntimeError('full TartanVO fine-tuning requires STAGE3_TARTANVO_MODE="finetune" and raw video datasets')
-    if STAGE3_DATASET_MODE == "mixed_features":
-        return _feature_datasets()
-    if STAGE3_DATASET_MODE in {"mixed", "nuscenes"}:
-        return _raw_datasets()
     if STAGE3_ARCH == "tartanvo_gru" and STAGE3_TARTANVO_MODE == "cached" and STAGE3_TARTANVO_USE_FEATURE_CACHE:
         return _feature_datasets()
     return _raw_datasets()
@@ -300,14 +175,8 @@ def _build_stage3_model(pretrained: bool = True):
 
 
 def _labels_from_dataset(dataset):
-    if hasattr(dataset, "df"):
-        accel = [_label_id(v, ACCEL_TO_ID) for v in dataset.df.accel_label.tolist()]
-        steer = [_label_id(v, STEER_TO_ID) for v in dataset.df.steer_label.tolist()]
-        return accel, steer
-    accel, steer = [], []
-    for ds in getattr(dataset, "datasets", []):
-        a, s = _labels_from_dataset(ds)
-        accel.extend(a); steer.extend(s)
+    accel = [_label_id(v, ACCEL_TO_ID) for v in dataset.df.accel_label.tolist()]
+    steer = [_label_id(v, STEER_TO_ID) for v in dataset.df.steer_label.tolist()]
     return accel, steer
 
 
@@ -330,6 +199,11 @@ def _print_one_distribution(name: str, dataset) -> None:
         rows = [part.iloc[0] for _, part in dataset.df.groupby(key, sort=False)]
         cached = sum(dataset._cache_dir(row) is not None for row in rows)
         print(f"frame cache: {cached}/{len(rows)} segments cached")
+        if rows:
+            row = rows[0]
+            video_path = dataset._video_path(str(row.video_path))
+            expected = dataset._expected_cache_dir(row)
+            print(f"frame cache sample: video={video_path} cache={expected} frames_csv={(expected / 'frames.csv').is_file() if expected else False}")
 
 def _print_dataset_summary(train_dataset, val_datasets: dict[str, object], summary: dict) -> None:
     print("=== Stage 3 Dataset ===")
@@ -344,36 +218,9 @@ def _print_dataset_summary(train_dataset, val_datasets: dict[str, object], summa
     print(f"TartanVO feature mode: {STAGE3_TARTANVO_MODE}/{STAGE3_TARTANVO_FEATURE}")
     print(f"TartanVO feature cache: {bool(summary.get('cache'))}")
     print(f"Batch size: {BATCH_SIZE}")
-    if summary.get("cache"):
-        print("feature: [15, 1536]")
-    if hasattr(train_dataset, "source_counts"):
-        print("=== Stage 3 Training Sources ===")
-        for name in ("KITTI", "comma2k19", "nuScenes"):
-            print(f"{name:<11}: {train_dataset.source_counts.get(name, 0)}")
-        print(f"{'Total':<11}: {len(train_dataset)}")
-        print(f"source counts: {train_dataset.source_counts}")
-        for source, ds in getattr(train_dataset, "source_datasets", {}).items():
-            _print_one_distribution(f"{source} train", ds)
-        if hasattr(train_dataset, "comma"):
-            _print_one_distribution("comma2k19 train", train_dataset.comma)
-        if hasattr(train_dataset, "kitti"):
-            _print_one_distribution("KITTI train", train_dataset.kitti)
-        _print_one_distribution("mixed train", train_dataset)
-    else:
-        _print_one_distribution(f"{STAGE3_DATASET_MODE} train", train_dataset)
+    _print_one_distribution("comma2k19 train", train_dataset)
     for source, ds in val_datasets.items():
         _print_one_distribution(f"{source} val", ds)
-    if len(val_datasets) > 1:
-        _print_one_distribution("mixed val", ConcatDataset(list(val_datasets.values())))
-    accel_names = {v: k for k, v in ACCEL_TO_ID.items()}
-    steer_names = {v: k for k, v in STEER_TO_ID.items()}
-    accel, steer = _labels_from_dataset(train_dataset)
-    print("Accel:")
-    for i in range(4):
-        print(f"  {accel_names[i]} {accel.count(i)}")
-    print("Steering:")
-    for i in range(3):
-        print(f"  {steer_names[i]} {steer.count(i)}")
 
 
 def _class_weights(name: str):
@@ -426,18 +273,10 @@ def _validate(model, loader, accel_weight=None, steer_weight=None):
 
 def _validate_all(model, loaders: dict[str, DataLoader], accel_weight=None, steer_weight=None) -> dict:
     metrics = {source: _validate(model, loader, accel_weight, steer_weight) for source, loader in loaders.items()}
-    if len(loaders) > 1:
-        metrics["overall"] = _validate(model, DataLoader(ConcatDataset([loader.dataset for loader in loaders.values()]), batch_size=BATCH_SIZE, shuffle=False, num_workers=0, collate_fn=_stage3_collate), accel_weight, steer_weight)
-        metrics["mixed_source_selection"] = sum(metrics[s]["selection"] for s in loaders) / len(loaders)
-    else:
-        only = next(iter(metrics.values())) if metrics else {"selection": float("nan")}
-        metrics["overall"] = only
-        metrics["mixed_source_selection"] = only["selection"]
+    only = next(iter(metrics.values())) if metrics else {"selection": float("nan")}
+    metrics["overall"] = only
     return metrics
-def _source_balanced_sampler(dataset):
-    if STAGE3_DATASET_MODE in {"mixed", "mixed_features", "comma_only"} or not STAGE3_SOURCE_BALANCED_SAMPLING or not hasattr(dataset, "source_counts"):
-        return None
-    return SourceBalancedSampler(dataset)
+
 
 def _stage3_collate(batch: list[dict]) -> dict:
     out = {
@@ -451,11 +290,9 @@ def _stage3_collate(batch: list[dict]) -> dict:
 
 
 def _loader(dataset, shuffle: bool):
-    sampler = _source_balanced_sampler(dataset) if shuffle else None
     kwargs = {
         "batch_size": BATCH_SIZE,
-        "shuffle": shuffle and sampler is None,
-        "sampler": sampler,
+        "shuffle": shuffle,
         "num_workers": STAGE3_NUM_WORKERS,
         "pin_memory": torch.cuda.is_available(),
         "persistent_workers": STAGE3_NUM_WORKERS > 0,
@@ -464,26 +301,26 @@ def _loader(dataset, shuffle: bool):
     if STAGE3_NUM_WORKERS > 0:
         kwargs["prefetch_factor"] = STAGE3_PREFETCH_FACTOR
     return DataLoader(dataset, **kwargs)
+
+
 def _param_count(model, trainable: bool) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad is trainable)
 
 
 def _history_keys() -> list[str]:
-    keys = [
+    return [
         "epoch", "arch", "dataset_mode", "batch_size", "selection_metric_name", "selection_metric",
         "train_loss", "val_loss", "train_accel_loss", "train_steer_loss",
         "train_accel_accuracy", "val_accel_accuracy", "train_accel_macro_f1", "val_accel_macro_f1",
         "train_steer_accuracy", "val_steer_accuracy", "train_steer_macro_f1", "val_steer_macro_f1",
-        "selection",
+        "selection", "comma_val_accel_accuracy", "comma_val_accel_macro_f1", "comma_val_steer_accuracy",
+        "comma_val_steer_macro_f1", "comma_selection",
     ]
-    for source, prefix in (("comma2k19", "comma"), ("kitti", "kitti"), ("nuscenes", "nuscenes")):
-        keys += [f"{prefix}_val_accel_accuracy", f"{prefix}_val_accel_macro_f1", f"{prefix}_val_steer_accuracy", f"{prefix}_val_steer_macro_f1", f"{prefix}_selection"]
-    keys.append("mixed_source_selection")
-    return keys
 
 
 def _append_history(history: dict, epoch: int, train_loss: float, train_accel_loss: float, train_steer_loss: float, train_metrics: dict, metrics: dict, selection_metric_name: str, selection_metric: float) -> None:
     overall = metrics["overall"]
+    comma = metrics.get("comma2k19")
     row = {
         "epoch": epoch,
         "arch": "mvit_v2_s" if STAGE3_ARCH == "mvit" else STAGE3_ARCH,
@@ -504,17 +341,16 @@ def _append_history(history: dict, epoch: int, train_loss: float, train_accel_lo
         "val_steer_accuracy": overall["steer"]["accuracy"],
         "val_steer_macro_f1": overall["steer"]["macro_f1"],
         "selection": overall["selection"],
-        "mixed_source_selection": metrics["mixed_source_selection"],
+        "comma_val_accel_accuracy": comma["accel"]["accuracy"] if comma else float("nan"),
+        "comma_val_accel_macro_f1": comma["accel"]["macro_f1"] if comma else float("nan"),
+        "comma_val_steer_accuracy": comma["steer"]["accuracy"] if comma else float("nan"),
+        "comma_val_steer_macro_f1": comma["steer"]["macro_f1"] if comma else float("nan"),
+        "comma_selection": comma["selection"] if comma else float("nan"),
     }
-    for source, prefix in (("comma2k19", "comma"), ("kitti", "kitti"), ("nuscenes", "nuscenes")):
-        m = metrics.get(source)
-        row[f"{prefix}_val_accel_accuracy"] = m["accel"]["accuracy"] if m else float("nan")
-        row[f"{prefix}_val_accel_macro_f1"] = m["accel"]["macro_f1"] if m else float("nan")
-        row[f"{prefix}_val_steer_accuracy"] = m["steer"]["accuracy"] if m else float("nan")
-        row[f"{prefix}_val_steer_macro_f1"] = m["steer"]["macro_f1"] if m else float("nan")
-        row[f"{prefix}_selection"] = m["selection"] if m else float("nan")
     for key in history:
         history[key].append(row.get(key, float("nan")))
+
+
 def _save_history(history: dict, run_id: str) -> tuple:
     history_dir = STAGE3_MODEL / "history"
     history_dir.mkdir(parents=True, exist_ok=True)
@@ -529,7 +365,7 @@ def _save_history(history: dict, run_id: str) -> tuple:
     plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title(f"Stage3 Training Loss - {STAGE3_ARCH}"); plt.legend(); plt.grid(True)
     plt.savefig(loss_path, bbox_inches="tight"); plt.close()
     plt.figure()
-    for name in ("train_accel_macro_f1", "val_accel_macro_f1", "train_steer_macro_f1", "val_steer_macro_f1", "selection", "mixed_source_selection", "comma_selection", "kitti_selection"):
+    for name in ("train_accel_macro_f1", "val_accel_macro_f1", "train_steer_macro_f1", "val_steer_macro_f1", "selection", "comma_selection"):
         if name in df and not df[name].isna().all():
             plt.plot(df["epoch"], df[name], marker="o", label=name)
     plt.xlabel("Epoch"); plt.ylabel("Score"); plt.ylim(0, 1); plt.title(f"Stage3 Validation Metrics - {STAGE3_ARCH}"); plt.legend(); plt.grid(True)
@@ -538,15 +374,14 @@ def _save_history(history: dict, run_id: str) -> tuple:
 
 
 def _checkpoint_payload(model, epoch: int, train_loss: float, metrics=None, history=None) -> dict:
-    selection_metric_name = "mixed_source_selection" if STAGE3_DATASET_MODE in {"mixed", "mixed_features"} else "overall.selection"
-    selection_metric = float(metrics["mixed_source_selection"] if STAGE3_DATASET_MODE in {"mixed", "mixed_features"} else metrics["overall"]["selection"]) if metrics else float("nan")
+    selection_metric = float(metrics["overall"]["selection"]) if metrics else float("nan")
     payload = {
         "model": model.state_dict(),
         "arch": "mvit_v2_s" if STAGE3_ARCH == "mvit" else STAGE3_ARCH,
         "epoch": epoch,
         "train_loss": train_loss,
         "dataset_mode": STAGE3_DATASET_MODE,
-        "selection_metric_name": selection_metric_name,
+        "selection_metric_name": "overall.selection",
         "selection_metric": selection_metric,
     }
     if metrics is not None:
@@ -556,10 +391,12 @@ def _checkpoint_payload(model, epoch: int, train_loss: float, metrics=None, hist
     if hasattr(model, "model_config"):
         payload["model_config"] = model.model_config()
     return payload
+
+
 def _print_metrics_table(metrics: dict, prefix: str = "") -> None:
     print(prefix + "Source      Accel F1   Steer F1   Weighted")
     print(prefix + "-------------------------------------------")
-    for name, label in (("comma2k19", "comma val"), ("kitti", "KITTI val"), ("nuscenes", "nuScenes"), ("overall", "overall")):
+    for name, label in (("comma2k19", "comma val"), ("overall", "overall")):
         if name in metrics:
             m = metrics[name]
             print(prefix + f"{label:<11} {m['accel']['macro_f1']:.5f}    {m['steer']['macro_f1']:.5f}    {m['selection']:.5f}")
@@ -584,20 +421,6 @@ def fit_stage3():
     print(f"Total trainable parameters: {_param_count(model, True)}")
     print(f"Frozen parameters: {_param_count(model, False)}")
     if STAGE3_ARCH == "tartanvo_gru":
-        tartan_trainable = sum(p.numel() for p in model.tartanvo.parameters() if p.requires_grad)
-        tartan_frozen = sum(p.numel() for p in model.tartanvo.parameters() if not p.requires_grad)
-        print(f"TartanVO mode: {STAGE3_TARTANVO_MODE}")
-        print(f"TartanVO feature mode: {STAGE3_TARTANVO_MODE}/{STAGE3_TARTANVO_FEATURE}")
-        print(f"TartanVO unfreeze: {model.tartanvo_unfreeze}")
-        print(f"Trainable TartanVO parameters: {tartan_trainable}")
-        print(f"Frozen TartanVO parameters: {tartan_frozen}")
-        print(f"feature dimension: {model.feature_dim}")
-        print("sequence length: 15")
-        print(f"TartanVO pretrained loaded: {model.tartanvo.pretrained_loaded}")
-        if model.tartanvo_unfreeze == "full":
-            assert all(p.requires_grad for p in model.tartanvo.parameters())
-            assert tartan_frozen == 0
-    if STAGE3_ARCH == "tartanvo_gru" and STAGE3_TARTANVO_MODE == "finetune":
         tartan_params = [p for p in model.tartanvo.parameters() if p.requires_grad]
         head_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("tartanvo.")]
         groups = []
@@ -644,12 +467,11 @@ def fit_stage3():
         }
         train_metrics["selection"] = _selection_score(train_metrics["accel"]["macro_f1"], train_metrics["steer"]["macro_f1"])
         print(f"[Stage 3] Epoch {epoch + 1}/{STAGE3_EPOCHS} | train_loss={train_loss:.5f} | train_accel_loss={train_accel_loss:.5f} | train_steer_loss={train_steer_loss:.5f}")
-        metrics = _validate_all(model, val_loaders, accel_class_weights, steer_class_weights) if val_loaders else {"overall": {"loss": float("nan"), "accel": {"accuracy": float("nan"), "macro_f1": float("nan")}, "steer": {"accuracy": float("nan"), "macro_f1": float("nan")}, "selection": float("nan")}, "mixed_source_selection": float("nan")}
+        metrics = _validate_all(model, val_loaders, accel_class_weights, steer_class_weights) if val_loaders else {"overall": {"loss": float("nan"), "accel": {"accuracy": float("nan"), "macro_f1": float("nan")}, "steer": {"accuracy": float("nan"), "macro_f1": float("nan")}, "selection": float("nan")}}
         _print_metrics_table(metrics, prefix=f"epoch={epoch + 1} ")
-        select_name = "mixed_source_selection" if STAGE3_DATASET_MODE in {"mixed", "mixed_features"} else "overall.selection"
-        select = metrics["mixed_source_selection"] if STAGE3_DATASET_MODE in {"mixed", "mixed_features"} else metrics["overall"]["selection"]
-        print(f"selection_metric_name={select_name} selection_metric={select:.5f}")
-        _append_history(history, epoch + 1, train_loss, train_accel_loss, train_steer_loss, train_metrics, metrics, select_name, select)
+        select = metrics["overall"]["selection"]
+        print(f"selection_metric_name=overall.selection selection_metric={select:.5f}")
+        _append_history(history, epoch + 1, train_loss, train_accel_loss, train_steer_loss, train_metrics, metrics, "overall.selection", select)
         history_path, loss_path, metrics_path = _save_history(history, run_id)
         if select > best:
             best = select; best_epoch = epoch + 1; best_metrics = metrics
@@ -664,15 +486,5 @@ def fit_stage3():
         for source, ref in SOURCE_REFS.items():
             if source in best_metrics:
                 print(f"{source} selection delta vs reference: {best_metrics[source]['selection'] - ref:+.5f}")
-        print(f"mixed_source_selection={best:.5f}")
-
-
-
-
-
-
-
-
-
-
+        print(f"selection={best:.5f}")
 

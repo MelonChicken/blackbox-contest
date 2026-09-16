@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from torch.utils.data import ConcatDataset, Dataset
+from torch.utils.data import Dataset
 
 from src.config import (
     SEED,
@@ -69,18 +69,6 @@ def _row_frame_index(row) -> int:
 
 
 def stage3_tartanvo_sample_key(row) -> str:
-    try:
-        return sanitize_cache_filename(f"{_row_value(row, 'sequence_id')}__{_row_frame_index(row)}")
-    except (KeyError, AttributeError):
-        pass
-    try:
-        return sanitize_cache_filename(f"{_row_value(row, 'scene')}__{int(_row_value(row, 'frame_idx'))}__{int(_row_value(row, 'timestamp'))}")
-    except (KeyError, AttributeError):
-        pass
-    try:
-        return sanitize_cache_filename(f"{_row_value(row, 'ID')}__{_row_frame_index(row)}")
-    except (KeyError, AttributeError):
-        pass
     try:
         return sanitize_cache_filename(f"{_row_value(row, 'route_id')}__{_row_value(row, 'segment_id')}__{_row_frame_index(row)}")
     except (KeyError, AttributeError):
@@ -163,8 +151,6 @@ class Stage3TartanFeatureDataset(Dataset):
         self.df = _limit_df(df[df.tartanvo_valid].reset_index(drop=True), limit)
 
     def _check_alignment_metadata(self, dataset: str) -> None:
-        if dataset != "comma2k19":
-            return
         meta_path = self.base / f"{self.split}_metadata.json"
         if not meta_path.is_file():
             raise RuntimeError(f"comma2k19 TartanVO cache is invalid until regenerated with comma_frame_times_nearest_v1 alignment: {self.index_path}")
@@ -265,17 +251,6 @@ class Stage3TartanFeatureDataset(Dataset):
             "sequence_id": segment_key,
             "frame_index": _row_frame_index(row),
         }
-
-
-class Stage3MixedTartanFeatureDataset(ConcatDataset):
-    def __init__(self, split: str, feature: str = "latent", root: str | Path = STAGE3_TARTANVO_FEATURE_CACHE, sources: tuple[str, ...] = ("comma2k19", "kitti"), limits: dict[str, int | None] | None = None):
-        self.sources = tuple(sources)
-        self.source_datasets = {source: Stage3TartanFeatureDataset(split, feature, root, dataset=source, limit=(limits or {}).get(source)) for source in self.sources}
-        super().__init__(list(self.source_datasets.values()))
-
-    @property
-    def source_counts(self) -> dict[str, int]:
-        return {source: len(ds) for source, ds in self.source_datasets.items()}
 
 
 class Stage3TartanPoseDataset(Stage3TartanFeatureDataset):

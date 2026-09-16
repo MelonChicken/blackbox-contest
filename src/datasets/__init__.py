@@ -4,8 +4,6 @@ _EXPORTS = {
     "AIHubStage1Dataset": "src.datasets.aihubDataset",
     "Stage2Dataset": "src.datasets.stage2_dataset",
     "Comma2k19Stage3Dataset": "src.datasets.comma2k19_stage3",
-    "Stage3DaconDataset": "src.datasets.comma2k19_stage3",
-    "NuScenesStage3Dataset": "src.datasets.nuscenes_stage3",
 }
 
 __all__ = list(_EXPORTS)

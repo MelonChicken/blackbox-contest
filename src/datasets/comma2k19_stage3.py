@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from src.config import COMMA2K19_STAGE3_FRAME_CACHE, COMMA2K19_STAGE3_RAW, S3_MEAN, S3_STD, SIZE, STAGE3_NUM_FRAMES, STAGE3_RAW
+from src.config import COMMA2K19_STAGE3_FRAME_CACHE, COMMA2K19_STAGE3_RAW, S3_MEAN, S3_STD, SIZE, STAGE3_NUM_FRAMES
 from src.datasets.stage3_labels import ACCEL_TO_ID, STEER_TO_ID
 from src.utils import _crop_tensor, clip
 
@@ -51,26 +51,6 @@ def stage3_cached_clip(cache_dir: str | Path, frame_index: int, frames: int = ST
     return (x - S3_MEAN[:, None, :, :]) / S3_STD[:, None, :, :]
 
 
-class Stage3DaconDataset(Dataset):
-    def __init__(self, labels: str | Path | pd.DataFrame, video_root: str | Path = STAGE3_RAW / "videos"):
-        self.df = pd.read_csv(labels) if not isinstance(labels, pd.DataFrame) else labels.reset_index(drop=True)
-        self.video_root = Path(video_root)
-
-    def __len__(self) -> int:
-        return len(self.df)
-
-    def __getitem__(self, index: int) -> dict:
-        row = self.df.iloc[index]
-        video_path = self.video_root / f"{row.ID}.mp4"
-        return {
-            "video": stage3_video_clip(video_path, int(row.frame_index)),
-            "accel_label": ACCEL_TO_ID[row.accel_label],
-            "steer_label": STEER_TO_ID[row.steer_label],
-            "timestamp": float(row.get("time_seconds", 0.0)),
-            "video_path": str(video_path),
-        }
-
-
 class Comma2k19Stage3Dataset(Dataset):
     def __init__(
         self,
@@ -92,14 +72,16 @@ class Comma2k19Stage3Dataset(Dataset):
         path = Path(value)
         return path if path.is_absolute() else self.root / path
 
-    def _cache_dir(self, row) -> Path | None:
+    def _expected_cache_dir(self, row) -> Path | None:
         if self.cache_root is None:
             return None
         if "route_id" in row and "segment_id" in row:
-            cache_dir = self.cache_root / str(row.route_id) / str(row.segment_id)
-        else:
-            cache_dir = self.cache_root / Path(str(row.video_path)).with_suffix("")
-        return cache_dir if (cache_dir / "frames.csv").is_file() else None
+            return self.cache_root / str(row.route_id) / str(row.segment_id)
+        return self.cache_root / Path(str(row.video_path)).with_suffix("")
+
+    def _cache_dir(self, row) -> Path | None:
+        cache_dir = self._expected_cache_dir(row)
+        return cache_dir if cache_dir is not None and (cache_dir / "frames.csv").is_file() else None
 
     def _missing_cache_error(self, cache_dir: Path) -> FileNotFoundError:
         return FileNotFoundError(
@@ -115,11 +97,7 @@ class Comma2k19Stage3Dataset(Dataset):
         frame_index = int(row.video_frame_index if "video_frame_index" in self.df.columns else row.frame_index)
         cache_dir = self._cache_dir(row)
         if self.cache_root is not None and cache_dir is None:
-            if "route_id" in row and "segment_id" in row:
-                expected = self.cache_root / str(row.route_id) / str(row.segment_id)
-            else:
-                expected = self.cache_root / Path(str(row.video_path)).with_suffix("")
-            raise self._missing_cache_error(expected)
+            raise self._missing_cache_error(self._expected_cache_dir(row))
         video = stage3_cached_clip(cache_dir, frame_index, self.frames) if cache_dir else stage3_video_clip(video_path, frame_index, self.frames)
         return {
             "video": video,
@@ -131,4 +109,5 @@ class Comma2k19Stage3Dataset(Dataset):
             "route_id": str(row.route_id) if "route_id" in self.df.columns else "",
             "segment_id": str(row.segment_id) if "segment_id" in self.df.columns else "",
         }
+
 

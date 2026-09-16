@@ -4,9 +4,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import cv2
-import numpy as np
-import pandas as pd
 import torch
 from torch import nn
 
@@ -14,7 +11,6 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.datasets.comma2k19_stage3 import Stage3DaconDataset
 from src.models import Stage3MViT
 from src.train.stage3 import _datasets, _stage3_collate
 
@@ -29,17 +25,11 @@ def _as_bcthw(video: torch.Tensor) -> torch.Tensor:
 
 
 def _fixture_sample() -> dict:
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp) / "videos"
-        root.mkdir()
-        path = root / "smoke.mp4"
-        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10, (224, 224))
-        for i in range(20):
-            frame = np.full((224, 224, 3), i * 8, dtype=np.uint8)
-            writer.write(frame)
-        writer.release()
-        labels = pd.DataFrame([{"ID": "smoke", "frame_index": 8, "accel_label": "CONSTANT", "steer_label": "STRAIGHT"}])
-        return Stage3DaconDataset(labels, video_root=root)[0]
+    return {
+        "video": torch.randn(3, 16, 224, 224),
+        "accel_label": 1,
+        "steer_label": 1,
+    }
 
 
 def _dataset_sample() -> tuple[dict, str]:

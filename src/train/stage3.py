@@ -325,7 +325,11 @@ def _print_one_distribution(name: str, dataset) -> None:
     print(f"samples: {len(dataset)}")
     print(f"accel: {_count_names(accel, accel_names)}")
     print(f"steer: {_count_names(steer, steer_names)}")
-
+    if isinstance(dataset, Comma2k19Stage3Dataset) and dataset.cache_root is not None:
+        key = ["route_id", "segment_id"] if {"route_id", "segment_id"}.issubset(dataset.df.columns) else "video_path"
+        rows = [part.iloc[0] for _, part in dataset.df.groupby(key, sort=False)]
+        cached = sum(dataset._cache_dir(row) is not None for row in rows)
+        print(f"frame cache: {cached}/{len(rows)} segments cached")
 
 def _print_dataset_summary(train_dataset, val_datasets: dict[str, object], summary: dict) -> None:
     print("=== Stage 3 Dataset ===")

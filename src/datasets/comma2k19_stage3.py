@@ -101,17 +101,26 @@ class Comma2k19Stage3Dataset(Dataset):
             cache_dir = self.cache_root / Path(str(row.video_path)).with_suffix("")
         return cache_dir if (cache_dir / "frames.csv").is_file() else None
 
+    def _missing_cache_error(self, cache_dir: Path) -> FileNotFoundError:
+        return FileNotFoundError(
+            "missing comma2k19 Stage3 frame cache; refusing slow HEVC fallback: "
+            f"{cache_dir / 'frames.csv'}\n"
+            "Build it, e.g. python -m src.tools.cache_comma2k19_stage3_frames "
+            f"--manifest {self.manifest} --temporal-stride 8 --limit-segments 0"
+        )
+
     def __getitem__(self, index: int) -> dict:
         row = self.df.iloc[index]
         video_path = self._video_path(str(row.video_path))
         frame_index = int(row.video_frame_index if "video_frame_index" in self.df.columns else row.frame_index)
         cache_dir = self._cache_dir(row)
-        try:
-            video = stage3_cached_clip(cache_dir, frame_index, self.frames) if cache_dir else stage3_video_clip(video_path, frame_index, self.frames)
-        except FileNotFoundError:
-            if cache_dir is None:
-                raise
-            video = stage3_video_clip(video_path, frame_index, self.frames)
+        if self.cache_root is not None and cache_dir is None:
+            if "route_id" in row and "segment_id" in row:
+                expected = self.cache_root / str(row.route_id) / str(row.segment_id)
+            else:
+                expected = self.cache_root / Path(str(row.video_path)).with_suffix("")
+            raise self._missing_cache_error(expected)
+        video = stage3_cached_clip(cache_dir, frame_index, self.frames) if cache_dir else stage3_video_clip(video_path, frame_index, self.frames)
         return {
             "video": video,
             "accel_label": int(row.accel_label),

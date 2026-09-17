@@ -1,6 +1,7 @@
 from .stage1 import Stage1MViT
 from .stage2_videomae import Stage2VideoMAE, build_stage2_model
 from .stage3 import Stage3MViT, Stage3ResNetGRU, Stage3TartanVOGRU
+from .stage3_vjepa2 import Stage3VJEPA2Frozen
 
 __all__ = [
     "Stage1MViT",
@@ -8,5 +9,6 @@ __all__ = [
     "Stage3MViT",
     "Stage3ResNetGRU",
     "Stage3TartanVOGRU",
+    "Stage3VJEPA2Frozen",
     "build_stage2_model",
 ]

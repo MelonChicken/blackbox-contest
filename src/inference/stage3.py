@@ -7,8 +7,10 @@ import torch
 from PIL import Image
 
 from src.config import S3_MEAN, S3_STD
+from src.datasets.stage3_sampling import build_centered_clip_indices
 from src.inference.stage1 import _video_paths
 from src.models.stage3 import Stage3MViT, Stage3ResNetGRU, Stage3TartanVOGRU
+from src.models.stage3_vjepa2 import Stage3VJEPA2Frozen
 
 
 ACCEL = ["ACCELERATING", "DECELERATING", "CONSTANT", "STOPPED"]
@@ -31,8 +33,8 @@ def _stage3_frames(path: Path):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
         width, height = image.size
-        scale = 256 / min(width, height)
-        image = image.resize((round(width * scale), round(height * scale)))
+        scale = 224 / min(width, height)
+        image = image.resize((max(224, round(width * scale)), max(224, round(height * scale))))
         width, height = image.size
         x, y = (width - 224) // 2, (height - 224) // 2
         image = image.crop((x, y, x + 224, y + 224))
@@ -63,8 +65,9 @@ def _stage3_state_dict(checkpoint: dict) -> dict:
 
 def _stage3_checkpoint_path(model_dir) -> Path:
     root = Path(model_dir)
+    best = root / "best.pt"
     tartan = root / "tartanvo_best.pt"
-    return tartan if tartan.is_file() else root / "best.pt"
+    return best if best.is_file() else tartan
 
 
 def _stage3_model(arch: str, checkpoint: dict | None = None):
@@ -72,6 +75,24 @@ def _stage3_model(arch: str, checkpoint: dict | None = None):
         return Stage3MViT(pretrained=False)
     if arch == "resnet18_gru":
         return Stage3ResNetGRU(pretrained=False)
+    if arch == "vjepa2_1_vitb_frozen":
+        config = dict((checkpoint or {}).get("model_config") or {})
+        required = ("backbone_repo", "backbone_name", "probe_type", "input_size", "num_frames")
+        missing = [key for key in required if key not in config]
+        if missing:
+            raise KeyError(f"V-JEPA Stage3 checkpoint missing model_config keys: {missing}")
+        return Stage3VJEPA2Frozen(
+            repo_dir=config["backbone_repo"],
+            checkpoint=None,
+            backbone_name=config["backbone_name"],
+            probe_type=config["probe_type"],
+            input_size=int(config["input_size"]),
+            num_frames=int(config["num_frames"]),
+            freeze_backbone=bool(config.get("backbone_frozen", True)),
+            probe_dim=int(config.get("probe_dim", 384)),
+            probe_heads=int(config.get("probe_heads", 6)),
+            dropout=float(config.get("dropout", 0.2)),
+        )
     if arch == "tartanvo_gru":
         config = _tartanvo_config(checkpoint or {})
         return Stage3TartanVOGRU(
@@ -89,7 +110,7 @@ def _stage3_model(arch: str, checkpoint: dict | None = None):
 
 def predict_stage3(data_dir, model_dir):
     device = _device()
-    checkpoint = torch.load(_stage3_checkpoint_path(model_dir), map_location="cpu", weights_only=False)
+    checkpoint = torch.load(_stage3_checkpoint_path(model_dir), map_location="cpu", weights_only=True)
     arch = checkpoint.get("arch", "mvit_v2_s")
     model = _stage3_model(arch, checkpoint)
     model.load_state_dict(_stage3_state_dict(checkpoint), strict=True)
@@ -105,7 +126,7 @@ def predict_stage3(data_dir, model_dir):
             window_batch = 1 if arch == "tartanvo_gru" else 8
             for start in range(0, count, window_batch):
                 center = centers[start : start + window_batch]
-                indices = np.clip(center[:, None] - 8 + np.arange(16)[None, :], 0, count - 1)
+                indices = np.asarray([build_centered_clip_indices(int(c), count, 16) for c in center], dtype=np.int64)
                 clips = frames[torch.from_numpy(indices)].permute(0, 2, 1, 3, 4).float() / 255.0
                 clips = (clips - S3_MEAN[None, :, None, :, :]) / S3_STD[None, :, None, :, :]
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -124,4 +145,6 @@ def predict_stage3(data_dir, model_dir):
     del model
     torch.cuda.empty_cache()
     return pd.DataFrame(rows, columns=["ID", "sample_index", "accel_label", "steer_label"])
+
+
 

@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.config import COMMA2K19_STAGE3_FRAME_CACHE, COMMA2K19_STAGE3_RAW, S3_MEAN, S3_STD, SIZE, STAGE3_NUM_FRAMES
+from src.datasets.stage3_sampling import build_centered_clip_indices
 from src.datasets.stage3_labels import ACCEL_TO_ID, STEER_TO_ID
 from src.utils import _crop_tensor, clip
 
@@ -20,7 +21,7 @@ def stage3_video_clip(path: str | Path, frame_index: int, frames: int = STAGE3_N
 
 
 def _clip_indices(center: int, total: int, frames: int = STAGE3_NUM_FRAMES) -> np.ndarray:
-    return np.clip(int(center) - frames // 2 + np.arange(frames), 0, total - 1).astype(int)
+    return np.asarray(build_centered_clip_indices(center, total, frames), dtype=int)
 
 
 @lru_cache(maxsize=512)
@@ -109,5 +110,6 @@ class Comma2k19Stage3Dataset(Dataset):
             "route_id": str(row.route_id) if "route_id" in self.df.columns else "",
             "segment_id": str(row.segment_id) if "segment_id" in self.df.columns else "",
         }
+
 
 

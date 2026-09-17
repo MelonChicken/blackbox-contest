@@ -30,6 +30,18 @@ from src.config import (
     STAGE3_MVIT_PRETRAINED_WEIGHTS,
     STAGE3_MVIT_PREPROCESS,
     STAGE3_MODEL,
+    STAGE3_VJEPA_BACKBONE_NAME,
+    STAGE3_VJEPA_CHECKPOINT,
+    STAGE3_VJEPA_DROPOUT,
+    STAGE3_VJEPA_EARLY_STOPPING_PATIENCE,
+    STAGE3_VJEPA_FREEZE_BACKBONE,
+    STAGE3_VJEPA_INPUT_SIZE,
+    STAGE3_VJEPA_PROBE,
+    STAGE3_VJEPA_PROBE_DIM,
+    STAGE3_VJEPA_PROBE_HEADS,
+    STAGE3_VJEPA_PROBE_LR,
+    STAGE3_VJEPA_REPO,
+    STAGE3_VJEPA_WEIGHT_DECAY,
     STAGE3_NUM_WORKERS,
     STAGE3_PREFETCH_FACTOR,
     STAGE3_SAMPLE_PROFILE,
@@ -51,7 +63,7 @@ except ImportError:
     STAGE3_DATASET_MODE = STAGE3_DATASET
 from src.datasets.comma2k19_stage3 import ACCEL_TO_ID, STEER_TO_ID, Comma2k19Stage3Dataset
 from src.datasets.stage3_tartanvo_pose import Stage3TartanFeatureDataset
-from src.models import Stage3MViT, Stage3ResNetGRU, Stage3TartanVOGRU
+from src.models import Stage3MViT, Stage3ResNetGRU, Stage3TartanVOGRU, Stage3VJEPA2Frozen
 from src.tools.stage3_comma_manifest import active_manifest_path, active_subset_name, segment_cache_index_name
 from src.utils import set_seed
 
@@ -171,6 +183,18 @@ def _build_stage3_model(pretrained: bool = True):
         return Stage3ResNetGRU(pretrained=pretrained)
     if STAGE3_ARCH == "tartanvo_gru":
         return Stage3TartanVOGRU(load_pretrained=pretrained)
+    if STAGE3_ARCH == "vjepa2_1_vitb_frozen":
+        return Stage3VJEPA2Frozen(
+            repo_dir=STAGE3_VJEPA_REPO,
+            checkpoint=STAGE3_VJEPA_CHECKPOINT,
+            backbone_name=STAGE3_VJEPA_BACKBONE_NAME,
+            probe_type=STAGE3_VJEPA_PROBE,
+            input_size=STAGE3_VJEPA_INPUT_SIZE,
+            freeze_backbone=STAGE3_VJEPA_FREEZE_BACKBONE,
+            probe_dim=STAGE3_VJEPA_PROBE_DIM,
+            probe_heads=STAGE3_VJEPA_PROBE_HEADS,
+            dropout=STAGE3_VJEPA_DROPOUT,
+        )
     raise ValueError(f"Unknown STAGE3_ARCH: {STAGE3_ARCH}")
 
 
@@ -390,6 +414,9 @@ def _checkpoint_payload(model, epoch: int, train_loss: float, metrics=None, hist
         payload["history"] = history
     if hasattr(model, "model_config"):
         payload["model_config"] = model.model_config()
+        if payload["arch"] == "vjepa2_1_vitb_frozen":
+            for key in ("probe_type", "input_size", "num_frames", "backbone_name", "backbone_frozen", "accel_classes", "steer_classes", "normalization"):
+                payload[key] = payload["model_config"][key]
     return payload
 
 
@@ -418,6 +445,7 @@ def fit_stage3():
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if not trainable_params:
         raise RuntimeError("Stage3 model has no trainable parameters.")
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
     print(f"Total trainable parameters: {_param_count(model, True)}")
     print(f"Frozen parameters: {_param_count(model, False)}")
     if STAGE3_ARCH == "tartanvo_gru":
@@ -436,6 +464,13 @@ def fit_stage3():
             {"params": list(model.accel.parameters()) + list(model.steer.parameters()), "lr": STAGE3_HEAD_LR},
         ])
         print(f"Optimizer LR: backbone={STAGE3_MVIT_BACKBONE_LR} head={STAGE3_HEAD_LR}")
+    elif STAGE3_ARCH == "vjepa2_1_vitb_frozen":
+        trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        opt = torch.optim.AdamW((p for _, p in trainable), lr=STAGE3_VJEPA_PROBE_LR, weight_decay=STAGE3_VJEPA_WEIGHT_DECAY)
+        print(f"Optimizer LR: vjepa_probe={STAGE3_VJEPA_PROBE_LR} weight_decay={STAGE3_VJEPA_WEIGHT_DECAY}")
+        print("Trainable parameters:", ", ".join(f"{n}={p.numel()}" for n, p in trainable))
+        if any(n.startswith("backbone.") for n, _ in trainable):
+            raise RuntimeError("V-JEPA frozen optimizer includes backbone parameters")
     else:
         opt = torch.optim.AdamW(trainable_params, STAGE3_HEAD_LR)
     accel_class_weights = _class_weights("accel")
@@ -443,6 +478,7 @@ def fit_stage3():
     best = -1.0
     best_metrics = None
     best_epoch = 0
+    bad_epochs = 0
 
     for epoch in range(STAGE3_EPOCHS):
         model.train()
@@ -474,8 +510,13 @@ def fit_stage3():
         _append_history(history, epoch + 1, train_loss, train_accel_loss, train_steer_loss, train_metrics, metrics, "overall.selection", select)
         history_path, loss_path, metrics_path = _save_history(history, run_id)
         if select > best:
-            best = select; best_epoch = epoch + 1; best_metrics = metrics
+            best = select; best_epoch = epoch + 1; best_metrics = metrics; bad_epochs = 0
             torch.save(_checkpoint_payload(model, epoch + 1, train_loss, metrics, history), out / "best.pt")
+        elif STAGE3_ARCH == "vjepa2_1_vitb_frozen":
+            bad_epochs += 1
+            if bad_epochs >= STAGE3_VJEPA_EARLY_STOPPING_PATIENCE:
+                print(f"[Stage 3] early stopping: no selection improvement for {bad_epochs} epoch(s)")
+                break
 
     print(f"Stage3 history saved:\n{history_path}")
     print(f"Loss plot:\n{loss_path}")

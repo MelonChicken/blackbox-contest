@@ -135,6 +135,7 @@ def validate_zip(path: Path) -> None:
         "model/stage3/tartanvo_wrapper.py",
         "model/stage3/tartanvo_network.py",
         "model/stage3/tartanvo_correlation.py",
+        "model/stage3/vjepa2.py",
     }
     missing = sorted(required - set(names))
     if missing:

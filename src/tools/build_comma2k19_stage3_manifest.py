@@ -10,12 +10,12 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from src.config import COMMA2K19_STAGE3_MANIFEST, COMMA2K19_STAGE3_RAW, STAGE3_ACCEL_LABEL_MODE, STAGE3_OUTPUT_HZ
+from src.config import COMMA2K19_STAGE3_MANIFEST, COMMA2K19_STAGE3_RAW, STAGE3_ACCEL_LABEL_MODE, STAGE3_INVERT_STEERING, STAGE3_MAX_ALIGNMENT_ERROR_SEC, STAGE3_OUTPUT_HZ
 from src.datasets.stage3_labels import ACCEL_NAMES, STEER_NAMES, derive_accel_label, derive_acceleration, derive_steer_label
 
 VIDEO_EXT = {".hevc", ".mp4", ".mkv", ".avi", ".mov"}
 ALIGNMENT_VERSION = "comma_frame_times_nearest_v1"
-DEFAULT_MAX_ALIGNMENT_ERROR_SEC = 0.06
+DEFAULT_MAX_ALIGNMENT_ERROR_SEC = STAGE3_MAX_ALIGNMENT_ERROR_SEC
 VIDEO_METADATA_COLUMNS = [
     "segment_id",
     "decoded_frame_count",
@@ -467,10 +467,11 @@ def main() -> None:
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--hf-split", default=None, help="Use HuggingFace load_dataset('commaai/comma2k19', split=...) instead of local Chunk_* files.")
-    parser.add_argument("--invert-steering", action="store_true")
+    parser.add_argument("--invert-steering", action="store_true", default=STAGE3_INVERT_STEERING)
     args = parser.parse_args()
     build_manifest(args.raw_root, args.out_dir, args.val_ratio, args.limit, args.invert_steering, args.hf_split)
 
 
 if __name__ == "__main__":
     main()
+

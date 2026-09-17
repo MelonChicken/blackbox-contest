@@ -27,6 +27,7 @@ from src.config import (
     STAGE3_TRAIN_TEMPORAL_STRIDE,
 )
 from src.datasets.comma2k19_stage3 import Comma2k19Stage3Dataset
+from src.datasets.stage3_sampling import parse_clip_float_list, parse_clip_frame_indices
 from src.models import Stage3MViT
 from src.train.stage3 import _loss, _stride_manifest
 
@@ -53,23 +54,29 @@ def _timestamp_column(df: pd.DataFrame) -> str:
     return "target_timestamp" if "target_timestamp" in df.columns else "timestamp"
 
 
-def _clip_indices(center: int, frames: int = STAGE3_NUM_FRAMES) -> np.ndarray:
-    return np.maximum(int(center) - frames // 2 + np.arange(frames), 0).astype(int)
-
-
 def _needed_frames(df: pd.DataFrame) -> np.ndarray:
+    if "clip_frame_indices" not in df.columns:
+        raise RuntimeError("manifest lacks clip_frame_indices; regenerate Stage3 manifest before caching")
     needed = set()
-    for frame_index in df[_frame_index_column(df)].astype(int):
-        needed.update(_clip_indices(frame_index).tolist())
+    for value in df["clip_frame_indices"]:
+        needed.update(parse_clip_frame_indices(str(value), STAGE3_NUM_FRAMES))
+    if not needed:
+        raise RuntimeError("manifest contains no requested clip frames")
     return np.asarray(sorted(needed), dtype=np.int64)
 
-
 def _timestamps(df: pd.DataFrame, needed: np.ndarray) -> np.ndarray:
+    by_frame = {}
+    if "clip_target_timestamps" in df.columns:
+        for row in df.itertuples(index=False):
+            indices = parse_clip_frame_indices(str(row.clip_frame_indices), STAGE3_NUM_FRAMES)
+            timestamps = parse_clip_float_list(str(row.clip_target_timestamps), STAGE3_NUM_FRAMES, "clip_target_timestamps")
+            for idx, ts in zip(indices, timestamps):
+                by_frame.setdefault(int(idx), float(ts))
     frame_col = _frame_index_column(df)
     time_col = _timestamp_column(df)
     source = df.sort_values(frame_col).drop_duplicates(frame_col)
-    return np.interp(needed, source[frame_col].to_numpy(dtype=float), source[time_col].to_numpy(dtype=float))
-
+    fallback = dict(zip(source[frame_col].to_numpy(dtype=int).tolist(), source[time_col].to_numpy(dtype=float).tolist()))
+    return np.asarray([by_frame.get(int(idx), fallback.get(int(idx), float("nan"))) for idx in needed], dtype=float)
 
 def _cache_dir(cache_root: Path, group: pd.DataFrame, video: Path) -> Path:
     first = group.iloc[0]
@@ -94,6 +101,7 @@ def cache_segment(group: pd.DataFrame, raw_root: Path, cache_root: Path, jpeg_qu
     rows = []
     ts = dict(zip(needed.tolist(), _timestamps(group, needed).tolist()))
     saved = 0
+    existing = 0
     decoded = 0
     idx = 0
     try:
@@ -104,21 +112,25 @@ def cache_segment(group: pd.DataFrame, raw_root: Path, cache_root: Path, jpeg_qu
             decoded += 1
             if idx in required_set:
                 name = f"{idx:06d}.jpg"
-                ok = cv2.imwrite(str(out_dir / name), _resize_center_crop_bgr(frame), [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
-                if not ok:
-                    raise ValueError(f"cannot write cached frame: {out_dir / name}")
+                out_path = out_dir / name
+                if out_path.is_file():
+                    existing += 1
+                else:
+                    ok = cv2.imwrite(str(out_path), _resize_center_crop_bgr(frame), [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
+                    if not ok:
+                        raise ValueError(f"cannot write cached frame: {out_path}")
+                    saved += 1
                 rows.append({"original_frame_index": idx, "cached_path": name, "timestamp": float(ts[idx])})
-                saved += 1
             idx += 1
     finally:
         cap.release()
 
     missing = sorted(required_set - {int(row["original_frame_index"]) for row in rows})
-    if saved == 0:
+    if saved + existing == 0:
         raise RuntimeError(f"no required frames decoded from {video}")
     pd.DataFrame(rows).to_csv(out_dir / "frames.csv", index=False)
     print(
-        f"segment_cache_stats required={len(needed)} decoded={decoded} saved={saved} "
+        f"segment_cache_stats requested={len(needed)} decoded={decoded} saved={saved} existing={existing} "
         f"missing={len(missing)} reported_frame_count={reported_count}"
     )
     if missing:
@@ -212,3 +224,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

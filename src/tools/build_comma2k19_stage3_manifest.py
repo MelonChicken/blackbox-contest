@@ -10,8 +10,9 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from src.config import COMMA2K19_STAGE3_MANIFEST, COMMA2K19_STAGE3_RAW, STAGE3_ACCEL_LABEL_MODE, STAGE3_INVERT_STEERING, STAGE3_MAX_ALIGNMENT_ERROR_SEC, STAGE3_OUTPUT_HZ
+from src.config import COMMA2K19_STAGE3_MANIFEST, COMMA2K19_STAGE3_RAW, STAGE3_ACCEL_LABEL_MODE, STAGE3_BOUNDARY_POLICY, STAGE3_FUTURE_FRAMES, STAGE3_INVERT_STEERING, STAGE3_MAX_ALIGNMENT_ERROR_SEC, STAGE3_NUM_FRAMES, STAGE3_OUTPUT_HZ, STAGE3_PAST_FRAMES, STAGE3_SAMPLING_HZ, STAGE3_SAMPLING_POLICY
 from src.datasets.stage3_labels import ACCEL_NAMES, STEER_NAMES, derive_accel_label, derive_acceleration, derive_steer_label
+from src.datasets.stage3_sampling import build_timestamp_nearest_clip, json_dumps_compact, sampling_metadata
 
 VIDEO_EXT = {".hevc", ".mp4", ".mkv", ".avi", ".mov"}
 ALIGNMENT_VERSION = "comma_frame_times_nearest_v1"
@@ -233,6 +234,15 @@ def _rows(
         if err > max_alignment_error_sec:
             dropped += 1
             continue
+        clip = build_timestamp_nearest_clip(
+            video_clock_t,
+            float(target),
+            STAGE3_SAMPLING_HZ,
+            STAGE3_PAST_FRAMES,
+            STAGE3_FUTURE_FRAMES,
+            max_alignment_error_sec=max_alignment_error_sec,
+            boundary_policy=STAGE3_BOUNDARY_POLICY,
+        )
         errors.append(err)
         rows.append(
             {
@@ -245,6 +255,13 @@ def _rows(
                 "alignment_error_sec": err,
                 "alignment_source": alignment_source,
                 "alignment_version": ALIGNMENT_VERSION,
+                "clip_frame_indices": json_dumps_compact(clip["clip_frame_indices"]),
+                "clip_target_timestamps": json_dumps_compact(clip["clip_target_timestamps"]),
+                "clip_alignment_errors_sec": json_dumps_compact(clip["clip_alignment_errors_sec"]),
+                "clip_max_alignment_error_sec": float(clip["clip_max_alignment_error_sec"]),
+                "clip_selected_interval_min_sec": float(clip["clip_selected_interval_min_sec"]),
+                "clip_selected_interval_median_sec": float(clip["clip_selected_interval_median_sec"]),
+                "clip_selected_interval_max_sec": float(clip["clip_selected_interval_max_sec"]),
                 "speed": float(speed[i]),
                 "acceleration": float(acceleration[i]),
                 "steering_angle": float(steering[i]),
@@ -368,6 +385,24 @@ def _alignment_summary(df: pd.DataFrame) -> None:
     )
 
 
+def _manifest_metadata() -> dict:
+    meta = sampling_metadata(
+        sampling_hz=STAGE3_SAMPLING_HZ,
+        sampling_policy=STAGE3_SAMPLING_POLICY,
+        num_frames=STAGE3_NUM_FRAMES,
+        past_frames=STAGE3_PAST_FRAMES,
+        future_frames=STAGE3_FUTURE_FRAMES,
+        boundary_policy=STAGE3_BOUNDARY_POLICY,
+        output_hz=STAGE3_OUTPUT_HZ,
+    )
+    meta["alignment_version"] = ALIGNMENT_VERSION
+    return meta
+
+
+def _write_manifest_metadata(out_dir: Path) -> None:
+    (out_dir / "metadata.json").write_text(json.dumps(_manifest_metadata(), indent=2), encoding="utf-8")
+
+
 def _write_splits(df: pd.DataFrame, out_dir: Path, val_ratio: float) -> tuple[Path, Path]:
     if df.empty:
         raise RuntimeError("no valid comma2k19 samples were produced")
@@ -474,4 +509,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

@@ -43,8 +43,15 @@ from src.config import (
     STAGE3_VJEPA_REPO,
     STAGE3_VJEPA_WEIGHT_DECAY,
     STAGE3_NUM_WORKERS,
+    STAGE3_NUM_FRAMES,
     STAGE3_PREFETCH_FACTOR,
     STAGE3_SAMPLE_PROFILE,
+    STAGE3_SAMPLING_HZ,
+    STAGE3_SAMPLING_POLICY,
+    STAGE3_PAST_FRAMES,
+    STAGE3_FUTURE_FRAMES,
+    STAGE3_BOUNDARY_POLICY,
+    STAGE3_OUTPUT_HZ,
     STAGE3_TARTANVO_FEATURE,
     STAGE3_TARTANVO_FEATURE_CACHE,
     STAGE3_TARTANVO_MODE,
@@ -528,4 +535,6 @@ def fit_stage3():
             if source in best_metrics:
                 print(f"{source} selection delta vs reference: {best_metrics[source]['selection'] - ref:+.5f}")
         print(f"selection={best:.5f}")
+
+
 

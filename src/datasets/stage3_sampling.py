@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -25,15 +25,15 @@ def nearest_frame_indices_for_timestamps(
     frame_times,
     target_timestamps,
     max_alignment_error_sec: float | None = None,
-    boundary_policy: str = "edge_clamp",
+    boundary_policy: str = "clamp",
 ) -> tuple[list[int], list[float]]:
     frame_times = np.asarray(frame_times, dtype=float).squeeze()
-    targets = np.asarray(target_timestamps, dtype=float).squeeze()
+    targets = np.atleast_1d(np.asarray(target_timestamps, dtype=float).squeeze())
     if frame_times.ndim != 1 or len(frame_times) == 0:
         raise ValueError("frame_times must be a non-empty 1D sequence")
     if np.any(np.diff(frame_times) < 0):
         raise ValueError("frame_times must be sorted ascending")
-    if boundary_policy != "edge_clamp":
+    if boundary_policy not in {"clamp", "edge_clamp"}:
         raise ValueError(f"unsupported boundary_policy: {boundary_policy}")
 
     indices: list[int] = []
@@ -65,7 +65,7 @@ def build_timestamp_nearest_clip(
     past_frames: int,
     future_frames: int,
     max_alignment_error_sec: float | None = None,
-    boundary_policy: str = "edge_clamp",
+    boundary_policy: str = "clamp",
 ) -> dict[str, Any]:
     target_timestamps = build_centered_clip_timestamps(center_timestamp, sampling_hz, past_frames, future_frames)
     indices, errors = nearest_frame_indices_for_timestamps(
@@ -158,3 +158,5 @@ def read_manifest_metadata(manifest: str | Path) -> dict[str, Any]:
     if not path.is_file():
         raise RuntimeError(f"missing Stage3 manifest metadata: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+

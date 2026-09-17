@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import py_compile
@@ -85,9 +85,8 @@ def _iter_submission_files():
 
 
 def _iter_extra_model_files():
-    path = PROJECT_ROOT / "model" / "stage3" / "tartanvo_best.pt"
-    if path.is_file() and not (MODEL_DIR / "stage3" / "best.pt").is_file():
-        yield path, "model/stage3/best.pt"
+    return
+    yield
 
 
 def build_zip() -> Path:
@@ -131,11 +130,6 @@ def validate_zip(path: Path) -> None:
         "model/stage2/videomae.py",
         "model/stage3/__init__.py",
         "model/stage3/heads.py",
-        "model/stage3/tartanvo.py",
-        "model/stage3/tartanvo_wrapper.py",
-        "model/stage3/tartanvo_network.py",
-        "model/stage3/tartanvo_correlation.py",
-        "model/stage3/vjepa2.py",
     }
     missing = sorted(required - set(names))
     if missing:
@@ -154,3 +148,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

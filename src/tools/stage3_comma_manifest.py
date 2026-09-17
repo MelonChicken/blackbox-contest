@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -19,8 +19,6 @@ from src.config import (
     STAGE3_COMMA_TRAIN_SEGMENTS_PER_ROUTE,
     STAGE3_COMMA_VAL_SAMPLE_LIMIT,
     STAGE3_COMMA_VAL_SEGMENTS_PER_ROUTE,
-    STAGE3_TARTANVO_FEATURE,
-    STAGE3_TARTANVO_FEATURE_CACHE,
     STAGE3_TRAIN_TEMPORAL_STRIDE,
     STAGE3_VAL_TEMPORAL_STRIDE,
     SEED,
@@ -261,11 +259,6 @@ def print_route_overlap() -> None:
         print("overlap examples:", sorted(overlap)[:10])
 
 
-def feature_index(split: str) -> pd.DataFrame | None:
-    path = STAGE3_TARTANVO_FEATURE_CACHE / STAGE3_TARTANVO_FEATURE / "comma2k19" / f"{split}_index.csv"
-    return pd.read_csv(path) if path.is_file() else None
-
-
 def abs_video_path(row) -> Path:
     p = Path(str(row.video_path))
     return p if p.is_absolute() else COMMA2K19_STAGE3_RAW / p
@@ -287,7 +280,6 @@ def print_sample_count_audit(split: str) -> None:
     limit = STAGE3_COMMA_TRAIN_SAMPLE_LIMIT if split == "train" else STAGE3_COMMA_VAL_SAMPLE_LIMIT
     after_stride = _stride_manifest(df, stride)
     final_df = _balanced_limit(after_stride, limit)
-    cache = feature_index(split)
     print(f"[comma {split} sample count]")
     print(f"routes: {route_series(df).nunique()}")
     print(f"segments: {df[['route_id','segment_id']].drop_duplicates().shape[0] if {'route_id','segment_id'} <= set(df.columns) else df.video_path.nunique()}")
@@ -295,8 +287,7 @@ def print_sample_count_audit(split: str) -> None:
     print(f"boundary-filtered centers: {len(df)}")
     print(f"after temporal stride ({stride}): {len(after_stride)}")
     print(f"after sample limit ({limit}): {len(final_df)}")
-    print(f"cache index samples: {len(cache) if cache is not None else 'missing'}")
-    print(f"final dataset len: {len(cache) if cache is not None else len(final_df)}")
+    print(f"final dataset len: {len(final_df)}")
     if len(df):
         key = 'segment_id' if 'segment_id' in df.columns else 'video_path'
         seg_key, seg = next(iter(df.groupby(key, sort=False)))

@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import InterpolationMode
 from model.stage1 import Stage1MViT
 from model.stage2 import LegacyStage2VideoMAE, Stage2VideoMAE
-from model.stage3 import Stage3MViT, Stage3ResNetGRU, Stage3TartanVOGRU, Stage3VJEPA2Frozen
+from model.stage3 import Stage3MViT
 
 
 # ============================================================
@@ -76,9 +76,6 @@ STEER = [
 
 cv2.setNumThreads(1)
 
-STAGE3_ENSEMBLE = True
-STAGE3_MVIT_CHECKPOINT = "mvit_best.pt"
-STAGE3_RESNET_GRU_CHECKPOINT = "resnet_gru_best.pt"
 
 def build_centered_clip_indices(center_index: int, num_frames: int, clip_len: int = 16) -> list[int]:
     if num_frames <= 0:
@@ -119,58 +116,14 @@ def _video_paths(
 # Models
 # ============================================================
 
-def _tartanvo_config(checkpoint: dict) -> dict:
-    config = dict(checkpoint.get("model_config") or {})
-    state = checkpoint.get("model", {})
-    input_size = state.get("gru.weight_ih_l0")
-    if input_size is not None:
-        config.setdefault("tartanvo_feature", "pose" if input_size.shape[1] == 6 else "latent")
-    if "feature_norm.weight" in state:
-        config.setdefault("tartanvo_feature_norm", "layernorm")
-    if "pose_norm.weight" in state:
-        config.setdefault("tartanvo_pose_norm", "layernorm")
-    return config
-
-
 def _stage3_checkpoint_path(model_dir) -> Path:
-    root = Path(model_dir)
-    best = root / "best.pt"
-    tartan = root / "tartanvo_best.pt"
-    return best if best.is_file() else tartan
-
-
-def _stage3_aux_checkpoints_exist(model_dir) -> bool:
-    root = Path(model_dir)
-    return (root / STAGE3_MVIT_CHECKPOINT).is_file() and (root / STAGE3_RESNET_GRU_CHECKPOINT).is_file()
+    return Path(model_dir) / "best.pt"
 
 
 def _stage3_model(arch: str, checkpoint: dict | None = None):
-    if arch in {"mvit_v2_s", "mvit"}:
-        return Stage3MViT()
-    if arch == "resnet18_gru":
-        return Stage3ResNetGRU()
-    if arch == "vjepa2_1_vitb_frozen":
-        config = dict((checkpoint or {}).get("model_config") or {})
-        required = ("backbone_repo", "backbone_name", "probe_type", "input_size", "num_frames")
-        missing = [key for key in required if key not in config]
-        if missing:
-            raise KeyError(f"V-JEPA Stage3 checkpoint missing model_config keys: {missing}")
-        return Stage3VJEPA2Frozen(
-            repo_dir=config["backbone_repo"],
-            checkpoint=None,
-            backbone_name=config["backbone_name"],
-            probe_type=config["probe_type"],
-            input_size=int(config["input_size"]),
-            num_frames=int(config["num_frames"]),
-            freeze_backbone=bool(config.get("backbone_frozen", True)),
-            probe_dim=int(config.get("probe_dim", 384)),
-            probe_heads=int(config.get("probe_heads", 6)),
-            dropout=float(config.get("dropout", 0.2)),
-        )
-    if arch == "tartanvo_gru":
-        return Stage3TartanVOGRU(load_pretrained=False, model_config=_tartanvo_config(checkpoint or {}))
-    raise ValueError(f"Unknown Stage3 arch: {arch}")
-
+    if arch not in {"mvit_v2_s", "mvit"}:
+        raise ValueError(f"Stage3 inference supports only mvit_v2_s checkpoints, got: {arch}")
+    return Stage3MViT()
 
 # ============================================================
 # Stage 1
@@ -897,19 +850,6 @@ def _stage3_frames(
     )
 
 
-def _load_stage3_checkpoint(model_dir, filename, expected_arch):
-    checkpoint = torch.load(
-        Path(model_dir) / filename,
-        map_location="cpu",
-        weights_only=True,
-    )
-    arch = checkpoint.get("arch") or "mvit_v2_s"
-    if (arch, expected_arch) not in {(expected_arch, expected_arch), ("mvit", "mvit_v2_s")}:
-        raise ValueError(f"{filename} arch mismatch: expected {expected_arch}, got {arch}")
-    model = _stage3_model(arch, checkpoint)
-    model.load_state_dict(checkpoint["model"], strict=True)
-    return model
-
 def predict_stage3(
     data_dir,
     model_dir,
@@ -922,16 +862,9 @@ def predict_stage3(
         weights_only=True,
     )
     arch = checkpoint.get("arch") or "mvit_v2_s"
-    use_ensemble = STAGE3_ENSEMBLE and arch != "tartanvo_gru" and _stage3_aux_checkpoints_exist(model_dir)
-
-    if use_ensemble:
-        mvit_model = _load_stage3_checkpoint(model_dir, STAGE3_MVIT_CHECKPOINT, "mvit_v2_s").to(device).eval()
-        resnet_model = _load_stage3_checkpoint(model_dir, STAGE3_RESNET_GRU_CHECKPOINT, "resnet18_gru").to(device).eval()
-        model = None
-    else:
-        model = _stage3_model(arch, checkpoint)
-        model.load_state_dict(checkpoint["model"], strict=True)
-        model.to(device).eval()
+    model = _stage3_model(arch, checkpoint)
+    model.load_state_dict(checkpoint["model"], strict=True)
+    model.to(device).eval()
 
     videos = _video_paths(
         Path(data_dir)
@@ -960,7 +893,7 @@ def predict_stage3(
 
             accel_predictions = []
             steer_predictions = []
-            window_batch = 1 if arch == "tartanvo_gru" else 8
+            window_batch = 8
 
             for start in range(
                 0,
@@ -1033,16 +966,12 @@ def predict_stage3(
                     dtype=torch.float16,
                 ):
 
-                    if use_ensemble:
-                        accel_logits, _ = mvit_model(clips)
-                        _, steer_logits = resnet_model(clips)
-                    else:
-                        (
-                            accel_logits,
-                            steer_logits,
-                        ) = model(
-                            clips
-                        )
+                    (
+                        accel_logits,
+                        steer_logits,
+                    ) = model(
+                        clips
+                    )
 
                 accel_predictions.extend(
                     accel_logits
@@ -1104,6 +1033,9 @@ def predict_stage3(
             "steer_label",
         ],
     )
+
+
+
 
 
 

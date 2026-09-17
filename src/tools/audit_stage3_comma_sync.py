@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from pathlib import Path
@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.config import COMMA2K19_STAGE3_RAW, STAGE3_TARTANVO_FEATURE, STAGE3_TARTANVO_FEATURE_CACHE
+from src.config import COMMA2K19_STAGE3_RAW
 from src.tools.build_comma2k19_stage3_manifest import ALIGNMENT_VERSION, _direct_video, _frame_time_arrays, _segment_dirs, _series, _video_timing
 
 
@@ -69,27 +69,6 @@ def _segment_row(segment: Path) -> dict:
     return row
 
 
-def _print_invalid_cache_report() -> None:
-    print("\n[comma2k19 TartanVO cache validity]")
-    base = STAGE3_TARTANVO_FEATURE_CACHE / STAGE3_TARTANVO_FEATURE / "comma2k19"
-    for split in ("train", "val"):
-        index = base / f"{split}_index.csv"
-        meta = base / f"{split}_metadata.json"
-        if not index.is_file():
-            print(f"{split}: missing cache index ({index})")
-            continue
-        reason = f"metadata lacks manifest_alignment_version={ALIGNMENT_VERSION}"
-        try:
-            import json
-            data = json.loads(meta.read_text(encoding="utf-8")) if meta.is_file() else {}
-            if data.get("manifest_alignment_version") == ALIGNMENT_VERSION:
-                print(f"{split}: cache appears aligned ({index})")
-            else:
-                print(f"{split}: INVALID until regenerated - {reason}: {index}")
-        except Exception as exc:
-            print(f"{split}: INVALID until regenerated - cannot read metadata {meta}: {exc}")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Audit comma2k19 CAN/video timestamp synchronization for Stage3.")
     parser.add_argument("--raw-root", type=Path, default=COMMA2K19_STAGE3_RAW)
@@ -115,7 +94,6 @@ def main() -> None:
         ]
         cols = [c for c in cols if c in df.columns]
         print(df[cols].to_string(index=False))
-    _print_invalid_cache_report()
 
 
 if __name__ == "__main__":

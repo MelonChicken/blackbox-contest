@@ -29,7 +29,14 @@ from src.config import (
 from src.datasets.comma2k19_stage3 import Comma2k19Stage3Dataset
 from src.datasets.stage3_sampling import parse_clip_float_list, parse_clip_frame_indices
 from src.models import Stage3MViT
-from src.train.stage3 import _loss, _stride_manifest
+
+
+def _stride_manifest(df: pd.DataFrame, stride: int) -> pd.DataFrame:
+    if stride <= 1 or df.empty:
+        return df.reset_index(drop=True)
+    key = ["route_id", "segment_id"] if {"route_id", "segment_id"}.issubset(df.columns) else "segment_id" if "segment_id" in df.columns else "video_path"
+    parts = [part.iloc[::stride] for _, part in df.groupby(key, sort=False)]
+    return pd.concat(parts, ignore_index=True) if parts else df.reset_index(drop=True)
 
 
 def _resize_center_crop_bgr(frame: np.ndarray, size: int = STAGE3_FRAME_CACHE_SIZE) -> np.ndarray:
@@ -64,6 +71,7 @@ def _needed_frames(df: pd.DataFrame) -> np.ndarray:
         raise RuntimeError("manifest contains no requested clip frames")
     return np.asarray(sorted(needed), dtype=np.int64)
 
+
 def _timestamps(df: pd.DataFrame, needed: np.ndarray) -> np.ndarray:
     by_frame = {}
     if "clip_target_timestamps" in df.columns:
@@ -74,9 +82,12 @@ def _timestamps(df: pd.DataFrame, needed: np.ndarray) -> np.ndarray:
                 by_frame.setdefault(int(idx), float(ts))
     frame_col = _frame_index_column(df)
     time_col = _timestamp_column(df)
-    source = df.sort_values(frame_col).drop_duplicates(frame_col)
-    fallback = dict(zip(source[frame_col].to_numpy(dtype=int).tolist(), source[time_col].to_numpy(dtype=float).tolist()))
+    fallback = {}
+    if frame_col in df.columns and time_col in df.columns:
+        source = df.sort_values(frame_col).drop_duplicates(frame_col)
+        fallback = dict(zip(source[frame_col].to_numpy(dtype=int).tolist(), source[time_col].to_numpy(dtype=float).tolist()))
     return np.asarray([by_frame.get(int(idx), fallback.get(int(idx), float("nan"))) for idx in needed], dtype=float)
+
 
 def _cache_dir(cache_root: Path, group: pd.DataFrame, video: Path) -> Path:
     first = group.iloc[0]
@@ -100,10 +111,7 @@ def cache_segment(group: pd.DataFrame, raw_root: Path, cache_root: Path, jpeg_qu
 
     rows = []
     ts = dict(zip(needed.tolist(), _timestamps(group, needed).tolist()))
-    saved = 0
-    existing = 0
-    decoded = 0
-    idx = 0
+    saved = existing = decoded = idx = 0
     try:
         while idx <= max_required:
             ok, frame = cap.read()
@@ -149,7 +157,7 @@ def cache_manifest(manifest: Path, raw_root: Path, cache_root: Path, stride: int
         try:
             saved, out_dir = cache_segment(group, raw_root, cache_root, jpeg_quality)
             outputs.append((saved, out_dir))
-            print(f"cached {saved} frames -> {out_dir}")
+            print(f"cached {saved} new frames -> {out_dir}")
         except Exception as exc:
             warnings.warn(f"skip cache segment {group.iloc[0].video_path}: {exc}")
     return outputs
@@ -193,10 +201,9 @@ def smoke(manifest: Path, raw_root: Path, cache_root: Path, stride: int) -> None
     model = Stage3MViT(pretrained=False).to(DEVICE).eval()
     with torch.inference_mode():
         accel, steer = model(batch["video"].to(DEVICE))
-        loss, accel_loss, steer_loss = _loss(accel, steer, batch)
     print("smoke ok")
     print("video_shape", tuple(batch["video"].shape))
-    print("loss", float(loss.cpu()), float(accel_loss.cpu()), float(steer_loss.cpu()))
+    print("logit_shapes", tuple(accel.shape), tuple(steer.shape))
 
 
 def main() -> None:
@@ -224,4 +231,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

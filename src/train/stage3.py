@@ -22,7 +22,7 @@ from src.config import (
     SEED,
     STAGE3_ARCH,
     STAGE3_CLASS_WEIGHTS,
-    STAGE3_DATASET,
+    STAGE3_DATASET_MODE,
     STAGE3_EPOCHS,
     STAGE3_LOSS_WEIGHTS,
     STAGE3_MVIT_BACKBONE_LR,
@@ -30,48 +30,18 @@ from src.config import (
     STAGE3_MVIT_PRETRAINED_WEIGHTS,
     STAGE3_MVIT_PREPROCESS,
     STAGE3_MODEL,
-    STAGE3_VJEPA_BACKBONE_NAME,
-    STAGE3_VJEPA_CHECKPOINT,
-    STAGE3_VJEPA_DROPOUT,
-    STAGE3_VJEPA_EARLY_STOPPING_PATIENCE,
-    STAGE3_VJEPA_FREEZE_BACKBONE,
-    STAGE3_VJEPA_INPUT_SIZE,
-    STAGE3_VJEPA_PROBE,
-    STAGE3_VJEPA_PROBE_DIM,
-    STAGE3_VJEPA_PROBE_HEADS,
-    STAGE3_VJEPA_PROBE_LR,
-    STAGE3_VJEPA_REPO,
-    STAGE3_VJEPA_WEIGHT_DECAY,
     STAGE3_NUM_WORKERS,
-    STAGE3_NUM_FRAMES,
     STAGE3_PREFETCH_FACTOR,
     STAGE3_SAMPLE_PROFILE,
-    STAGE3_SAMPLING_HZ,
-    STAGE3_SAMPLING_POLICY,
-    STAGE3_PAST_FRAMES,
-    STAGE3_FUTURE_FRAMES,
-    STAGE3_BOUNDARY_POLICY,
-    STAGE3_OUTPUT_HZ,
-    STAGE3_TARTANVO_FEATURE,
-    STAGE3_TARTANVO_FEATURE_CACHE,
-    STAGE3_TARTANVO_MODE,
-    STAGE3_TARTANVO_UNFREEZE,
-    STAGE3_TARTANVO_USE_FEATURE_CACHE,
-    STAGE3_TARTANVO_LR,
     STAGE3_HEAD_LR,
     STAGE3_TRAIN_SAMPLE_LIMIT,
     STAGE3_TRAIN_TEMPORAL_STRIDE,
     STAGE3_VAL_SAMPLE_LIMIT,
     STAGE3_VAL_TEMPORAL_STRIDE,
 )
-try:
-    from src.config import STAGE3_DATASET_MODE
-except ImportError:
-    STAGE3_DATASET_MODE = STAGE3_DATASET
 from src.datasets.comma2k19_stage3 import ACCEL_TO_ID, STEER_TO_ID, Comma2k19Stage3Dataset
-from src.datasets.stage3_tartanvo_pose import Stage3TartanFeatureDataset
-from src.models import Stage3MViT, Stage3ResNetGRU, Stage3TartanVOGRU, Stage3VJEPA2Frozen
-from src.tools.stage3_comma_manifest import active_manifest_path, active_subset_name, segment_cache_index_name
+from src.models import Stage3MViT
+from src.tools.stage3_comma_manifest import active_manifest_path
 from src.utils import set_seed
 
 set_seed(SEED)
@@ -131,11 +101,6 @@ def _label_id(value, mapping: dict[str, int]) -> int:
     return int(value) if not isinstance(value, str) else mapping[value]
 
 
-def _feature_dataset(split: str):
-    limit = STAGE3_TRAIN_SAMPLE_LIMIT if split == "train" else STAGE3_VAL_SAMPLE_LIMIT
-    return Stage3TartanFeatureDataset(split, STAGE3_TARTANVO_FEATURE, root=STAGE3_TARTANVO_FEATURE_CACHE, dataset="comma2k19", limit=limit)
-
-
 def _comma_manifest_path(split: str):
     path = active_manifest_path(split)
     if path.is_file() and path.stat().st_size > 0:
@@ -144,20 +109,9 @@ def _comma_manifest_path(split: str):
     return fallback if fallback.is_file() and fallback.stat().st_size > 0 else path
 
 
-def _has_feature_cache(split: str) -> bool:
-    if STAGE3_TARTANVO_FEATURE == "latent":
-        index = segment_cache_index_name(split, active_subset_name(split))
-        return (STAGE3_TARTANVO_FEATURE_CACHE / "segment_latent" / "comma2k19" / index).is_file()
-    return (STAGE3_TARTANVO_FEATURE_CACHE / STAGE3_TARTANVO_FEATURE / "comma2k19" / f"{split}_index.csv").is_file()
-
-
-def _feature_datasets():
-    train = _feature_dataset("train")
-    val = {"comma2k19": _feature_dataset("val")} if _has_feature_cache("val") else {}
-    return train, val, {"cache": True, "train_sources": {"comma2k19": len(train)}, "val_sources": {k: len(v) for k, v in val.items()}}
-
-
-def _raw_datasets():
+def _datasets():
+    if STAGE3_DATASET_MODE != "comma_only":
+        raise ValueError(f"Stage3 supports only comma_only, got: {STAGE3_DATASET_MODE}")
     train_manifest = _comma_manifest_path("train")
     if not train_manifest.is_file():
         raise FileNotFoundError(f"missing comma2k19 Stage3 train manifest: {train_manifest}")
@@ -173,36 +127,8 @@ def _raw_datasets():
     return train, val, summary
 
 
-def _datasets():
-    if STAGE3_DATASET_MODE not in {"comma2k19", "comma_only"}:
-        raise ValueError(f"Stage3 now supports only comma2k19/comma_only, got: {STAGE3_DATASET_MODE}")
-    if STAGE3_TARTANVO_UNFREEZE == "full" and (STAGE3_TARTANVO_MODE != "finetune" or (STAGE3_TARTANVO_MODE == "cached" and STAGE3_TARTANVO_USE_FEATURE_CACHE)):
-        raise RuntimeError('full TartanVO fine-tuning requires STAGE3_TARTANVO_MODE="finetune" and raw video datasets')
-    if STAGE3_ARCH == "tartanvo_gru" and STAGE3_TARTANVO_MODE == "cached" and STAGE3_TARTANVO_USE_FEATURE_CACHE:
-        return _feature_datasets()
-    return _raw_datasets()
-
-
 def _build_stage3_model(pretrained: bool = True):
-    if STAGE3_ARCH in {"mvit_v2_s", "mvit"}:
-        return Stage3MViT(pretrained=pretrained)
-    if STAGE3_ARCH == "resnet18_gru":
-        return Stage3ResNetGRU(pretrained=pretrained)
-    if STAGE3_ARCH == "tartanvo_gru":
-        return Stage3TartanVOGRU(load_pretrained=pretrained)
-    if STAGE3_ARCH == "vjepa2_1_vitb_frozen":
-        return Stage3VJEPA2Frozen(
-            repo_dir=STAGE3_VJEPA_REPO,
-            checkpoint=STAGE3_VJEPA_CHECKPOINT,
-            backbone_name=STAGE3_VJEPA_BACKBONE_NAME,
-            probe_type=STAGE3_VJEPA_PROBE,
-            input_size=STAGE3_VJEPA_INPUT_SIZE,
-            freeze_backbone=STAGE3_VJEPA_FREEZE_BACKBONE,
-            probe_dim=STAGE3_VJEPA_PROBE_DIM,
-            probe_heads=STAGE3_VJEPA_PROBE_HEADS,
-            dropout=STAGE3_VJEPA_DROPOUT,
-        )
-    raise ValueError(f"Unknown STAGE3_ARCH: {STAGE3_ARCH}")
+    return Stage3MViT(pretrained=pretrained)
 
 
 def _labels_from_dataset(dataset):
@@ -236,6 +162,7 @@ def _print_one_distribution(name: str, dataset) -> None:
             expected = dataset._expected_cache_dir(row)
             print(f"frame cache sample: video={video_path} cache={expected} frames_csv={(expected / 'frames.csv').is_file() if expected else False}")
 
+
 def _print_dataset_summary(train_dataset, val_datasets: dict[str, object], summary: dict) -> None:
     print("=== Stage 3 Dataset ===")
     print(f"Dataset mode: {STAGE3_DATASET_MODE}")
@@ -243,11 +170,8 @@ def _print_dataset_summary(train_dataset, val_datasets: dict[str, object], summa
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {sum(len(v) for v in val_datasets.values())}")
     print(f"Architecture: {STAGE3_ARCH}")
-    if STAGE3_ARCH in {"mvit_v2_s", "mvit"}:
-        print(f"MViT pretrained: {STAGE3_MVIT_PRETRAINED} ({STAGE3_MVIT_PRETRAINED_WEIGHTS})")
-        print(f"MViT preprocessing: {STAGE3_MVIT_PREPROCESS} mean=[0.45, 0.45, 0.45] std=[0.225, 0.225, 0.225] resize=256 crop=224")
-    print(f"TartanVO feature mode: {STAGE3_TARTANVO_MODE}/{STAGE3_TARTANVO_FEATURE}")
-    print(f"TartanVO feature cache: {bool(summary.get('cache'))}")
+    print(f"MViT pretrained: {STAGE3_MVIT_PRETRAINED} ({STAGE3_MVIT_PRETRAINED_WEIGHTS})")
+    print(f"MViT preprocessing: {STAGE3_MVIT_PREPROCESS} mean=[0.45, 0.45, 0.45] std=[0.225, 0.225, 0.225] resize=224 crop=224")
     print(f"Batch size: {BATCH_SIZE}")
     _print_one_distribution("comma2k19 train", train_dataset)
     for source, ds in val_datasets.items():
@@ -260,15 +184,7 @@ def _class_weights(name: str):
 
 
 def _model_outputs(model, batch):
-    if "feature" in batch:
-        return model.forward_feature(batch["feature"].to(DEVICE, non_blocking=True))
-    if "pose" in batch:
-        return model.forward_pose(batch["pose"].to(DEVICE, non_blocking=True))
-    video = batch["video"].to(DEVICE, non_blocking=True)
-    intrinsics = batch.get("intrinsics")
-    if intrinsics is not None and hasattr(model, "feature_sequence"):
-        return model(video, intrinsics=intrinsics.to(DEVICE, non_blocking=True))
-    return model(video)
+    return model(batch["video"].to(DEVICE, non_blocking=True))
 
 
 def _loss(accel, steer, batch, accel_weight=None, steer_weight=None):
@@ -314,9 +230,8 @@ def _stage3_collate(batch: list[dict]) -> dict:
         "accel_label": torch.tensor([item["accel_label"] for item in batch], dtype=torch.long),
         "steer_label": torch.tensor([item["steer_label"] for item in batch], dtype=torch.long),
     }
-    for key in ("feature", "pose", "video", "intrinsics"):
-        if all(key in item for item in batch):
-            out[key] = torch.stack([item[key] for item in batch])
+    if all("video" in item for item in batch):
+        out["video"] = torch.stack([item["video"] for item in batch])
     return out
 
 
@@ -354,7 +269,7 @@ def _append_history(history: dict, epoch: int, train_loss: float, train_accel_lo
     comma = metrics.get("comma2k19")
     row = {
         "epoch": epoch,
-        "arch": "mvit_v2_s" if STAGE3_ARCH == "mvit" else STAGE3_ARCH,
+        "arch": STAGE3_ARCH,
         "dataset_mode": STAGE3_DATASET_MODE,
         "batch_size": BATCH_SIZE,
         "selection_metric_name": selection_metric_name,
@@ -408,12 +323,20 @@ def _checkpoint_payload(model, epoch: int, train_loss: float, metrics=None, hist
     selection_metric = float(metrics["overall"]["selection"]) if metrics else float("nan")
     payload = {
         "model": model.state_dict(),
-        "arch": "mvit_v2_s" if STAGE3_ARCH == "mvit" else STAGE3_ARCH,
+        "arch": STAGE3_ARCH,
         "epoch": epoch,
         "train_loss": train_loss,
         "dataset_mode": STAGE3_DATASET_MODE,
         "selection_metric_name": "overall.selection",
         "selection_metric": selection_metric,
+        "sampling_hz": STAGE3_SAMPLING_HZ,
+        "sampling_policy": STAGE3_SAMPLING_POLICY,
+        "num_frames": STAGE3_NUM_FRAMES,
+        "past_frames": STAGE3_PAST_FRAMES,
+        "future_frames": STAGE3_FUTURE_FRAMES,
+        "boundary_policy": STAGE3_BOUNDARY_POLICY,
+        "output_hz": STAGE3_OUTPUT_HZ,
+        "image_size": 224,
     }
     if metrics is not None:
         payload["metrics"] = metrics
@@ -421,9 +344,6 @@ def _checkpoint_payload(model, epoch: int, train_loss: float, metrics=None, hist
         payload["history"] = history
     if hasattr(model, "model_config"):
         payload["model_config"] = model.model_config()
-        if payload["arch"] == "vjepa2_1_vitb_frozen":
-            for key in ("probe_type", "input_size", "num_frames", "backbone_name", "backbone_frozen", "accel_classes", "steer_classes", "normalization"):
-                payload[key] = payload["model_config"][key]
     return payload
 
 
@@ -444,48 +364,22 @@ def fit_stage3():
     history_path = loss_path = metrics_path = None
     train_dataset, val_datasets, summary = _datasets()
     _print_dataset_summary(train_dataset, val_datasets, summary)
-    if STAGE3_TARTANVO_MODE == "finetune" and sum(len(v) for v in val_datasets.values()) == 0:
-        raise RuntimeError("Stage3 finetune requires validation samples; build the val manifest/subset or use a profile with val data.")
     train_loader = _loader(train_dataset, shuffle=True)
     val_loaders = {name: _loader(ds, shuffle=False) for name, ds in val_datasets.items()}
-    model = _build_stage3_model(pretrained=STAGE3_MVIT_PRETRAINED if STAGE3_ARCH in {"mvit_v2_s", "mvit"} else True).to(DEVICE)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    if not trainable_params:
-        raise RuntimeError("Stage3 model has no trainable parameters.")
+    model = _build_stage3_model(pretrained=STAGE3_MVIT_PRETRAINED).to(DEVICE)
     print(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
     print(f"Total trainable parameters: {_param_count(model, True)}")
     print(f"Frozen parameters: {_param_count(model, False)}")
-    if STAGE3_ARCH == "tartanvo_gru":
-        tartan_params = [p for p in model.tartanvo.parameters() if p.requires_grad]
-        head_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("tartanvo.")]
-        groups = []
-        if tartan_params:
-            groups.append({"params": tartan_params, "lr": STAGE3_TARTANVO_LR})
-        if head_params:
-            groups.append({"params": head_params, "lr": STAGE3_HEAD_LR})
-        opt = torch.optim.AdamW(groups)
-        print(f"Optimizer LR: tartanvo={STAGE3_TARTANVO_LR} head={STAGE3_HEAD_LR}")
-    elif STAGE3_ARCH in {"mvit_v2_s", "mvit"}:
-        opt = torch.optim.AdamW([
-            {"params": model.backbone.parameters(), "lr": STAGE3_MVIT_BACKBONE_LR},
-            {"params": list(model.accel.parameters()) + list(model.steer.parameters()), "lr": STAGE3_HEAD_LR},
-        ])
-        print(f"Optimizer LR: backbone={STAGE3_MVIT_BACKBONE_LR} head={STAGE3_HEAD_LR}")
-    elif STAGE3_ARCH == "vjepa2_1_vitb_frozen":
-        trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-        opt = torch.optim.AdamW((p for _, p in trainable), lr=STAGE3_VJEPA_PROBE_LR, weight_decay=STAGE3_VJEPA_WEIGHT_DECAY)
-        print(f"Optimizer LR: vjepa_probe={STAGE3_VJEPA_PROBE_LR} weight_decay={STAGE3_VJEPA_WEIGHT_DECAY}")
-        print("Trainable parameters:", ", ".join(f"{n}={p.numel()}" for n, p in trainable))
-        if any(n.startswith("backbone.") for n, _ in trainable):
-            raise RuntimeError("V-JEPA frozen optimizer includes backbone parameters")
-    else:
-        opt = torch.optim.AdamW(trainable_params, STAGE3_HEAD_LR)
+    opt = torch.optim.AdamW([
+        {"params": model.backbone.parameters(), "lr": STAGE3_MVIT_BACKBONE_LR},
+        {"params": list(model.accel.parameters()) + list(model.steer.parameters()), "lr": STAGE3_HEAD_LR},
+    ])
+    print(f"Optimizer LR: backbone={STAGE3_MVIT_BACKBONE_LR} head={STAGE3_HEAD_LR}")
     accel_class_weights = _class_weights("accel")
     steer_class_weights = _class_weights("steer")
     best = -1.0
     best_metrics = None
     best_epoch = 0
-    bad_epochs = 0
 
     for epoch in range(STAGE3_EPOCHS):
         model.train()
@@ -517,13 +411,8 @@ def fit_stage3():
         _append_history(history, epoch + 1, train_loss, train_accel_loss, train_steer_loss, train_metrics, metrics, "overall.selection", select)
         history_path, loss_path, metrics_path = _save_history(history, run_id)
         if select > best:
-            best = select; best_epoch = epoch + 1; best_metrics = metrics; bad_epochs = 0
+            best = select; best_epoch = epoch + 1; best_metrics = metrics
             torch.save(_checkpoint_payload(model, epoch + 1, train_loss, metrics, history), out / "best.pt")
-        elif STAGE3_ARCH == "vjepa2_1_vitb_frozen":
-            bad_epochs += 1
-            if bad_epochs >= STAGE3_VJEPA_EARLY_STOPPING_PATIENCE:
-                print(f"[Stage 3] early stopping: no selection improvement for {bad_epochs} epoch(s)")
-                break
 
     print(f"Stage3 history saved:\n{history_path}")
     print(f"Loss plot:\n{loss_path}")
@@ -535,6 +424,4 @@ def fit_stage3():
             if source in best_metrics:
                 print(f"{source} selection delta vs reference: {best_metrics[source]['selection'] - ref:+.5f}")
         print(f"selection={best:.5f}")
-
-
 

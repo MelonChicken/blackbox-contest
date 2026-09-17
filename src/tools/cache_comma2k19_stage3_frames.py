@@ -20,6 +20,7 @@ from src.config import (
     COMMA2K19_STAGE3_FRAME_CACHE,
     COMMA2K19_STAGE3_RAW,
     COMMA2K19_STAGE3_TRAIN_MANIFEST,
+    COMMA2K19_STAGE3_VAL_MANIFEST,
     DEVICE,
     STAGE3_FRAME_CACHE_JPEG_QUALITY,
     STAGE3_FRAME_CACHE_SIZE,
@@ -163,6 +164,157 @@ def cache_manifest(manifest: Path, raw_root: Path, cache_root: Path, stride: int
     return outputs
 
 
+
+def _group_key(df: pd.DataFrame):
+    if {"route_id", "segment_id"}.issubset(df.columns):
+        return ["route_id", "segment_id"]
+    if "segment_id" in df.columns:
+        return "segment_id"
+    return "video_path"
+
+
+def _required_set(group: pd.DataFrame) -> set[int]:
+    required: set[int] = set()
+    for value in group["clip_frame_indices"]:
+        required.update(parse_clip_frame_indices(str(value), STAGE3_NUM_FRAMES))
+    return required
+
+
+def _cache_dir_for_group(cache_root: Path, group: pd.DataFrame, raw_root: Path) -> Path:
+    return _cache_dir(cache_root, group, _video_path(raw_root, str(group.iloc[0].video_path)))
+
+
+def _existing_required_frames(required: set[int], cache_dir: Path, size_sample: list[int], size_sample_limit: int) -> int:
+    if not required or not cache_dir.exists():
+        return 0
+    lookup: dict[int, Path] = {}
+    frames_csv = cache_dir / "frames.csv"
+    if frames_csv.is_file():
+        try:
+            meta = pd.read_csv(frames_csv)
+            if {"original_frame_index", "cached_path"}.issubset(meta.columns):
+                lookup = {int(row.original_frame_index): cache_dir / str(row.cached_path) for row in meta.itertuples(index=False)}
+        except Exception as exc:
+            warnings.warn(f"cannot read cache metadata {frames_csv}: {exc}")
+    existing = 0
+    for idx in required:
+        path = lookup.get(int(idx), cache_dir / f"{int(idx):06d}.jpg")
+        if path.is_file():
+            existing += 1
+            if len(size_sample) < size_sample_limit:
+                size_sample.append(int(path.stat().st_size))
+    return existing
+
+
+def _segment_path(raw_root: Path, row) -> Path:
+    video = _video_path(raw_root, str(row.video_path))
+    return video.parent
+
+
+def _frame_times_for_row(raw_root: Path, row, indices: list[int]) -> list[float]:
+    try:
+        from src.tools.build_comma2k19_stage3_manifest import _frame_time_arrays
+
+        segment = _segment_path(raw_root, row)
+        max_idx = max(indices) if indices else -1
+        for _, values in _frame_time_arrays(segment):
+            values = np.asarray(values, dtype=float).squeeze()
+            if len(values) > max_idx:
+                return [float(values[int(i)]) for i in indices]
+    except Exception as exc:
+        warnings.warn(f"cannot read frame timestamps for {getattr(row, 'video_path', '')}: {exc}")
+    return [float("nan") for _ in indices]
+
+
+def _audit_samples(name: str, df: pd.DataFrame, raw_root: Path, samples: int) -> None:
+    if df.empty or samples <= 0:
+        return
+    print(f"[{name} sample audit]")
+    take = df.sample(n=min(samples, len(df)), random_state=42).reset_index(drop=True)
+    for i, row in enumerate(take.itertuples(index=False), start=1):
+        indices = parse_clip_frame_indices(str(row.clip_frame_indices), STAGE3_NUM_FRAMES)
+        targets = parse_clip_float_list(str(row.clip_target_timestamps), STAGE3_NUM_FRAMES, "clip_target_timestamps") if "clip_target_timestamps" in df.columns else []
+        actual = _frame_times_for_row(raw_root, row, indices)
+        diffs = [float(a - t) if a == a and targets else float("nan") for a, t in zip(actual, targets)]
+        errors = parse_clip_float_list(str(row.clip_alignment_errors_sec), STAGE3_NUM_FRAMES, "clip_alignment_errors_sec") if "clip_alignment_errors_sec" in df.columns else [abs(v) for v in diffs]
+        duration = float(actual[-1] - actual[0]) if actual and actual[0] == actual[0] and actual[-1] == actual[-1] else float("nan")
+        route = getattr(row, "route_id", "")
+        segment = getattr(row, "segment_id", "")
+        print(f"sample {i}: route={route} segment={segment}")
+        print(f"  target_timestamp={float(row.target_timestamp):.6f}")
+        print(f"  clip_target_timestamps={targets}")
+        print(f"  clip_frame_indices={indices}")
+        print(f"  actual_frame_timestamps={actual}")
+        print(f"  timestamp_differences={diffs}")
+        print(f"  first_to_last_duration={duration:.6f}")
+        print(f"  alignment_errors={errors}")
+        print(f"  duplicate_frame_count={len(indices) - len(set(indices))}")
+
+
+def _audit_one_manifest(name: str, manifest: Path, raw_root: Path, cache_root: Path, sample_count: int, size_sample_limit: int) -> None:
+    if not manifest.is_file():
+        print(f"[{name}] SKIP missing manifest: {manifest}")
+        return
+    df = pd.read_csv(manifest)
+    if "clip_frame_indices" not in df.columns:
+        raise RuntimeError(f"{manifest} lacks clip_frame_indices; regenerate Stage3 manifest")
+    key = _group_key(df)
+    route_stats: dict[str, dict[str, int]] = {}
+    size_sample: list[int] = []
+    total_required = total_existing = 0
+    for _, group in df.groupby(key, sort=False):
+        required = _required_set(group)
+        cache_dir = _cache_dir_for_group(cache_root, group, raw_root)
+        existing = _existing_required_frames(required, cache_dir, size_sample, size_sample_limit)
+        route = str(group.iloc[0].route_id) if "route_id" in group.columns else str(group.iloc[0].video_path)
+        stats = route_stats.setdefault(route, {"required": 0, "existing": 0, "missing": 0})
+        stats["required"] += len(required)
+        stats["existing"] += existing
+        stats["missing"] += len(required) - existing
+        total_required += len(required)
+        total_existing += existing
+    total_missing = total_required - total_existing
+    coverage = total_existing / total_required if total_required else 0.0
+    avg_jpeg = float(np.mean(size_sample)) if size_sample else 0.0
+    print(f"[{name}]")
+    print(f"manifest_rows={len(df)}")
+    print(f"unique_routes={df.route_id.nunique() if 'route_id' in df.columns else 'N/A'}")
+    print(f"required_unique_original_frames={total_required}")
+    print(f"existing_required_frames={total_existing}")
+    print(f"missing_required_frames={total_missing}")
+    print(f"coverage={coverage:.6f}")
+    print(f"estimated_additional_jpegs={total_missing}")
+    print(f"sample_jpeg_count={len(size_sample)}")
+    print(f"sample_jpeg_avg_bytes={avg_jpeg:.1f}")
+    print(f"estimated_additional_storage_gb={(total_missing * avg_jpeg) / 1024 / 1024 / 1024:.3f}")
+    print(f"[{name} routes]")
+    print("route_id,required,existing,missing,coverage")
+    for route, stats in sorted(route_stats.items()):
+        r = stats["required"]
+        c = stats["existing"] / r if r else 0.0
+        print(f"{route},{r},{stats['existing']},{stats['missing']},{c:.6f}")
+    print(f"[{name} lowest coverage routes]")
+    for route, stats in sorted(route_stats.items(), key=lambda item: (item[1]["existing"] / item[1]["required"] if item[1]["required"] else 0.0, -item[1]["missing"]))[:10]:
+        r = stats["required"]
+        c = stats["existing"] / r if r else 0.0
+        print(f"{route}: required={r} existing={stats['existing']} missing={stats['missing']} coverage={c:.6f}")
+    if {"video_frame_index", "sample_index"}.issubset(df.columns):
+        delta = df["video_frame_index"].astype(int) - (2 * df["sample_index"].astype(int))
+        min_delta = int(delta.min())
+        cols = [c for c in ["route_id", "segment_id", "video_path", "sample_index", "target_timestamp", "video_frame_index"] if c in df.columns]
+        print(f"[{name} actual_frame_index_minus_2x_sample_index]")
+        print(f"min={min_delta}")
+        print(df.loc[delta == min_delta, cols].head(10).to_string(index=False))
+        if min_delta != -163 and (delta == -163).any():
+            print("rows_where_delta_is_-163")
+            print(df.loc[delta == -163, cols].head(10).to_string(index=False))
+    _audit_samples(name, df, raw_root, sample_count)
+
+
+def audit_manifests(train_manifest: Path, val_manifest: Path, raw_root: Path, cache_root: Path, sample_count: int, size_sample_limit: int) -> None:
+    _audit_one_manifest("train", train_manifest, raw_root, cache_root, sample_count, size_sample_limit)
+    _audit_one_manifest("val", val_manifest, raw_root, cache_root, sample_count, size_sample_limit)
+
 def _take(dataset: Comma2k19Stage3Dataset, n: int) -> Comma2k19Stage3Dataset:
     dataset.df = dataset.df.head(n).reset_index(drop=True)
     return dataset
@@ -209,6 +361,8 @@ def smoke(manifest: Path, raw_root: Path, cache_root: Path, stride: int) -> None
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, default=COMMA2K19_STAGE3_TRAIN_MANIFEST)
+    parser.add_argument("--train-manifest", type=Path, default=COMMA2K19_STAGE3_TRAIN_MANIFEST)
+    parser.add_argument("--val-manifest", type=Path, default=COMMA2K19_STAGE3_VAL_MANIFEST)
     parser.add_argument("--raw-root", type=Path, default=COMMA2K19_STAGE3_RAW)
     parser.add_argument("--cache-root", type=Path, default=COMMA2K19_STAGE3_FRAME_CACHE)
     parser.add_argument("--temporal-stride", type=int, default=STAGE3_TRAIN_TEMPORAL_STRIDE)
@@ -216,7 +370,15 @@ def main() -> None:
     parser.add_argument("--jpeg-quality", type=int, default=STAGE3_FRAME_CACHE_JPEG_QUALITY)
     parser.add_argument("--benchmark-samples", type=int, default=100)
     parser.add_argument("--skip-benchmark", action="store_true")
+    parser.add_argument("--audit", action="store_true", help="Read-only cache coverage audit for train/val manifests.")
+    parser.add_argument("--dry-run", action="store_true", help="Alias for --audit; does not create, modify, or delete JPEGs.")
+    parser.add_argument("--audit-samples", type=int, default=3)
+    parser.add_argument("--size-sample-limit", type=int, default=10000)
     args = parser.parse_args()
+
+    if args.audit or args.dry_run:
+        audit_manifests(args.train_manifest, args.val_manifest, args.raw_root, args.cache_root, args.audit_samples, args.size_sample_limit)
+        return
 
     outputs = cache_manifest(args.manifest, args.raw_root, args.cache_root, args.temporal_stride, args.limit_segments, args.jpeg_quality)
     if not outputs:
@@ -227,7 +389,5 @@ def main() -> None:
     smoke(args.manifest, args.raw_root, args.cache_root, args.temporal_stride)
     if not args.skip_benchmark:
         benchmark(args.manifest, args.raw_root, args.cache_root, args.benchmark_samples, args.temporal_stride)
-
-
 if __name__ == "__main__":
     main()

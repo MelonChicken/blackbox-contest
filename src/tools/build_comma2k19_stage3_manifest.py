@@ -417,6 +417,9 @@ def _write_splits(df: pd.DataFrame, out_dir: Path, val_ratio: float) -> tuple[Pa
     schema = [
         "route_id", "segment_id", "video_path", "sample_index", "target_timestamp",
         "video_frame_index", "video_frame_timestamp", "alignment_error_sec", "alignment_version",
+        "clip_frame_indices", "clip_target_timestamps", "clip_alignment_errors_sec",
+        "clip_max_alignment_error_sec", "clip_selected_interval_min_sec",
+        "clip_selected_interval_median_sec", "clip_selected_interval_max_sec",
         "speed", "steering_angle", "acceleration", "accel_label", "steer_label", "source", "split",
     ]
     for col in schema:
@@ -509,5 +512,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

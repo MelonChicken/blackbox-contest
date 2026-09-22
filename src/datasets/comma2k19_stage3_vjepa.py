@@ -5,8 +5,10 @@ from pathlib import Path
 import cv2
 import torch
 
+from src.config import SIZE
 from src.datasets.comma2k19_stage3 import Comma2k19Stage3Dataset, _cached_frame_lookup
 from src.datasets.stage3_sampling import parse_clip_frame_indices
+from src.utils import _crop_tensor
 
 VJEPA_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)
 VJEPA_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
@@ -23,7 +25,10 @@ def stage3_vjepa_cached_clip(cache_dir: str | Path, frame_indices: list[int]) ->
         if bgr is None:
             raise ValueError(f"cannot read cached frame: {path}")
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        frames.append(torch.from_numpy(rgb.copy()).permute(2, 0, 1).float() / 255.0)
+        if rgb.shape[:2] == (SIZE, SIZE):
+            frames.append(torch.from_numpy(rgb.copy()).permute(2, 0, 1).float() / 255.0)
+        else:
+            frames.append(_crop_tensor(rgb))
     x = torch.stack(frames, dim=1)
     return (x - VJEPA_MEAN[:, None, None, None]) / VJEPA_STD[:, None, None, None]
 

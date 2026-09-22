@@ -39,6 +39,8 @@ STAGE2_CHECKPOINT = STAGE2_MODEL / "best.pt"
 STAGE2_VIDEOMAE_MODEL = STAGE2_MODEL
 STAGE2_VIDEOMAE_CHECKPOINT = STAGE2_CHECKPOINT
 STAGE3_MODEL = MODEL / "stage3"
+STAGE3_VJEPA_MODEL = STAGE3_MODEL / "vjepa"
+STAGE3_VJEPA_CHECKPOINT = _path_env("STAGE3_VJEPA_CHECKPOINT", STAGE3_MODEL / "vjepa_vitl_224.pth")
 # ============================================================
 # Data directories
 # ============================================================
@@ -65,7 +67,6 @@ COMMA2K19_STAGE3_PROCESSED = STAGE3_PROCESSED
 COMMA2K19_STAGE3_MANIFEST = _path_env("COMMA2K19_STAGE3_MANIFEST", COMMA2K19_STAGE3_PROCESSED / "manifest")
 COMMA2K19_STAGE3_TRAIN_MANIFEST = COMMA2K19_STAGE3_MANIFEST / "train.csv"
 COMMA2K19_STAGE3_VAL_MANIFEST = COMMA2K19_STAGE3_MANIFEST / "val.csv"
-COMMA2K19_STAGE3_SUBSET_MANIFEST = COMMA2K19_STAGE3_MANIFEST / "subsets"
 COMMA2K19_STAGE3_FRAME_CACHE = _path_env("COMMA2K19_STAGE3_FRAME_CACHE", STAGE3_PROCESSED / "comma2k19_frames")
 
 # Backward-compatible aliases for stage raw data roots.
@@ -105,7 +106,6 @@ TRAIN_SOURCE_LIMIT = 4000
 
 SIZE = 224
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "2"))
-STAGE3_DATASET_MODE = "comma_only"
 STAGE3_EPOCHS = int(os.getenv("STAGE3_EPOCHS", "3"))
 STAGE3_ARCH = "mvit_v2_s"
 STAGE3_MVIT_PRETRAINED = True
@@ -113,38 +113,27 @@ STAGE3_MVIT_PRETRAINED_WEIGHTS = "KINETICS400_V1"
 STAGE3_MVIT_PREPROCESS = "stage3_default"
 STAGE3_MVIT_BACKBONE_LR = 1e-5
 STAGE3_HEAD_LR = 1e-4
-STAGE3_COMMA_SUBSET_MODE = os.getenv("STAGE3_COMMA_SUBSET_MODE", "route_balanced")
-STAGE3_COMMA_TRAIN_SEGMENTS_PER_ROUTE = int(os.getenv("STAGE3_COMMA_TRAIN_SEGMENTS_PER_ROUTE", "2"))
-STAGE3_COMMA_VAL_SEGMENTS_PER_ROUTE = int(os.getenv("STAGE3_COMMA_VAL_SEGMENTS_PER_ROUTE", "1"))
 STAGE3_SAMPLE_PROFILE = os.getenv("STAGE3_SAMPLE_PROFILE", "mvit_full")
 STAGE3_SAMPLE_PROFILES = {
     "r2_baseline_3k": {
         "train_stride": 50,
         "val_stride": 50,
-        "comma_train_limit": 5000,
-        "comma_val_limit": 1000,
     },
     "r2_medium": {
         "train_stride": 8,
         "val_stride": 4,
-        "comma_train_limit": None,
-        "comma_val_limit": None,
     },
     "full_ft_smoke": {
         "train_stride": 8,
         "val_stride": 4,
         "train_sample_limit": 3000,
         "val_sample_limit": 1000,
-        "comma_train_limit": 3000,
-        "comma_val_limit": 1000,
     },
     "mvit_full": {
         "train_stride": 8,
         "val_stride": 8,
         "train_sample_limit": None,
         "val_sample_limit": None,
-        "comma_train_limit": None,
-        "comma_val_limit": None,
     },
 }
 _STAGE3_SAMPLE_PROFILE = STAGE3_SAMPLE_PROFILES[STAGE3_SAMPLE_PROFILE]
@@ -168,6 +157,7 @@ STAGE3_STEER_THRESHOLD_DEG = 5.0
 STAGE3_STEER_THRESHOLD = STAGE3_STEER_THRESHOLD_DEG
 STAGE3_STEER_POSITIVE_IS = "LEFT"
 STAGE3_LOSS_WEIGHTS = {"accel": 1.0, "steer": 1.0}
+STAGE3_SELECTION_WEIGHTS = {"accel": 0.7, "steer": 0.3}
 STAGE3_CLASS_WEIGHTS = {"accel": None,
     "steer": [1.5, 1.0, 1.5],}
 # LEFT      150
@@ -177,13 +167,10 @@ STAGE3_TRAIN_TEMPORAL_STRIDE = _STAGE3_SAMPLE_PROFILE["train_stride"]
 STAGE3_VAL_TEMPORAL_STRIDE = _STAGE3_SAMPLE_PROFILE["val_stride"]
 STAGE3_NUM_WORKERS = 1
 STAGE3_PREFETCH_FACTOR = 1
-COMMA2K19_STAGE3_FRAME_CACHE = _path_env("COMMA2K19_STAGE3_FRAME_CACHE", STAGE3_PROCESSED / "comma2k19_frames")
 STAGE3_FRAME_CACHE_JPEG_QUALITY = 92
 STAGE3_FRAME_CACHE_SIZE = 224
 STAGE3_TRAIN_SAMPLE_LIMIT = _STAGE3_SAMPLE_PROFILE.get("train_sample_limit", 3000)
 STAGE3_VAL_SAMPLE_LIMIT = _STAGE3_SAMPLE_PROFILE.get("val_sample_limit", 500)
-STAGE3_COMMA_TRAIN_SAMPLE_LIMIT = _STAGE3_SAMPLE_PROFILE["comma_train_limit"]
-STAGE3_COMMA_VAL_SAMPLE_LIMIT = _STAGE3_SAMPLE_PROFILE["comma_val_limit"]
 
 
 S1_MEAN = torch.tensor([0.45, 0.45, 0.45])[:, None, None, None]
@@ -192,6 +179,8 @@ S3_MEAN = torch.tensor([0.45, 0.45, 0.45])[:, None, None]
 S3_STD = torch.tensor([0.225, 0.225, 0.225])[:, None, None]
 
 SEED = 42
+
+
 
 
 

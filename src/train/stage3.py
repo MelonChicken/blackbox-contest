@@ -22,17 +22,23 @@ from src.config import (
     SEED,
     STAGE3_ARCH,
     STAGE3_CLASS_WEIGHTS,
-    STAGE3_DATASET_MODE,
     STAGE3_EPOCHS,
+    STAGE3_FUTURE_FRAMES,
     STAGE3_LOSS_WEIGHTS,
+    STAGE3_NUM_FRAMES,
     STAGE3_MVIT_BACKBONE_LR,
     STAGE3_MVIT_PRETRAINED,
     STAGE3_MVIT_PRETRAINED_WEIGHTS,
     STAGE3_MVIT_PREPROCESS,
     STAGE3_MODEL,
     STAGE3_NUM_WORKERS,
+    STAGE3_OUTPUT_HZ,
+    STAGE3_PAST_FRAMES,
     STAGE3_PREFETCH_FACTOR,
     STAGE3_SAMPLE_PROFILE,
+    STAGE3_SAMPLING_HZ,
+    STAGE3_SAMPLING_POLICY,
+    STAGE3_SELECTION_WEIGHTS,
     STAGE3_HEAD_LR,
     STAGE3_TRAIN_SAMPLE_LIMIT,
     STAGE3_TRAIN_TEMPORAL_STRIDE,
@@ -40,13 +46,9 @@ from src.config import (
     STAGE3_VAL_TEMPORAL_STRIDE,
 )
 from src.datasets.comma2k19_stage3 import ACCEL_TO_ID, STEER_TO_ID, Comma2k19Stage3Dataset
-from src.models import Stage3MViT
-from src.tools.stage3_comma_manifest import active_manifest_path
 from src.utils import set_seed
 
 set_seed(SEED)
-SOURCE_REFS = {"comma2k19": 0.75}
-
 
 def _classification_metrics(pred: list[int], target: list[int], num_classes: int) -> dict:
     if not target:
@@ -102,33 +104,22 @@ def _label_id(value, mapping: dict[str, int]) -> int:
 
 
 def _comma_manifest_path(split: str):
-    path = active_manifest_path(split)
-    if path.is_file() and path.stat().st_size > 0:
-        return path
-    fallback = COMMA2K19_STAGE3_TRAIN_MANIFEST if split == "train" else COMMA2K19_STAGE3_VAL_MANIFEST
-    return fallback if fallback.is_file() and fallback.stat().st_size > 0 else path
+    return COMMA2K19_STAGE3_TRAIN_MANIFEST if split == "train" else COMMA2K19_STAGE3_VAL_MANIFEST
 
 
 def _datasets():
-    if STAGE3_DATASET_MODE != "comma_only":
-        raise ValueError(f"Stage3 supports only comma_only, got: {STAGE3_DATASET_MODE}")
     train_manifest = _comma_manifest_path("train")
     if not train_manifest.is_file():
         raise FileNotFoundError(f"missing comma2k19 Stage3 train manifest: {train_manifest}")
     train, before, after = _limited_dataset(Comma2k19Stage3Dataset(train_manifest), STAGE3_TRAIN_TEMPORAL_STRIDE, STAGE3_TRAIN_SAMPLE_LIMIT)
-    summary = {"train_sources": {"comma2k19": len(train)}, "val_sources": {}, "comma_train_before": before, "comma_train_after": after}
+    summary = {"comma_train_before": before, "comma_train_after": after}
     val = {}
     val_manifest = _comma_manifest_path("val")
     if val_manifest.is_file():
         ds, before, after = _limited_dataset(Comma2k19Stage3Dataset(val_manifest), STAGE3_VAL_TEMPORAL_STRIDE, STAGE3_VAL_SAMPLE_LIMIT)
         val["comma2k19"] = ds
         summary.update(comma_val_before=before, comma_val_after=after)
-        summary["val_sources"]["comma2k19"] = len(ds)
     return train, val, summary
-
-
-def _build_stage3_model(pretrained: bool = True):
-    return Stage3MViT(pretrained=pretrained)
 
 
 def _labels_from_dataset(dataset):
@@ -165,7 +156,7 @@ def _print_one_distribution(name: str, dataset) -> None:
 
 def _print_dataset_summary(train_dataset, val_datasets: dict[str, object], summary: dict) -> None:
     print("=== Stage 3 Dataset ===")
-    print(f"Dataset mode: {STAGE3_DATASET_MODE}")
+    print("Dataset: comma2k19")
     print(f"Sample profile: {STAGE3_SAMPLE_PROFILE}")
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {sum(len(v) for v in val_datasets.values())}")
@@ -195,8 +186,8 @@ def _loss(accel, steer, batch, accel_weight=None, steer_weight=None):
 
 
 def _selection_score(accel_f1: float, steer_f1: float) -> float:
-    accel_w = float(STAGE3_LOSS_WEIGHTS.get("accel", 1.0))
-    steer_w = float(STAGE3_LOSS_WEIGHTS.get("steer", 1.0))
+    accel_w = float(STAGE3_SELECTION_WEIGHTS["accel"])
+    steer_w = float(STAGE3_SELECTION_WEIGHTS["steer"])
     return ((accel_w * accel_f1) + (steer_w * steer_f1)) / max(1e-12, accel_w + steer_w)
 
 
@@ -255,7 +246,7 @@ def _param_count(model, trainable: bool) -> int:
 
 def _history_keys() -> list[str]:
     return [
-        "epoch", "arch", "dataset_mode", "batch_size", "selection_metric_name", "selection_metric",
+        "epoch", "arch", "dataset", "batch_size", "selection_metric_name", "selection_metric",
         "train_loss", "val_loss", "train_accel_loss", "train_steer_loss",
         "train_accel_accuracy", "val_accel_accuracy", "train_accel_macro_f1", "val_accel_macro_f1",
         "train_steer_accuracy", "val_steer_accuracy", "train_steer_macro_f1", "val_steer_macro_f1",
@@ -269,8 +260,8 @@ def _append_history(history: dict, epoch: int, train_loss: float, train_accel_lo
     comma = metrics.get("comma2k19")
     row = {
         "epoch": epoch,
-        "arch": STAGE3_ARCH,
-        "dataset_mode": STAGE3_DATASET_MODE,
+        "arch": "mvit_v2_s",
+        "dataset": "comma2k19",
         "batch_size": BATCH_SIZE,
         "selection_metric_name": selection_metric_name,
         "selection_metric": selection_metric,
@@ -323,12 +314,13 @@ def _checkpoint_payload(model, epoch: int, train_loss: float, metrics=None, hist
     selection_metric = float(metrics["overall"]["selection"]) if metrics else float("nan")
     payload = {
         "model": model.state_dict(),
-        "arch": STAGE3_ARCH,
+        "arch": "mvit_v2_s",
         "epoch": epoch,
         "train_loss": train_loss,
-        "dataset_mode": STAGE3_DATASET_MODE,
+        "dataset": "comma2k19",
         "selection_metric_name": "overall.selection",
         "selection_metric": selection_metric,
+        "selection_weights": STAGE3_SELECTION_WEIGHTS,
         "sampling_hz": STAGE3_SAMPLING_HZ,
         "sampling_policy": STAGE3_SAMPLING_POLICY,
         "num_frames": STAGE3_NUM_FRAMES,
@@ -357,6 +349,9 @@ def _print_metrics_table(metrics: dict, prefix: str = "") -> None:
 
 
 def fit_stage3():
+    from src.models import Stage3MViT
+    if STAGE3_ARCH != "mvit_v2_s":
+        raise ValueError(f"Stage3 supports only mvit_v2_s, got: {STAGE3_ARCH}")
     out = STAGE3_MODEL
     out.mkdir(parents=True, exist_ok=True)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -366,7 +361,7 @@ def fit_stage3():
     _print_dataset_summary(train_dataset, val_datasets, summary)
     train_loader = _loader(train_dataset, shuffle=True)
     val_loaders = {name: _loader(ds, shuffle=False) for name, ds in val_datasets.items()}
-    model = _build_stage3_model(pretrained=STAGE3_MVIT_PRETRAINED).to(DEVICE)
+    model = Stage3MViT(pretrained=STAGE3_MVIT_PRETRAINED).to(DEVICE)
     print(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
     print(f"Total trainable parameters: {_param_count(model, True)}")
     print(f"Frozen parameters: {_param_count(model, False)}")
@@ -420,8 +415,6 @@ def fit_stage3():
     if best_metrics:
         print(f"Best epoch: {best_epoch}")
         _print_metrics_table(best_metrics)
-        for source, ref in SOURCE_REFS.items():
-            if source in best_metrics:
-                print(f"{source} selection delta vs reference: {best_metrics[source]['selection'] - ref:+.5f}")
         print(f"selection={best:.5f}")
+
 

@@ -40,7 +40,7 @@ STAGE2_VIDEOMAE_MODEL = STAGE2_MODEL
 STAGE2_VIDEOMAE_CHECKPOINT = STAGE2_CHECKPOINT
 STAGE3_MODEL = MODEL / "stage3"
 STAGE3_VJEPA_MODEL = STAGE3_MODEL / "vjepa"
-STAGE3_VJEPA_CHECKPOINT = _path_env("STAGE3_VJEPA_CHECKPOINT", STAGE3_MODEL / "vjepa_vitl_224.pth")
+STAGE3_VJEPA_CHECKPOINT = _path_env("STAGE3_VJEPA_CHECKPOINT", STAGE3_MODEL / "vitl16.pth.tar")
 # ============================================================
 # Data directories
 # ============================================================
@@ -179,6 +179,7 @@ S3_MEAN = torch.tensor([0.45, 0.45, 0.45])[:, None, None]
 S3_STD = torch.tensor([0.225, 0.225, 0.225])[:, None, None]
 
 SEED = 42
+
 
 
 

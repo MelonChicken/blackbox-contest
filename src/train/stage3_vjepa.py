@@ -22,6 +22,7 @@ from src.config import (
     STAGE3_VJEPA_FRAME_POSITIONS,
     STAGE3_VJEPA_INPUT_FRAMES,
     STAGE3_VJEPA_MODEL,
+    STAGE3_VJEPA_RESUME,
 )
 from src.datasets.comma2k19_stage3_vjepa import Comma2k19Stage3VJEPADataset
 from src.models.stage3_vjepa import Stage3VJEPA
@@ -113,8 +114,8 @@ def _save_history(history: dict, run_id: str):
     return path
 
 
-def _checkpoint_payload(model: Stage3VJEPA, epoch: int, train_loss: float, metrics: dict, history: dict) -> dict:
-    return {
+def _checkpoint_payload(model: Stage3VJEPA, epoch: int, train_loss: float, metrics: dict, history: dict, optimizer=None) -> dict:
+    payload = {
         "arch": "vjepa_vitl_224",
         "encoder_checkpoint": str(STAGE3_VJEPA_CHECKPOINT),
         "head": model.head.state_dict(),
@@ -128,8 +129,12 @@ def _checkpoint_payload(model: Stage3VJEPA, epoch: int, train_loss: float, metri
         "frame_positions": list(STAGE3_VJEPA_FRAME_POSITIONS),
         "train_temporal_stride": STAGE3_TRAIN_TEMPORAL_STRIDE,
         "rotating_stride": True,
+        "metrics": metrics,
         "history": history,
     }
+    if optimizer is not None:
+        payload["optimizer"] = optimizer.state_dict()
+    return payload
 
 
 def fit_stage3_vjepa():
@@ -155,11 +160,32 @@ def fit_stage3_vjepa():
     opt = torch.optim.AdamW(model.head.parameters(), lr=STAGE3_HEAD_LR)
     accel_class_weights = _class_weights("accel")
     steer_class_weights = _class_weights("steer")
+    start_epoch = 0
     best = -1.0
     best_metrics = None
     best_epoch = 0
 
-    for epoch in range(STAGE3_VJEPA_EPOCHS):
+    if STAGE3_VJEPA_RESUME:
+        for resume_path in (out / "last.pt", out / "best.pt"):
+            if not resume_path.is_file():
+                continue
+            checkpoint = torch.load(resume_path, map_location="cpu", weights_only=True)
+            if checkpoint.get("arch") != "vjepa_vitl_224" or checkpoint.get("input_num_frames") != STAGE3_VJEPA_INPUT_FRAMES:
+                print(f"Skip incompatible resume checkpoint: {resume_path}")
+                continue
+            model.head.load_state_dict(checkpoint["head"], strict=True)
+            if "optimizer" in checkpoint:
+                opt.load_state_dict(checkpoint["optimizer"])
+            start_epoch = int(checkpoint.get("epoch", 0))
+            restored_history = checkpoint.get("history", {})
+            history = {key: list(restored_history.get(key, [])) for key in HISTORY_KEYS}
+            best = float(checkpoint.get("selection_metric", -1.0))
+            best_epoch = start_epoch
+            best_metrics = checkpoint.get("metrics")
+            print(f"Resumed V-JEPA head from {resume_path} at completed epoch {start_epoch}")
+            break
+
+    for epoch in range(start_epoch, STAGE3_VJEPA_EPOCHS):
         offset = epoch % max(1, STAGE3_TRAIN_TEMPORAL_STRIDE)
         train_dataset.df = _balanced_limit(
             _stride_manifest(full_train_df, STAGE3_TRAIN_TEMPORAL_STRIDE, offset),
@@ -203,6 +229,7 @@ def fit_stage3_vjepa():
             best_epoch = epoch + 1
             best_metrics = metrics
             torch.save(_checkpoint_payload(model, epoch + 1, train_loss, metrics, history), out / "best.pt")
+        torch.save(_checkpoint_payload(model, epoch + 1, train_loss, metrics, history, optimizer=opt), out / "last.pt")
 
     if best_metrics:
         print(f"Best epoch: {best_epoch}")

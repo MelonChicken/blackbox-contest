@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from bisect import bisect_left
 from pathlib import Path
 
 import cv2
@@ -57,13 +58,30 @@ def _cached_frame_lookup(cache_dir: str) -> tuple[int, dict[int, Path]]:
     return max(lookup) + 1, lookup
 
 
+@lru_cache(maxsize=4096)
+def _cached_frame_path(cache_dir: str, frame_index: int, max_fallback_delta: int = 2) -> Path:
+    _, lookup = _cached_frame_lookup(cache_dir)
+    frame_index = int(frame_index)
+    path = lookup.get(frame_index)
+    if path is not None:
+        return path
+    available = sorted(lookup)
+    position = bisect_left(available, frame_index)
+    candidates = available[max(0, position - 1):position + 1]
+    if not candidates:
+        raise FileNotFoundError(f"cached frame {frame_index} missing under {cache_dir}")
+    nearest = min(candidates, key=lambda value: abs(value - frame_index))
+    if abs(nearest - frame_index) > int(max_fallback_delta):
+        raise FileNotFoundError(
+            f"cached frame {frame_index} missing under {cache_dir}; nearest={nearest} exceeds fallback delta {max_fallback_delta}"
+        )
+    return lookup[nearest]
+
+
 def stage3_cached_clip_indices(cache_dir: str | Path, frame_indices: list[int]) -> torch.Tensor:
-    _, lookup = _cached_frame_lookup(str(cache_dir))
     tensors = []
     for idx in frame_indices:
-        path = lookup.get(int(idx))
-        if path is None:
-            raise FileNotFoundError(f"cached frame {idx} missing under {cache_dir}")
+        path = _cached_frame_path(str(cache_dir), int(idx))
         bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if bgr is None:
             raise ValueError(f"cannot read cached frame: {path}")

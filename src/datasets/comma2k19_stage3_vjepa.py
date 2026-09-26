@@ -6,7 +6,7 @@ import cv2
 import torch
 
 from src.config import SIZE, STAGE3_VJEPA_FRAME_POSITIONS
-from src.datasets.comma2k19_stage3 import Comma2k19Stage3Dataset, _cached_frame_lookup
+from src.datasets.comma2k19_stage3 import Comma2k19Stage3Dataset, _cached_frame_path
 from src.datasets.stage3_sampling import parse_clip_frame_indices
 from src.utils import _crop_tensor
 
@@ -15,12 +15,9 @@ VJEPA_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
 
 
 def stage3_vjepa_cached_clip(cache_dir: str | Path, frame_indices: list[int]) -> torch.Tensor:
-    _, lookup = _cached_frame_lookup(str(cache_dir))
     frames = []
     for idx in frame_indices:
-        path = lookup.get(int(idx))
-        if path is None:
-            raise FileNotFoundError(f"cached frame {idx} missing under {cache_dir}")
+        path = _cached_frame_path(str(cache_dir), int(idx))
         bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if bgr is None:
             raise ValueError(f"cannot read cached frame: {path}")

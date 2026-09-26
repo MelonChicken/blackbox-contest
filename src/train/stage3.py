@@ -184,8 +184,10 @@ def _model_outputs(model, batch):
 
 
 def _loss(accel, steer, batch, accel_weight=None, steer_weight=None):
-    loss_accel = nn.functional.cross_entropy(accel, batch["accel_label"].to(DEVICE), weight=accel_weight)
-    loss_steer = nn.functional.cross_entropy(steer, batch["steer_label"].to(DEVICE), weight=steer_weight)
+    # Autocast can return BF16 logits while class weights remain FP32.
+    # Compute cross entropy in FP32 for matching dtypes and stable reduction.
+    loss_accel = nn.functional.cross_entropy(accel.float(), batch["accel_label"].to(DEVICE), weight=accel_weight)
+    loss_steer = nn.functional.cross_entropy(steer.float(), batch["steer_label"].to(DEVICE), weight=steer_weight)
     total = (STAGE3_LOSS_WEIGHTS["accel"] * loss_accel) + (STAGE3_LOSS_WEIGHTS["steer"] * loss_steer)
     return total, loss_accel.detach(), loss_steer.detach()
 

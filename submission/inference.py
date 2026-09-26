@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 import cv2
@@ -14,9 +15,14 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import InterpolationMode
+
+SUBMISSION_ROOT = Path(__file__).resolve().parent
+if str(SUBMISSION_ROOT) not in sys.path:
+    sys.path.insert(0, str(SUBMISSION_ROOT))
+
 from model.stage1 import Stage1MViT
 from model.stage2 import LegacyStage2VideoMAE, Stage2VideoMAE
-from model.stage3 import Stage3MViT
+from model.stage3 import Stage3VJEPA
 
 
 # ============================================================
@@ -33,11 +39,11 @@ S1_STD = torch.tensor(
 
 
 S3_MEAN = torch.tensor(
-    [0.45, 0.45, 0.45]
+    [0.485, 0.456, 0.406]
 )[:, None, None]
 
 S3_STD = torch.tensor(
-    [0.225, 0.225, 0.225]
+    [0.229, 0.224, 0.225]
 )[:, None, None]
 
 
@@ -120,10 +126,22 @@ def _stage3_checkpoint_path(model_dir) -> Path:
     return Path(model_dir) / "best.pt"
 
 
-def _stage3_model(arch: str, checkpoint: dict | None = None):
-    if arch not in {"mvit_v2_s", "mvit"}:
-        raise ValueError(f"Stage3 inference supports only mvit_v2_s checkpoints, got: {arch}")
-    return Stage3MViT()
+def _stage3_model(model_dir, checkpoint: dict):
+    arch = checkpoint.get("arch")
+    if arch != "vjepa_vitl_224":
+        raise ValueError(f"Stage3 inference requires vjepa_vitl_224, got: {arch}")
+    if "head" not in checkpoint:
+        raise KeyError("Stage3 V-JEPA checkpoint is missing 'head' weights")
+    encoder_filename = checkpoint.get("encoder_filename", "encoder.pt")
+    return Stage3VJEPA(Path(model_dir) / encoder_filename, checkpoint["head"])
+
+
+def _stage3_frame_sampling(checkpoint: dict) -> tuple[int, list[int]]:
+    source_num_frames = int(checkpoint.get("source_num_frames", 16))
+    positions = [int(value) for value in checkpoint.get("frame_positions", range(source_num_frames))]
+    if source_num_frames <= 0 or not positions or min(positions) < 0 or max(positions) >= source_num_frames:
+        raise ValueError("invalid Stage3 frame sampling metadata")
+    return source_num_frames, positions
 
 # ============================================================
 # Stage 1
@@ -861,10 +879,9 @@ def predict_stage3(
         map_location="cpu",
         weights_only=True,
     )
-    arch = checkpoint.get("arch") or "mvit_v2_s"
-    model = _stage3_model(arch, checkpoint)
-    model.load_state_dict(checkpoint["model"], strict=True)
+    model = _stage3_model(model_dir, checkpoint)
     model.to(device).eval()
+    source_num_frames, frame_positions = _stage3_frame_sampling(checkpoint)
 
     videos = _video_paths(
         Path(data_dir)
@@ -893,7 +910,9 @@ def predict_stage3(
 
             accel_predictions = []
             steer_predictions = []
-            window_batch = 8
+            # ViT-L is substantially larger than the previous MViT backbone.
+            # Batch size 1 keeps inference within typical competition GPU memory.
+            window_batch = 1
 
             for start in range(
                 0,
@@ -911,12 +930,13 @@ def predict_stage3(
                         build_centered_clip_indices(
                             int(c),
                             count,
-                            16,
-                        )
+                            source_num_frames,
+                        )[position]
                         for c in center
+                        for position in frame_positions
                     ],
                     dtype=np.int64,
-                )
+                ).reshape(len(center), len(frame_positions))
 
                 indices = (
                     torch.from_numpy(

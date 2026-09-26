@@ -5,7 +5,7 @@ from pathlib import Path
 import cv2
 import torch
 
-from src.config import SIZE
+from src.config import SIZE, STAGE3_VJEPA_FRAME_POSITIONS
 from src.datasets.comma2k19_stage3 import Comma2k19Stage3Dataset, _cached_frame_lookup
 from src.datasets.stage3_sampling import parse_clip_frame_indices
 from src.utils import _crop_tensor
@@ -37,6 +37,7 @@ class Comma2k19Stage3VJEPADataset(Comma2k19Stage3Dataset):
     def __getitem__(self, index: int) -> dict:
         row = self.df.iloc[index]
         clip_indices = parse_clip_frame_indices(str(row.clip_frame_indices), self.frames)
+        clip_indices = [clip_indices[position] for position in STAGE3_VJEPA_FRAME_POSITIONS]
         cache_dir = self._cache_dir(row)
         if self.cache_root is None or cache_dir is None:
             raise self._missing_cache_error(self._expected_cache_dir(row))

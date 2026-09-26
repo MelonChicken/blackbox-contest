@@ -6,13 +6,14 @@ import pandas as pd
 import torch
 from PIL import Image
 
-from src.config import S3_MEAN, S3_STD
 from src.datasets.stage3_sampling import build_centered_clip_indices
 from src.inference.stage1 import _video_paths
-from src.models.stage3 import Stage3MViT
+from src.models.stage3_vjepa import Stage3VJEPA
 
 ACCEL = ["ACCELERATING", "DECELERATING", "CONSTANT", "STOPPED"]
 STEER = ["LEFT", "STRAIGHT", "RIGHT"]
+VJEPA_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)[:, None, None]
+VJEPA_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)[:, None, None]
 
 
 def _device() -> torch.device:
@@ -44,18 +45,50 @@ def _stage3_frames(path: Path):
 
 
 def _stage3_checkpoint_path(model_dir) -> Path:
-    return Path(model_dir) / "best.pt"
+    root = Path(model_dir)
+    candidates = [root / "vjepa" / "best.pt", root / "best.pt"]
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(f"missing Stage3 V-JEPA checkpoint under: {root}")
+
+
+def _stage3_encoder_path(model_dir, checkpoint: dict) -> Path:
+    root = Path(model_dir)
+    filename = checkpoint.get("encoder_filename")
+    candidates = []
+    if filename:
+        candidates.append(root / filename)
+    candidates.extend([
+        root / "vitl16.pth.tar",
+        root / "vitl16.pth",
+        root.parent / "vitl16.pth.tar",
+        root.parent / "vitl16.pth",
+    ])
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(f"missing Stage3 V-JEPA encoder under: {root}")
+
+
+def _stage3_frame_sampling(checkpoint: dict) -> tuple[int, list[int]]:
+    source_num_frames = int(checkpoint.get("source_num_frames", 16))
+    positions = [int(value) for value in checkpoint.get("frame_positions", range(source_num_frames))]
+    if source_num_frames <= 0 or not positions or min(positions) < 0 or max(positions) >= source_num_frames:
+        raise ValueError("invalid Stage3 frame sampling metadata")
+    return source_num_frames, positions
 
 
 def predict_stage3(data_dir, model_dir):
     device = _device()
     checkpoint = torch.load(_stage3_checkpoint_path(model_dir), map_location="cpu", weights_only=True)
-    arch = checkpoint.get("arch", "mvit_v2_s")
-    if arch not in {"mvit_v2_s", "mvit"}:
-        raise ValueError(f"Stage3 inference supports only mvit_v2_s checkpoints, got: {arch}")
-    model = Stage3MViT(pretrained=False)
-    model.load_state_dict(checkpoint["model"], strict=True)
+    arch = checkpoint.get("arch")
+    if arch != "vjepa_vitl_224":
+        raise ValueError(f"Stage3 inference requires vjepa_vitl_224, got: {arch}")
+    model = Stage3VJEPA(_stage3_encoder_path(model_dir, checkpoint))
+    model.head.load_state_dict(checkpoint["head"], strict=True)
     model.to(device).eval()
+    source_num_frames, frame_positions = _stage3_frame_sampling(checkpoint)
     videos = _video_paths(Path(data_dir) / "videos")
     rows = []
     with torch.inference_mode():
@@ -63,11 +96,17 @@ def predict_stage3(data_dir, model_dir):
             frames = _stage3_frames(path)
             count = len(frames)
             accel_predictions, steer_predictions = [], []
-            for start in range(0, count, 8):
-                center = np.arange(count)[start : start + 8]
-                indices = np.asarray([build_centered_clip_indices(int(c), count, 16) for c in center], dtype=np.int64)
+            for start in range(0, count, 1):
+                center = np.arange(count)[start : start + 1]
+                indices = np.asarray(
+                    [
+                        np.asarray(build_centered_clip_indices(int(c), count, source_num_frames))[frame_positions]
+                        for c in center
+                    ],
+                    dtype=np.int64,
+                )
                 clips = frames[torch.from_numpy(indices)].permute(0, 2, 1, 3, 4).float() / 255.0
-                clips = (clips - S3_MEAN[None, :, None, :, :]) / S3_STD[None, :, None, :, :]
+                clips = (clips - VJEPA_MEAN[None, :, None, :, :]) / VJEPA_STD[None, :, None, :, :]
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     accel_logits, steer_logits = model(clips.to(device, non_blocking=True))
                 accel_predictions.extend(accel_logits.argmax(1).cpu().tolist())

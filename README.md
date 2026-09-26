@@ -6,7 +6,7 @@ This repository keeps one active submission pipeline per stage.
 
 - Stage 1: MViT-v2-S recapture classifier
 - Stage 2: VideoMAE collision and direction model
-- Stage 3: MViT-v2-S comma2k19-only acceleration and steering model
+- Stage 3: frozen V-JEPA ViT-L/16 encoder with task-query acceleration and steering heads
 
 ## Data Flow
 
@@ -29,7 +29,7 @@ python -m src.stage2.train
 
 python -m src.stage3.manifest
 python -m src.stage3.cache
-python -m src.stage3.train
+python train.py
 ```
 
 Root training wrapper:
@@ -37,7 +37,8 @@ Root training wrapper:
 ```bash
 python train.py stage1
 python train.py stage2
-python train.py stage3
+python train.py                  # defaults to stage3_vjepa
+python train.py stage3           # legacy MViT training
 ```
 
 ## Checkpoints
@@ -46,9 +47,10 @@ Default checkpoint roots are under `model/` unless `DACON_MODEL_ROOT` is set.
 
 - Stage 1: `model/stage1/best.pt`
 - Stage 2: `model/stage2/best.pt`
-- Stage 3: `model/stage3/best.pt`
+- Stage 3 head: `model/stage3/vjepa/best.pt`
+- Stage 3 encoder source: `model/stage3/vitl16.pth.tar`
 
-Stage 3 checkpoints store MViT weights under `model` plus sampling metadata: `sampling_hz`, `num_frames`, `past_frames`, `future_frames`, `clip_duration_sec`, `sampling_policy`, `boundary_policy`, `image_size`, `arch`, and `dataset_mode`.
+The Stage 3 training checkpoint stores only the task-query head. The submission builder extracts `target_encoder` from the local V-JEPA checkpoint and writes a compact `submission/model/stage3/encoder.pt`; no model download is performed during inference.
 
 ## Submission
 
@@ -56,14 +58,17 @@ Stage 3 checkpoints store MViT weights under `model` plus sampling metadata: `sa
 python -m src.tools.build_submission
 ```
 
-Submission inference lives in `submission/inference.py` and loads the three stage checkpoints from `submission/model/stage*/best.pt`.
+Submission inference lives in `submission/inference.py`. Stage 3 loads both `submission/model/stage3/best.pt` and the bundled `submission/model/stage3/encoder.pt` entirely offline.
 
 ## Stage 3 Sampling
 
 Stage 3 training and cache generation use timestamp-nearest sampling aligned to the submission cadence:
 
 - `sampling_hz = 10.0`
-- `num_frames = 16`
+- cache/manifest frames: `16`
+- V-JEPA model input: `8` frames sampled across the same 1.5 sec window
+- train row stride: `8`, with offsets `0..7` rotated across 8 epochs
+- batch size: `4`; BF16 enabled when the GPU supports it
 - offsets: `[-8, -7, ..., 6, 7]`
 - coverage: `1.5 sec`
 - center: manifest `target_timestamp`
@@ -71,4 +76,4 @@ Stage 3 training and cache generation use timestamp-nearest sampling aligned to 
 - boundary policy: `clamp`
 - image size: `224`
 
-Older Stage 3 checkpoints trained with consecutive source frames are legacy-sampling checkpoints and should be retrained for this sampler.
+The checkpoint stores the selected frame positions, so submission inference supports both existing 16-frame and new 8-frame heads without online downloads.

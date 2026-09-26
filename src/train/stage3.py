@@ -15,12 +15,12 @@ from tqdm import tqdm
 cv2.setNumThreads(0)
 
 from src.config import (
-    BATCH_SIZE,
     COMMA2K19_STAGE3_TRAIN_MANIFEST,
     COMMA2K19_STAGE3_VAL_MANIFEST,
     DEVICE,
     SEED,
     STAGE3_ARCH,
+    STAGE3_BATCH_SIZE,
     STAGE3_CLASS_WEIGHTS,
     STAGE3_EPOCHS,
     STAGE3_FUTURE_FRAMES,
@@ -42,6 +42,7 @@ from src.config import (
     STAGE3_HEAD_LR,
     STAGE3_TRAIN_SAMPLE_LIMIT,
     STAGE3_TRAIN_TEMPORAL_STRIDE,
+    STAGE3_USE_BF16,
     STAGE3_VAL_SAMPLE_LIMIT,
     STAGE3_VAL_TEMPORAL_STRIDE,
 )
@@ -74,11 +75,12 @@ def _classification_metrics(pred: list[int], target: list[int], num_classes: int
     }
 
 
-def _stride_manifest(df: pd.DataFrame, stride: int) -> pd.DataFrame:
+def _stride_manifest(df: pd.DataFrame, stride: int, offset: int = 0) -> pd.DataFrame:
     if stride <= 1 or df.empty:
         return df.reset_index(drop=True)
+    offset = int(offset) % int(stride)
     key = ["route_id", "segment_id"] if {"route_id", "segment_id"}.issubset(df.columns) else "segment_id" if "segment_id" in df.columns else "video_path"
-    parts = [part.iloc[::stride] for _, part in df.groupby(key, sort=False)]
+    parts = [part.iloc[offset::stride] for _, part in df.groupby(key, sort=False)]
     return pd.concat(parts, ignore_index=True) if parts else df.reset_index(drop=True)
 
 
@@ -93,9 +95,9 @@ def _balanced_limit(df: pd.DataFrame, limit: int | None) -> pd.DataFrame:
     return out.head(limit).sort_index().reset_index(drop=True)
 
 
-def _limited_dataset(dataset, stride: int, limit: int | None):
+def _limited_dataset(dataset, stride: int, limit: int | None, offset: int = 0):
     before = len(dataset)
-    dataset.df = _balanced_limit(_stride_manifest(dataset.df, stride), limit)
+    dataset.df = _balanced_limit(_stride_manifest(dataset.df, stride, offset), limit)
     return dataset, before, len(dataset)
 
 
@@ -163,7 +165,7 @@ def _print_dataset_summary(train_dataset, val_datasets: dict[str, object], summa
     print(f"Architecture: {STAGE3_ARCH}")
     print(f"MViT pretrained: {STAGE3_MVIT_PRETRAINED} ({STAGE3_MVIT_PRETRAINED_WEIGHTS})")
     print(f"MViT preprocessing: {STAGE3_MVIT_PREPROCESS} mean=[0.45, 0.45, 0.45] std=[0.225, 0.225, 0.225] resize=224 crop=224")
-    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Batch size: {STAGE3_BATCH_SIZE}")
     _print_one_distribution("comma2k19 train", train_dataset)
     for source, ds in val_datasets.items():
         _print_one_distribution(f"{source} val", ds)
@@ -175,7 +177,10 @@ def _class_weights(name: str):
 
 
 def _model_outputs(model, batch):
-    return model(batch["video"].to(DEVICE, non_blocking=True))
+    video = batch["video"].to(DEVICE, non_blocking=True)
+    use_bf16 = bool(STAGE3_USE_BF16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16):
+        return model(video)
 
 
 def _loss(accel, steer, batch, accel_weight=None, steer_weight=None):
@@ -228,7 +233,7 @@ def _stage3_collate(batch: list[dict]) -> dict:
 
 def _loader(dataset, shuffle: bool):
     kwargs = {
-        "batch_size": BATCH_SIZE,
+        "batch_size": STAGE3_BATCH_SIZE,
         "shuffle": shuffle,
         "num_workers": STAGE3_NUM_WORKERS,
         "pin_memory": torch.cuda.is_available(),
@@ -262,7 +267,7 @@ def _append_history(history: dict, epoch: int, train_loss: float, train_accel_lo
         "epoch": epoch,
         "arch": "mvit_v2_s",
         "dataset": "comma2k19",
-        "batch_size": BATCH_SIZE,
+        "batch_size": STAGE3_BATCH_SIZE,
         "selection_metric_name": selection_metric_name,
         "selection_metric": selection_metric,
         "train_loss": train_loss,

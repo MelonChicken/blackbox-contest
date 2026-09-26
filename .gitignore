@@ -28,6 +28,13 @@ model/
 test.*
 
 submission/model/
+!submission/model/
+submission/model/*
+!submission/model/stage3/
+submission/model/stage3/*
+!submission/model/stage3/vjepa/
+!submission/model/stage3/vjepa/**/
+!submission/model/stage3/vjepa/**/*.py
 # Outputs
 outputs/
 runs/

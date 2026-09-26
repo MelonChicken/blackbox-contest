@@ -7,29 +7,35 @@ import torch
 from tqdm import tqdm
 
 from src.config import (
-    BATCH_SIZE,
     COMMA2K19_STAGE3_TRAIN_MANIFEST,
     COMMA2K19_STAGE3_VAL_MANIFEST,
     DEVICE,
-    STAGE3_EPOCHS,
+    STAGE3_BATCH_SIZE,
     STAGE3_HEAD_LR,
+    STAGE3_NUM_FRAMES,
     STAGE3_TRAIN_SAMPLE_LIMIT,
     STAGE3_TRAIN_TEMPORAL_STRIDE,
     STAGE3_VAL_SAMPLE_LIMIT,
     STAGE3_VAL_TEMPORAL_STRIDE,
     STAGE3_VJEPA_CHECKPOINT,
+    STAGE3_VJEPA_EPOCHS,
+    STAGE3_VJEPA_FRAME_POSITIONS,
+    STAGE3_VJEPA_INPUT_FRAMES,
     STAGE3_VJEPA_MODEL,
 )
 from src.datasets.comma2k19_stage3_vjepa import Comma2k19Stage3VJEPADataset
 from src.models.stage3_vjepa import Stage3VJEPA
 from src.train.stage3 import (
+    _balanced_limit,
     _class_weights,
     _classification_metrics,
     _limited_dataset,
     _loader,
     _loss,
+    _model_outputs,
     _print_metrics_table,
     _selection_score,
+    _stride_manifest,
     _validate_all,
 )
 
@@ -46,8 +52,10 @@ HISTORY_KEYS = [
 def _datasets():
     if not COMMA2K19_STAGE3_TRAIN_MANIFEST.is_file():
         raise FileNotFoundError(f"missing comma2k19 Stage3 train manifest: {COMMA2K19_STAGE3_TRAIN_MANIFEST}")
+    train = Comma2k19Stage3VJEPADataset(COMMA2K19_STAGE3_TRAIN_MANIFEST)
+    full_train_df = train.df.copy()
     train, before, after = _limited_dataset(
-        Comma2k19Stage3VJEPADataset(COMMA2K19_STAGE3_TRAIN_MANIFEST),
+        train,
         STAGE3_TRAIN_TEMPORAL_STRIDE,
         STAGE3_TRAIN_SAMPLE_LIMIT,
     )
@@ -61,7 +69,7 @@ def _datasets():
         )
         val["comma2k19"] = ds
         summary.update(comma_val_before=before, comma_val_after=after)
-    return train, val, summary
+    return train, val, summary, full_train_df
 
 
 def _append_history(history: dict, epoch: int, train_loss: float, train_accel_loss: float, train_steer_loss: float, train_metrics: dict, metrics: dict, selection: float) -> None:
@@ -71,7 +79,7 @@ def _append_history(history: dict, epoch: int, train_loss: float, train_accel_lo
         "epoch": epoch,
         "arch": "vjepa_vitl_224",
         "dataset": "comma2k19",
-        "batch_size": BATCH_SIZE,
+        "batch_size": STAGE3_BATCH_SIZE,
         "selection_metric_name": "overall.selection",
         "selection_metric": selection,
         "train_loss": train_loss,
@@ -115,6 +123,11 @@ def _checkpoint_payload(model: Stage3VJEPA, epoch: int, train_loss: float, metri
         "dataset": "comma2k19",
         "selection_metric_name": "overall.selection",
         "selection_metric": float(metrics["overall"]["selection"]),
+        "input_num_frames": STAGE3_VJEPA_INPUT_FRAMES,
+        "source_num_frames": STAGE3_NUM_FRAMES,
+        "frame_positions": list(STAGE3_VJEPA_FRAME_POSITIONS),
+        "train_temporal_stride": STAGE3_TRAIN_TEMPORAL_STRIDE,
+        "rotating_stride": True,
         "history": history,
     }
 
@@ -127,15 +140,16 @@ def fit_stage3_vjepa():
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     history = {k: [] for k in HISTORY_KEYS}
 
-    train_dataset, val_datasets, _ = _datasets()
+    train_dataset, val_datasets, _, full_train_df = _datasets()
     print("=== Stage 3 V-JEPA Dataset ===")
     print("Dataset: comma2k19")
     print("Architecture: vjepa_vitl_224")
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {sum(len(v) for v in val_datasets.values())}")
-    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Input frames: {STAGE3_VJEPA_INPUT_FRAMES} from cached positions {list(STAGE3_VJEPA_FRAME_POSITIONS)}")
+    print(f"Batch size: {STAGE3_BATCH_SIZE}")
+    print(f"Train stride: {STAGE3_TRAIN_TEMPORAL_STRIDE} with rotating epoch offset")
 
-    train_loader = _loader(train_dataset, shuffle=True)
     val_loaders = {name: _loader(ds, shuffle=False) for name, ds in val_datasets.items()}
     model = Stage3VJEPA(STAGE3_VJEPA_CHECKPOINT).to(DEVICE)
     opt = torch.optim.AdamW(model.head.parameters(), lr=STAGE3_HEAD_LR)
@@ -145,15 +159,22 @@ def fit_stage3_vjepa():
     best_metrics = None
     best_epoch = 0
 
-    for epoch in range(STAGE3_EPOCHS):
+    for epoch in range(STAGE3_VJEPA_EPOCHS):
+        offset = epoch % max(1, STAGE3_TRAIN_TEMPORAL_STRIDE)
+        train_dataset.df = _balanced_limit(
+            _stride_manifest(full_train_df, STAGE3_TRAIN_TEMPORAL_STRIDE, offset),
+            STAGE3_TRAIN_SAMPLE_LIMIT,
+        )
+        train_loader = _loader(train_dataset, shuffle=True)
+        print(f"Epoch {epoch + 1}: stride_offset={offset} train_samples={len(train_dataset)}")
         model.train()
         total_loss = total_accel_loss = total_steer_loss = 0.0
         train_accel_pred, train_accel_target, train_steer_pred, train_steer_target = [], [], [], []
-        progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{STAGE3_EPOCHS} V-JEPA")
+        progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{STAGE3_VJEPA_EPOCHS} V-JEPA")
         for batch in progress:
-            accel, steer = model(batch["video"].to(DEVICE, non_blocking=True))
+            accel, steer = _model_outputs(model, batch)
             loss, loss_accel, loss_steer = _loss(accel, steer, batch, accel_class_weights, steer_class_weights)
-            opt.zero_grad(); loss.backward(); opt.step()
+            opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
             total_loss += float(loss.detach().cpu())
             total_accel_loss += float(loss_accel.cpu())
             total_steer_loss += float(loss_steer.cpu())

@@ -5,7 +5,7 @@ import argparse
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the canonical training entrypoint for one stage.")
-    parser.add_argument("stage", nargs="?", choices=("stage1", "stage2", "stage3", "stage3_vjepa"), default="stage3")
+    parser.add_argument("stage", nargs="?", choices=("stage1", "stage2", "stage3", "stage3_vjepa"), default="stage3_vjepa")
     args = parser.parse_args()
     if args.stage == "stage1":
         from src.train.stage1 import fit_stage1

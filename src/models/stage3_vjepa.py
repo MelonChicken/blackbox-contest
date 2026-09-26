@@ -23,10 +23,15 @@ def _load_vjepa_encoder(checkpoint: str | Path = STAGE3_VJEPA_CHECKPOINT) -> nn.
     checkpoint = Path(checkpoint)
     if not checkpoint.is_file():
         raise FileNotFoundError(f"missing V-JEPA checkpoint: {checkpoint}")
-    payload = torch.load(checkpoint, map_location="cpu")
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
     state = payload.get("target_encoder", payload.get("encoder", payload))
     state = {k.replace("module.", "").replace("backbone.", ""): v for k, v in state.items()}
-    encoder.load_state_dict(state, strict=False)
+    incompatible = encoder.load_state_dict(state, strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "V-JEPA encoder checkpoint is incompatible: "
+            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+        )
     return encoder
 
 

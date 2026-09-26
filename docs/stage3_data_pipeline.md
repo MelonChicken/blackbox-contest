@@ -1,14 +1,14 @@
 # Stage 3 Data Pipeline
 
-Stage 3 is comma2k19 + MViT only.
+Stage 3 is comma2k19 + V-JEPA ViT-L/16.
 
 ```text
 data/raw/comma2k19
 -> data/processed/stage3/manifest/{train,val}.csv
 -> data/processed/stage3/comma2k19_frames/
--> src.datasets.comma2k19_stage3.Comma2k19Stage3Dataset
--> src.models.stage3.Stage3MViT
--> model/stage3/best.pt
+-> src.datasets.comma2k19_stage3_vjepa.Comma2k19Stage3VJEPADataset
+-> src.models.stage3_vjepa.Stage3VJEPA
+-> model/stage3/vjepa/best.pt
 ```
 
 ## Manifest
@@ -66,7 +66,7 @@ data/processed/stage3/comma2k19_frames/<route_id>/<segment_id>/frames.csv
 ## Training
 
 ```bash
-python train.py stage3
+python train.py
 ```
 
 Selection metric is weighted macro-F1:
@@ -78,8 +78,6 @@ Selection metric is weighted macro-F1:
 Outputs:
 
 ```text
-model/stage3/best.pt
-model/stage3/history/*_history.csv
-model/stage3/history/*_loss.png
-model/stage3/history/*_metrics.png
+model/stage3/vjepa/best.pt
+model/stage3/vjepa/*_history.csv
 ```

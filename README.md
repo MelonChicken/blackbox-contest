@@ -5,7 +5,7 @@ This repository keeps one active submission pipeline per stage.
 ## Active Models
 
 - Stage 1: MViT-v2-S recapture classifier
-- Stage 2: VideoMAE collision and direction model
+- Stage 2: four-task VideoMAE for collision time, entry time, entry side, and evasion space
 - Stage 3: frozen V-JEPA ViT-L/16 encoder with task-query acceleration and steering heads
 
 ## Data Flow
@@ -77,3 +77,9 @@ Stage 3 training and cache generation use timestamp-nearest sampling aligned to 
 - image size: `224`
 
 The checkpoint stores the selected frame positions, so submission inference supports both existing 16-frame and new 8-frame heads without online downloads.
+
+## Stage 2 Labels and Scoring
+
+Stage 2 loads reviewed label files from `data/processed/stage2/CCD_lane_labeling/` by default. On the server this resolves to `/data/processed/stage2/CCD_lane_labeling/`; set `STAGE2_HUMAN_LABEL_ROOT` to override it. Human `NEW_*` labels override pseudo-labels on a per-task basis.
+
+Model selection follows the competition metric: collision and entry use Accuracy@0.3 seconds with per-video FPS, direction and evasion use macro-F1, and the four scores are weighted `0.35`, `0.35`, `0.15`, and `0.15`. See `docs/stage2_training_pipeline.md` for the data and training contract.

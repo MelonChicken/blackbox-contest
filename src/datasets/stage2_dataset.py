@@ -131,6 +131,20 @@ def _label(row: pd.Series, name: str) -> int:
     return int(value)
 
 
+def _video_fps(row: pd.Series, video_path: Path) -> float:
+    value = pd.to_numeric(row.get("fps"), errors="coerce")
+    if pd.notna(value) and float(value) > 0:
+        return float(value)
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS)) if capture.isOpened() else 0.0
+    finally:
+        capture.release()
+    if not np.isfinite(fps) or fps <= 0:
+        raise RuntimeError(f"Could not determine video FPS: {video_path}")
+    return fps
+
+
 class Stage2Dataset(Dataset):
     def __init__(self, manifest_path: str | Path, num_frames: int = 16, image_size: int = 224, min_pseudo_label_confidence: float | None = None):
         self.manifest_path = Path(manifest_path)
@@ -148,6 +162,8 @@ class Stage2Dataset(Dataset):
         row = pd.Series(self.rows[index])
         video_path = Path(row["video_path"])
         video, sampled_indices = preprocess_video(video_path, self.num_frames, self.image_size)
+        fps = _video_fps(row, video_path)
+        frame_count = int(sampled_indices[-1]) + 1
 
         collision_frame = _label(row, "collision_frame")
         entry_frame = _label(row, "entry_frame")
@@ -155,6 +171,8 @@ class Stage2Dataset(Dataset):
             "video": video,
             "video_path": str(video_path),
             "sampled_indices": torch.as_tensor(sampled_indices, dtype=torch.long),
+            "fps": torch.tensor(fps, dtype=torch.float32),
+            "frame_count": torch.tensor(frame_count, dtype=torch.long),
             "collision_frame": torch.tensor(collision_frame, dtype=torch.long),
             "entry_frame": torch.tensor(entry_frame, dtype=torch.long),
             "collision_index": torch.tensor(

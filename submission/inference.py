@@ -742,13 +742,18 @@ def _predict_stage2_clip(model: Stage2VideoMAE, clip: torch.Tensor, sampled_fram
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         outputs = model(video)
     collision_idx = int(outputs["collision_logits"].argmax(dim=1).item())
+    entry_logits = outputs.get("entry_logits")
+    entry_idx = int(entry_logits.argmax(dim=1).item()) if entry_logits is not None else collision_idx
     side_logits = outputs["direction_logits"] if "direction_logits" in outputs else outputs["side_logits"]
     direction_idx = int(side_logits.argmax(dim=1).item())
+    avoidance_logits = outputs.get("avoidance_logits")
+    avoidance_idx = int(avoidance_logits.argmax(dim=1).item()) if avoidance_logits is not None else 0
     collision_frame = int(sampled_frames[collision_idx])
+    entry_frame = int(sampled_frames[entry_idx])
     return {
         "collision_frame": collision_frame,
-        "entry_frame": collision_frame,
-        "evasion_space": 0,
+        "entry_frame": entry_frame,
+        "evasion_space": avoidance_idx,
         "entry_side": "RIGHT" if direction_idx == 1 else "LEFT",
     }
 

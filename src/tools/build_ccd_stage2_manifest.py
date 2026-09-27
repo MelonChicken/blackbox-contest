@@ -18,6 +18,7 @@ from src.config import (
     STAGE2_TRAIN_MANIFEST,
     STAGE2_VAL_MANIFEST,
 )
+from src.tools.stage2_human_labels import load_stage2_human_labels, print_human_label_summary
 
 CCD_ROOT = CCD_STAGE2_RAW
 ANNOTATION_PATH = CCD_ROOT / "Crash-1500.txt"
@@ -162,6 +163,113 @@ def direction_from_candidate(value: object) -> int:
     return MISSING_LABEL
 
 
+def _apply_human_labels(out: pd.DataFrame, human: pd.DataFrame) -> pd.DataFrame:
+    out = out.copy()
+    out["dataset"] = "ccd"
+    out["n_frames"] = EXPECTED_NUM_FRAMES
+    out["fps"] = EXPECTED_FPS
+    out["human_reviewed"] = False
+    out["ambiguous"] = False
+    out["tier"] = ""
+    out["lane_score"] = float("nan")
+    out["labeler"] = ""
+    out["notes"] = ""
+    out["label_issue"] = ""
+    out["collision_valid"] = out["collision_frame"].ge(0)
+    out["entry_valid"] = out["entry_frame"].ge(0)
+    out["direction_valid"] = out["direction"].ge(0)
+    out["avoidance_valid"] = out["avoidance"].ge(0)
+    if human.empty:
+        return out
+
+    ccd = human[human["dataset"] == "ccd"].copy()
+    if not ccd.empty:
+        keep = [
+            "video_id",
+            "collision_frame",
+            "entry_frame",
+            "direction",
+            "avoidance",
+            "collision_valid",
+            "entry_valid",
+            "direction_valid",
+            "avoidance_valid",
+            "human_reviewed",
+            "ambiguous",
+            "tier",
+            "lane_score",
+            "labeler",
+            "notes",
+            "label_issue",
+        ]
+        out = out.merge(ccd[keep], on="video_id", how="left", validate="one_to_one", suffixes=("", "_human"))
+        reviewed = out["human_reviewed_human"].eq(True)
+        for task in ("collision", "entry", "direction", "avoidance"):
+            valid = out[f"{task}_valid_human"].eq(True)
+            target = f"{task}_frame" if task in {"collision", "entry"} else task
+            out.loc[valid, target] = pd.to_numeric(out.loc[valid, f"{target}_human"], errors="raise")
+            out[target] = pd.to_numeric(out[target], errors="raise").astype(int)
+            out.loc[valid, f"{task}_source"] = "human_manual"
+            out.loc[valid, f"{task}_confidence"] = 1.0
+            out.loc[reviewed, f"{task}_valid"] = valid.loc[reviewed].astype(bool)
+        for column in ("ambiguous", "tier", "lane_score", "labeler", "notes", "label_issue"):
+            human_column = f"{column}_human"
+            values = out.loc[reviewed, human_column]
+            if column == "ambiguous":
+                values = values.astype(bool)
+            elif column == "lane_score":
+                values = pd.to_numeric(values, errors="coerce")
+            else:
+                values = values.fillna("").astype(str)
+            out.loc[reviewed, column] = values
+        out["human_reviewed"] = reviewed
+        out.loc[reviewed, "overall_confidence"] = 1.0
+        out.loc[reviewed, "confidence_level"] = "human"
+        out = out.drop(columns=[column for column in out.columns if column.endswith("_human")])
+
+    aihub = human[human["dataset"] == "aihub"].copy()
+    if not aihub.empty:
+        added = pd.DataFrame(
+            {
+                "video_id": aihub["video_id"],
+                "video_path": aihub["video_path"],
+                "source_id": aihub["source_id"],
+                "ego_involved": True,
+                "ego_source": "human_stage2_label",
+                "collision_frame": aihub["collision_frame"],
+                "entry_frame": aihub["entry_frame"],
+                "direction": aihub["direction"],
+                "avoidance": aihub["avoidance"],
+                "collision_source": "human_manual",
+                "entry_source": aihub["entry_valid"].map(lambda valid: "human_manual" if valid else "missing"),
+                "direction_source": aihub["direction_valid"].map(lambda valid: "human_manual" if valid else "missing"),
+                "avoidance_source": aihub["avoidance_valid"].map(lambda valid: "human_manual" if valid else "missing"),
+                "collision_confidence": 1.0,
+                "entry_confidence": aihub["entry_valid"].astype(float),
+                "direction_confidence": aihub["direction_valid"].astype(float),
+                "avoidance_confidence": aihub["avoidance_valid"].astype(float),
+                "overall_confidence": 1.0,
+                "confidence_level": "human",
+                "dataset": "aihub",
+                "n_frames": aihub["n_frames"],
+                "fps": aihub["fps"],
+                "human_reviewed": True,
+                "ambiguous": aihub["ambiguous"],
+                "tier": aihub["tier"],
+                "lane_score": aihub["lane_score"],
+                "labeler": aihub["labeler"],
+                "notes": aihub["notes"],
+                "label_issue": aihub["label_issue"],
+                "collision_valid": aihub["collision_valid"],
+                "entry_valid": aihub["entry_valid"],
+                "direction_valid": aihub["direction_valid"],
+                "avoidance_valid": aihub["avoidance_valid"],
+            }
+        )
+        out = pd.concat([out, added], ignore_index=True, sort=False)
+    return out
+
+
 def build_stage2_manifest() -> pd.DataFrame:
     if not EGO_MANIFEST_PATH.exists():
         write_ccd_manifests()
@@ -199,11 +307,14 @@ def build_stage2_manifest() -> pd.DataFrame:
             "collision_confidence": 1.0,
             "entry_confidence": df.get("entry_confidence", pd.Series(0.0, index=df.index)).fillna(0.0),
             "direction_confidence": df.get("direction_confidence", pd.Series(0.0, index=df.index)).fillna(0.0),
+            "avoidance_confidence": 0.0,
             "overall_confidence": df.get("overall_confidence", pd.Series(0.0, index=df.index)).fillna(0.0),
             "confidence_level": df.get("confidence_level", pd.Series("low", index=df.index)).fillna("low"),
         }
     )
-    return out
+    human = load_stage2_human_labels()
+    print_human_label_summary(human)
+    return _apply_human_labels(out, human)
 
 
 def write_stage2_manifest() -> pd.DataFrame:
@@ -219,10 +330,22 @@ def split_stage2_manifest() -> None:
     if not STAGE2_ALL_MANIFEST.exists():
         write_stage2_manifest()
     df = pd.read_csv(STAGE2_ALL_MANIFEST, dtype={"video_id": str, "source_id": str})
-    groups = df["source_id"] if "source_id" in df.columns else df.get("video_id", df.index)
-    train_idx, val_idx = next(GroupShuffleSplit(n_splits=1, test_size=VAL_SIZE, random_state=SEED).split(df, groups=groups))
-    train_df = df.iloc[train_idx].reset_index(drop=True)
-    val_df = df.iloc[val_idx].reset_index(drop=True)
+    train_parts = []
+    val_parts = []
+    datasets = df["dataset"] if "dataset" in df.columns else pd.Series("ccd", index=df.index)
+    for _, part in df.groupby(datasets, sort=True):
+        part = part.reset_index(drop=True)
+        if len(part) < 2:
+            train_parts.append(part)
+            continue
+        groups = part["source_id"] if "source_id" in part.columns else part.get("video_id", part.index)
+        train_idx, val_idx = next(
+            GroupShuffleSplit(n_splits=1, test_size=VAL_SIZE, random_state=SEED).split(part, groups=groups)
+        )
+        train_parts.append(part.iloc[train_idx])
+        val_parts.append(part.iloc[val_idx])
+    train_df = pd.concat(train_parts, ignore_index=True)
+    val_df = pd.concat(val_parts, ignore_index=True) if val_parts else df.iloc[0:0].copy()
     train_df.to_csv(STAGE2_TRAIN_MANIFEST, index=False)
     val_df.to_csv(STAGE2_VAL_MANIFEST, index=False)
     print(f"Saved: {STAGE2_TRAIN_MANIFEST}")

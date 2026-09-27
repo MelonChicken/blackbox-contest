@@ -45,7 +45,7 @@ def _batch() -> dict[str, torch.Tensor]:
         "collision_index": torch.tensor([1, 1, 2, 2]),
         "entry_index": torch.tensor([0, -1, 1, -1]),
         "direction": torch.tensor([-1, 1, 0, -1]),
-        "avoidance": torch.tensor([-1, -1, -1, -1]),
+        "avoidance": torch.tensor([0, 1, -1, -1]),
     }
 
 
@@ -63,7 +63,7 @@ def _run(tasks: tuple[str, ...]) -> dict[str, float]:
     assert _has_grad(model.collision_head)
     assert _has_grad(model.entry_head) == ("entry" in tasks and metrics.get("entry_supervised_count", 0) > 0)
     assert _has_grad(model.direction_head) == ("direction" in tasks and metrics.get("direction_supervised_count", 0) > 0)
-    assert not _has_grad(model.avoidance_head)
+    assert _has_grad(model.avoidance_head) == ("avoidance" in tasks and metrics.get("avoidance_supervised_count", 0) > 0)
     build_optimizer(model)
     return metrics
 
@@ -95,6 +95,7 @@ def main() -> None:
     cd = _run(("collision", "direction"))
     ce = _run(("collision", "entry"))
     ced = _run(("collision", "entry", "direction"))
+    all_tasks = _run(("collision", "entry", "direction", "avoidance"))
 
     all_missing = _batch()
     all_missing["entry_index"] = torch.full((4,), -1)
@@ -110,6 +111,7 @@ def main() -> None:
     print("collision+direction", cd)
     print("collision+entry", ce)
     print("collision+entry+direction", ced)
+    print("all four tasks", all_tasks)
     print("mixed batch: entry-only, direction-only, both, neither passed")
 
 

@@ -39,11 +39,12 @@ UNFREEZE_LAST_N = 2
 TASK_ORDER = ("collision", "entry", "direction", "avoidance")
 FRAME_TASKS = ("collision", "entry")
 CLASSIFICATION_TASKS = ("direction", "avoidance")
-ACTIVE_STAGE2_TASKS = ("collision", "direction")
-LOSS_WEIGHTS = {"collision": 1.0, "entry": 1.0, "direction": 1.0}
+ACTIVE_STAGE2_TASKS = ("collision", "entry", "direction", "avoidance")
+LOSS_WEIGHTS = {"collision": 1.0, "entry": 1.0, "direction": 0.5, "avoidance": 0.5}
+STAGE2_SCORE_WEIGHTS = {"collision": 0.35, "entry": 0.35, "direction": 0.15, "avoidance": 0.15}
 STAGE2_INIT_CHECKPOINT: str | Path | None = STAGE2_MODEL / "archive" / "collision_only_best.pt"
 STAGE2_MIN_PSEUDO_LABEL_CONFIDENCE: float | None = None
-SELECTION_METRIC = "val_selection_metric"
+SELECTION_METRIC = "val_stage2_score"
 
 
 def _active_tasks(tasks: tuple[str, ...] | list[str] | None = None) -> tuple[str, ...]:
@@ -59,7 +60,10 @@ def _experiment_name(tasks: tuple[str, ...] | list[str] | None = None) -> str:
 
 
 def _checkpoint_path(kind: str, tasks: tuple[str, ...] | list[str] | None = None) -> Path:
-    return STAGE2_MODEL / f"{kind}_{_experiment_name(tasks)}.pt"
+    selected = _active_tasks(tasks)
+    if selected == ACTIVE_STAGE2_TASKS:
+        return STAGE2_MODEL / f"{kind}.pt"
+    return STAGE2_MODEL / f"{kind}_{_experiment_name(selected)}.pt"
 
 
 STAGE2_EXPERIMENT_NAME = _experiment_name()
@@ -79,14 +83,19 @@ def split_supervision_counts(manifest_path: str | Path) -> dict[str, Any]:
     df = pd.read_csv(manifest_path)
     entry = df.get("entry_frame", pd.Series(MISSING_LABEL, index=df.index)).fillna(MISSING_LABEL).astype(int).ge(0)
     direction = df.get("direction", pd.Series(MISSING_LABEL, index=df.index)).fillna(MISSING_LABEL).astype(int).ge(0)
+    avoidance = df.get("avoidance", pd.Series(MISSING_LABEL, index=df.index)).fillna(MISSING_LABEL).astype(int).ge(0)
     direction_values = df.loc[direction, "direction"].astype(int) if "direction" in df else pd.Series(dtype=int)
+    avoidance_values = df.loc[avoidance, "avoidance"].astype(int) if "avoidance" in df else pd.Series(dtype=int)
     return {
         "rows": int(len(df)),
         "collision": int(len(df)),
         "entry": int(entry.sum()),
         "direction": int(direction.sum()),
+        "avoidance": int(avoidance.sum()),
         "left": int((direction_values == 0).sum()),
         "right": int((direction_values == 1).sum()),
+        "no_evasion_space": int((avoidance_values == 0).sum()),
+        "has_evasion_space": int((avoidance_values == 1).sum()),
     }
 
 
@@ -106,8 +115,11 @@ def print_stage2_task_summary(
         print(f"  rows: {counts['rows']}")
         print(f"  entry valid: {counts['entry']}")
         print(f"  direction valid: {counts['direction']}")
+        print(f"  avoidance valid: {counts['avoidance']}")
         print(f"  LEFT: {counts['left']}")
         print(f"  RIGHT: {counts['right']}")
+        print(f"  evasion_space=0: {counts['no_evasion_space']}")
+        print(f"  evasion_space=1: {counts['has_evasion_space']}")
 
 
 def _frame_count(path: str | Path) -> int:
@@ -123,20 +135,41 @@ def _valid_frame(df: pd.DataFrame, task: str) -> pd.DataFrame:
     return df[df[column].fillna(MISSING_LABEL).astype(int).ge(0)].copy()
 
 
-def _frame_metrics(pred_frames: list[int], target_frames: list[int]) -> dict[str, float]:
+def _frame_metrics(
+    pred_frames: list[int],
+    target_frames: list[int],
+    fps_values: list[float] | None = None,
+    frame_counts: list[int] | None = None,
+) -> dict[str, float]:
     if not target_frames:
         return {
             "mean_abs_original_frame_error": float("nan"),
             "median_abs_original_frame_error": float("nan"),
             "acc_within_1_frame": float("nan"),
             "acc_within_2_frames": float("nan"),
+            "accuracy_at_0_3s": float("nan"),
+            "mean_abs_normalized_error": float("nan"),
         }
     errors = np.abs(np.asarray(pred_frames, dtype=np.float32) - np.asarray(target_frames, dtype=np.float32))
+    accuracy_at_0_3s = float("nan")
+    if fps_values is not None:
+        fps = np.asarray(fps_values, dtype=np.float32)
+        if len(fps) != len(errors) or bool((fps <= 0).any()):
+            raise ValueError("fps_values must contain one positive FPS value per frame prediction")
+        accuracy_at_0_3s = float((errors <= (0.3 * fps) + 1e-6).mean())
+    normalized_error = float("nan")
+    if frame_counts is not None:
+        counts = np.asarray(frame_counts, dtype=np.float32)
+        if len(counts) != len(errors) or bool((counts <= 1).any()):
+            raise ValueError("frame_counts must contain one value greater than one per frame prediction")
+        normalized_error = float((errors / (counts - 1.0)).mean())
     return {
         "mean_abs_original_frame_error": float(errors.mean()),
         "median_abs_original_frame_error": float(np.median(errors)),
         "acc_within_1_frame": float((errors <= 1).mean()),
         "acc_within_2_frames": float((errors <= 2).mean()),
+        "accuracy_at_0_3s": accuracy_at_0_3s,
+        "mean_abs_normalized_error": normalized_error,
     }
 
 
@@ -358,7 +391,11 @@ def evaluate(
     tasks = _active_tasks(active_tasks)
     model.eval()
     loss_rows = []
-    frame_rows = {task: {"pred": [], "target": [], "positions": []} for task in tasks if task in FRAME_TASKS}
+    frame_rows = {
+        task: {"pred": [], "target": [], "positions": [], "fps": [], "frame_count": []}
+        for task in tasks
+        if task in FRAME_TASKS
+    }
     class_rows = {task: {"pred": [], "target": []} for task in tasks if task in CLASSIFICATION_TASKS}
     for batch in tqdm(loader, desc="stage2 val"):
         video = batch["video"].to(device, non_blocking=True)
@@ -376,6 +413,8 @@ def evaluate(
                 rows["positions"].append(int(pos))
                 rows["pred"].append(int(sampled[pos]))
                 rows["target"].append(int(target[i]))
+                rows["fps"].append(float(batch["fps"][i]))
+                rows["frame_count"].append(int(batch["frame_count"][i]))
 
         for task, rows in class_rows.items():
             pred = outputs[f"{task}_logits"].argmax(dim=1).cpu()
@@ -391,7 +430,9 @@ def evaluate(
         key = f"{task}_supervised_count"
         metrics[f"val_{key}"] = float(sum(row.get(key, 0.0) for row in loss_rows))
     for task, rows in frame_rows.items():
-        for name, value in _frame_metrics(rows["pred"], rows["target"]).items():
+        for name, value in _frame_metrics(
+            rows["pred"], rows["target"], rows["fps"], rows["frame_count"]
+        ).items():
             metrics[f"val_{task}_{name}"] = value
         counts = pd.Series(rows["positions"]).value_counts().sort_index()
         for pos in range(NUM_FRAMES):
@@ -402,26 +443,25 @@ def evaluate(
             metrics[f"val_{task}_{name}"] = value
 
     metrics[SELECTION_METRIC] = selection_metric(metrics, tasks)
+    metrics["val_selection_metric"] = metrics[SELECTION_METRIC]
     return metrics
 
 
 def selection_metric(metrics: dict[str, Any], active_tasks: tuple[str, ...] | list[str] | None = None) -> float:
-    tasks = _active_tasks(active_tasks)
-    collision_mae = metrics.get("val_collision_mean_abs_original_frame_error")
-    if collision_mae is not None and (tasks == ("collision",) or tasks == ("collision", "direction")):
-        return float(collision_mae)
-
-    values = []
-    for task in tasks:
-        if task in FRAME_TASKS:
-            value = float(metrics[f"val_{task}_mean_abs_original_frame_error"])
-            if not np.isnan(value):
-                values.append(value)
-        elif task in CLASSIFICATION_TASKS:
-            accuracy = float(metrics[f"val_{task}_accuracy"])
-            if not np.isnan(accuracy):
-                values.append(1.0 - accuracy)
-    return float(np.sum(values)) if values else float("inf")
+    tasks = set(_active_tasks(active_tasks))
+    components = {
+        "collision": metrics.get("val_collision_accuracy_at_0_3s"),
+        "entry": metrics.get("val_entry_accuracy_at_0_3s"),
+        "direction": metrics.get("val_direction_macro_f1"),
+        "avoidance": metrics.get("val_avoidance_macro_f1"),
+    }
+    score = 0.0
+    for task, weight in STAGE2_SCORE_WEIGHTS.items():
+        value = components[task]
+        if task not in tasks or value is None or np.isnan(float(value)):
+            value = 0.0
+        score += weight * float(value)
+    return float(score)
 
 
 def _checkpoint_payload(
@@ -444,6 +484,7 @@ def _checkpoint_payload(
         "val_collision_metrics": {key: value for key, value in metrics.items() if key.startswith("val_collision_")},
         "val_entry_metrics": {key: value for key, value in metrics.items() if key.startswith("val_entry_")},
         "val_direction_metrics": {key: value for key, value in metrics.items() if key.startswith("val_direction_")},
+        "val_avoidance_metrics": {key: value for key, value in metrics.items() if key.startswith("val_avoidance_")},
         "selection_metric_name": SELECTION_METRIC,
         "selection_metric": metrics.get(SELECTION_METRIC),
         "metrics": metrics,
@@ -550,6 +591,7 @@ def _print_metrics(epoch: int, train_metrics: dict[str, float], val_metrics: dic
             print(f"val_{task}_median_abs_original_frame_error={val_metrics[f'val_{task}_median_abs_original_frame_error']:.5f}")
             print(f"val_{task}_acc_within_1_frame={val_metrics[f'val_{task}_acc_within_1_frame']:.5f}")
             print(f"val_{task}_acc_within_2_frames={val_metrics[f'val_{task}_acc_within_2_frames']:.5f}")
+            print(f"val_{task}_accuracy_at_0_3s={val_metrics[f'val_{task}_accuracy_at_0_3s']:.5f}")
         else:
             print(f"val_{task}_accuracy={val_metrics[f'val_{task}_accuracy']:.5f}")
             print(f"val_{task}_macro_f1={val_metrics[f'val_{task}_macro_f1']:.5f}")
@@ -557,7 +599,7 @@ def _print_metrics(epoch: int, train_metrics: dict[str, float], val_metrics: dic
             if task == "direction":
                 print(f"val_{task}_left_recall={val_metrics[f'val_{task}_left_recall']:.5f}")
                 print(f"val_{task}_right_recall={val_metrics[f'val_{task}_right_recall']:.5f}")
-    print(f"val_selection_metric={val_metrics[SELECTION_METRIC]:.5f}")
+    print(f"{SELECTION_METRIC}={val_metrics[SELECTION_METRIC]:.5f}")
 
 
 def fit_stage2(active_tasks: tuple[str, ...] | list[str] | None = None) -> None:
@@ -583,19 +625,19 @@ def fit_stage2(active_tasks: tuple[str, ...] | list[str] | None = None) -> None:
     model.freeze_backbone(unfreeze_last_n=UNFREEZE_LAST_N)
     optimizer = build_optimizer(model)
 
-    best_value = float("inf")
+    best_value = float("-inf")
     history: list[dict[str, Any]] = []
     for epoch in range(1, max(1, EPOCHS) + 1):
         train_metrics = train_one_epoch(model, train_loader, optimizer, device, active_tasks=active_tasks)
         if val_loader is not None:
             val_metrics = evaluate(model, val_loader, device, active_tasks=active_tasks)
         else:
-            val_metrics = {"val_total_loss": train_metrics["total_loss"], SELECTION_METRIC: train_metrics["total_loss"]}
+            val_metrics = {"val_total_loss": train_metrics["total_loss"], SELECTION_METRIC: -train_metrics["total_loss"]}
         row = {"epoch": float(epoch), **{f"train_{k}": v for k, v in train_metrics.items()}, **val_metrics}
         history.append(row)
         _print_metrics(epoch, train_metrics, val_metrics, active_tasks)
         save_stage2_checkpoint(last_checkpoint, model, epoch=epoch, metrics=val_metrics, history=history, active_tasks=active_tasks)
-        if float(val_metrics[SELECTION_METRIC]) < best_value:
+        if float(val_metrics[SELECTION_METRIC]) > best_value:
             best_value = float(val_metrics[SELECTION_METRIC])
             save_stage2_checkpoint(best_checkpoint, model, epoch=epoch, metrics=val_metrics, history=history, active_tasks=active_tasks)
             print(f"saved best checkpoint: {best_checkpoint} {SELECTION_METRIC}={best_value:.5f}")

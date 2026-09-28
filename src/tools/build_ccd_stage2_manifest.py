@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import argparse
 import csv
 from collections import Counter
 from collections.abc import Callable
@@ -32,6 +33,7 @@ EXPECTED_FPS = 10.0
 MISSING_LABEL = -1
 SEED = 42
 VAL_SIZE = 0.15
+SPLIT_CANDIDATES = 128
 
 
 def parse_annotation_line(line: str) -> dict:
@@ -320,10 +322,88 @@ def build_stage2_manifest() -> pd.DataFrame:
 def write_stage2_manifest() -> pd.DataFrame:
     STAGE2_MANIFEST.mkdir(parents=True, exist_ok=True)
     df = build_stage2_manifest()
+    validate_stage2_manifest(df)
     df.to_csv(STAGE2_ALL_MANIFEST, index=False)
     print(f"Saved: {STAGE2_ALL_MANIFEST}")
     print(f"Rows: {len(df)}")
+    print_task_source_summary(df)
     return df
+
+
+def _valid_mask(df: pd.DataFrame, task: str) -> pd.Series:
+    column = f"{task}_frame" if task in {"collision", "entry"} else task
+    return pd.to_numeric(df.get(column, MISSING_LABEL), errors="coerce").fillna(MISSING_LABEL).astype(int).ge(0)
+
+
+def validate_stage2_manifest(df: pd.DataFrame) -> None:
+    required = {"video_id", "video_path", "source_id", "collision_frame", "entry_frame", "direction", "avoidance"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise RuntimeError(f"Stage2 manifest is missing columns: {missing}")
+    duplicate_keys = ["dataset", "video_id"] if "dataset" in df else ["video_id"]
+    duplicated = df.duplicated(duplicate_keys, keep=False)
+    if duplicated.any():
+        raise RuntimeError(f"Duplicate Stage2 rows:\n{df.loc[duplicated, duplicate_keys].head(20).to_string(index=False)}")
+
+    n_frames = pd.to_numeric(df.get("n_frames", df.get("total_frames")), errors="coerce")
+    for task in ("collision", "entry"):
+        values = pd.to_numeric(df[f"{task}_frame"], errors="coerce").fillna(MISSING_LABEL).astype(int)
+        invalid = values.ge(0) & n_frames.notna() & values.ge(n_frames)
+        if invalid.any():
+            raise RuntimeError(f"{task} labels outside frame range: {df.loc[invalid, ['video_id', f'{task}_frame']].head(20).to_dict('records')}")
+    chronology = _valid_mask(df, "collision") & _valid_mask(df, "entry") & (df["entry_frame"].astype(int) > df["collision_frame"].astype(int))
+    if chronology.any():
+        raise RuntimeError(f"Entry occurs after collision: {df.loc[chronology, ['video_id', 'entry_frame', 'collision_frame']].head(20).to_dict('records')}")
+    for task in ("direction", "avoidance"):
+        values = pd.to_numeric(df[task], errors="coerce").fillna(MISSING_LABEL).astype(int)
+        invalid = ~values.isin({MISSING_LABEL, 0, 1})
+        if invalid.any():
+            raise RuntimeError(f"Invalid {task} classes: {sorted(values[invalid].unique().tolist())}")
+
+
+def print_task_source_summary(df: pd.DataFrame) -> None:
+    print("=== Stage 2 supervision by source ===")
+    for task in ("collision", "entry", "direction", "avoidance"):
+        valid = _valid_mask(df, task)
+        source_column = f"{task}_source"
+        counts = df.loc[valid, source_column].fillna("unknown").value_counts() if source_column in df else pd.Series(dtype=int)
+        print(f"{task}: valid={int(valid.sum())} sources={counts.to_dict()}")
+
+
+def _split_cost(part: pd.DataFrame, val_idx) -> float:
+    val = part.iloc[val_idx]
+    cost = abs((len(val) / len(part)) - VAL_SIZE) * 4.0
+    for task in ("entry", "direction", "avoidance"):
+        full_valid = _valid_mask(part, task)
+        val_valid = _valid_mask(val, task)
+        if int(full_valid.sum()) == 0:
+            continue
+        cost += abs(float(val_valid.mean()) - float(full_valid.mean()))
+        if int(full_valid.sum()) >= 4 and int(val_valid.sum()) == 0:
+            cost += 10.0
+        if task in {"direction", "avoidance"}:
+            for cls in (0, 1):
+                full_cls = full_valid & part[task].astype(int).eq(cls)
+                val_cls = val_valid & val[task].astype(int).eq(cls)
+                if int(full_cls.sum()) >= 4 and int(val_cls.sum()) == 0:
+                    cost += 5.0
+                if int(full_valid.sum()) and int(val_valid.sum()):
+                    cost += abs(float(full_cls.sum() / full_valid.sum()) - float(val_cls.sum() / val_valid.sum()))
+    return cost
+
+
+def _balanced_group_split(part: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    part = part.reset_index(drop=True)
+    groups = part["source_id"] if "source_id" in part.columns else part.get("video_id", part.index)
+    splitter = GroupShuffleSplit(n_splits=SPLIT_CANDIDATES, test_size=VAL_SIZE, random_state=SEED)
+    candidates = list(splitter.split(part, groups=groups))
+    train_idx, val_idx = min(candidates, key=lambda pair: _split_cost(part, pair[1]))
+    train = part.iloc[train_idx].copy()
+    val = part.iloc[val_idx].copy()
+    overlap = set(train["source_id"].astype(str)) & set(val["source_id"].astype(str))
+    if overlap:
+        raise RuntimeError(f"Stage2 group leakage detected: {sorted(overlap)[:10]}")
+    return train, val
 
 
 def split_stage2_manifest() -> None:
@@ -338,18 +418,19 @@ def split_stage2_manifest() -> None:
         if len(part) < 2:
             train_parts.append(part)
             continue
-        groups = part["source_id"] if "source_id" in part.columns else part.get("video_id", part.index)
-        train_idx, val_idx = next(
-            GroupShuffleSplit(n_splits=1, test_size=VAL_SIZE, random_state=SEED).split(part, groups=groups)
-        )
-        train_parts.append(part.iloc[train_idx])
-        val_parts.append(part.iloc[val_idx])
+        train, val = _balanced_group_split(part)
+        train_parts.append(train)
+        val_parts.append(val)
     train_df = pd.concat(train_parts, ignore_index=True)
     val_df = pd.concat(val_parts, ignore_index=True) if val_parts else df.iloc[0:0].copy()
     train_df.to_csv(STAGE2_TRAIN_MANIFEST, index=False)
     val_df.to_csv(STAGE2_VAL_MANIFEST, index=False)
     print(f"Saved: {STAGE2_TRAIN_MANIFEST}")
     print(f"Saved: {STAGE2_VAL_MANIFEST}")
+    print("Train split:")
+    print_task_source_summary(train_df)
+    print("Validation split:")
+    print_task_source_summary(val_df)
 
 
 def print_summary(df: pd.DataFrame, ego_df: pd.DataFrame | None = None) -> None:
@@ -368,12 +449,16 @@ def print_summary(df: pd.DataFrame, ego_df: pd.DataFrame | None = None) -> None:
         print(f"  {key}: {value}")
 
 
-def build_stage2_flow(include_tracking: bool = True) -> None:
+def build_stage2_flow(include_tracking: bool = False, include_pseudo_labels: bool = True) -> None:
     steps: list[tuple[str, Callable[[], object]]] = [("ccd manifest", write_ccd_manifests)]
     if include_tracking:
         from src.tools import build_ccd_collision_candidates, build_ccd_vehicles_tracks
 
         steps += [("vehicle tracks", build_ccd_vehicles_tracks.main), ("collision candidates", build_ccd_collision_candidates.main)]
+    if include_pseudo_labels:
+        from src.tools.build_ccd_stage2_entry_direction import write_entry_direction_pseudo_labels
+
+        steps.append(("entry/direction pseudo labels", write_entry_direction_pseudo_labels))
     steps += [("stage2 manifest", write_stage2_manifest), ("stage2 split", split_stage2_manifest)]
     for index, (name, run_step) in enumerate(steps, start=1):
         print(f"[{index}/{len(steps)}] {name}")
@@ -382,7 +467,22 @@ def build_stage2_flow(include_tracking: bool = True) -> None:
 
 
 def main() -> None:
-    build_stage2_flow()
+    parser = argparse.ArgumentParser(description="Build Stage 2 manifests from existing artifacts.")
+    parser.add_argument(
+        "--with-tracking",
+        action="store_true",
+        help="Rerun YOLO tracking and collision-candidate generation before building labels.",
+    )
+    parser.add_argument(
+        "--skip-pseudo-labels",
+        action="store_true",
+        help="Reuse the existing pseudo-label CSV instead of rebuilding it from track CSVs.",
+    )
+    args = parser.parse_args()
+    build_stage2_flow(
+        include_tracking=args.with_tracking,
+        include_pseudo_labels=not args.skip_pseudo_labels,
+    )
 
 
 if __name__ == "__main__":

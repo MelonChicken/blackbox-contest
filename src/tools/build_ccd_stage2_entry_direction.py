@@ -597,17 +597,17 @@ def print_stats(df: pd.DataFrame) -> None:
     reasons = Counter(reason for cell in df["failure_reason"].fillna("") for reason in str(cell).split(";") if reason)
     print(pd.Series(reasons).sort_values(ascending=False).to_string() if reasons else "none")
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Build CCD Stage2 entry/direction pseudo-labels from official CCD ego samples and existing YOLO tracks.")
-    parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--video-id", action="append", default=[])
-    parser.add_argument("--output", type=Path, default=OUTPUT_PATH)
-    parser.add_argument("--debug-dir", type=Path, default=DEBUG_DIR)
-    parser.add_argument("--preview-groups", action="store_true")
-    parser.add_argument("--preview-per-group", type=int, default=5)
-    args = parser.parse_args()
-
-    manifest = load_manifest(limit=args.limit, video_ids=args.video_id)
+def write_entry_direction_pseudo_labels(
+    *,
+    limit: int | None = None,
+    video_ids: list[str] | None = None,
+    output: Path = OUTPUT_PATH,
+    debug_dir: Path = DEBUG_DIR,
+    preview_groups: bool = False,
+    preview_per_group: int = 5,
+) -> pd.DataFrame:
+    """Build pseudo-labels from existing track CSVs without rerunning tracking."""
+    manifest = load_manifest(limit=limit, video_ids=video_ids)
     rows = []
     debug_rows = []
     for idx, row in manifest.iterrows():
@@ -618,18 +618,38 @@ def main() -> None:
         print(f"[{idx + 1}/{len(manifest)}] {out['video_id']} status={out['stage2_entry_status']} candidate_score={out['stage2_entry_candidate_score']:.3f} target={out['target_track_id']} entry={out['entry_frame']} direction={out['direction_name']} confidence={out['overall_confidence']:.3f} reason={out['failure_reason']}")
 
     df = pd.DataFrame(rows)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(args.output, index=False)
-    args.debug_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(debug_rows).to_csv(args.debug_dir / "target_candidates_debug.csv", index=False)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output, index=False)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(debug_rows).to_csv(debug_dir / "target_candidates_debug.csv", index=False)
     print_stats(df)
-    if args.preview_groups:
+    if preview_groups:
         from src.tools.preview_ccd_stage2_entry_direction import write_group_contact_sheets
 
-        counts = write_group_contact_sheets(df, args.output, args.debug_dir / "preview_groups", per_group=args.preview_per_group)
+        counts = write_group_contact_sheets(df, output, debug_dir / "preview_groups", per_group=preview_per_group)
         print(f"Representative preview: {counts}")
-    print(f"Saved: {args.output}")
-    print(f"Saved: {args.debug_dir / 'target_candidates_debug.csv'}")
+    print(f"Saved: {output}")
+    print(f"Saved: {debug_dir / 'target_candidates_debug.csv'}")
+    return df
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build CCD Stage2 entry/direction pseudo-labels from official CCD ego samples and existing YOLO tracks.")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--video-id", action="append", default=[])
+    parser.add_argument("--output", type=Path, default=OUTPUT_PATH)
+    parser.add_argument("--debug-dir", type=Path, default=DEBUG_DIR)
+    parser.add_argument("--preview-groups", action="store_true")
+    parser.add_argument("--preview-per-group", type=int, default=5)
+    args = parser.parse_args()
+    write_entry_direction_pseudo_labels(
+        limit=args.limit,
+        video_ids=args.video_id,
+        output=args.output,
+        debug_dir=args.debug_dir,
+        preview_groups=args.preview_groups,
+        preview_per_group=args.preview_per_group,
+    )
 
 if __name__ == "__main__":
     main()

@@ -4,38 +4,20 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.config import CCD_STAGE2_MANIFEST
+from src.config import CCD_STAGE2_MANIFEST, CCD_STAGE2_PROCESSED, CCD_STAGE2_TOOL_DATA
 
 # ============================================================
 # Configuration
 # ============================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-
 MANIFEST_PATH = CCD_STAGE2_MANIFEST / 'ego_candidates.csv'
 
-TOOLS_DIR = Path(__file__).resolve().parent
-
-TRACK_ROOT = (
-    TOOLS_DIR
-    / "data"
-    / "stage2"
-    / "CCD-1500"
-    / "tracks"
-)
+TRACK_ROOT = CCD_STAGE2_TOOL_DATA / "tracks"
 
 BYTETRACK_DIR = TRACK_ROOT / "bytetrack"
 BOTSORT_DIR = TRACK_ROOT / "botsort"
 
-OUTPUT_DIR = (
-    PROJECT_ROOT
-    / "data"
-    / "processed"
-    / "stage2"
-    / "CCD-1500"
-    / "tracker_comparison"
-)
+OUTPUT_DIR = CCD_STAGE2_PROCESSED / "tracker_comparison"
 
 DETAIL_OUTPUT = OUTPUT_DIR / "track_comparison.csv"
 SUMMARY_OUTPUT = OUTPUT_DIR / "summary.csv"

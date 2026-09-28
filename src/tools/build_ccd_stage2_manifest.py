@@ -23,7 +23,7 @@ from src.tools.stage2_human_labels import load_stage2_human_labels, print_human_
 
 CCD_ROOT = CCD_STAGE2_RAW
 ANNOTATION_PATH = CCD_ROOT / "Crash-1500.txt"
-VIDEO_DIR = CCD_ROOT / "videos"
+VIDEO_DIR = CCD_ROOT
 CCD_ALL_MANIFEST_PATH = CCD_STAGE2_MANIFEST / "all.csv"
 EGO_MANIFEST_PATH = CCD_STAGE2_MANIFEST / "ego_candidates.csv"
 COLLISION_CANDIDATES_PATH = CCD_STAGE2_COLLISION_CANDIDATES

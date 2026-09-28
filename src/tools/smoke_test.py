@@ -13,10 +13,10 @@ if str(ROOT) not in sys.path:
 
 from src.config import (
     PROJECT_ROOT,
+    CCD_STAGE2_RAW,
     STAGE1_MODEL,
     DLC_STAGE1_RAW,
     STAGE2_MODEL,
-    STAGE2_RAW,
     STAGE3_MODEL,
     STAGE3_RAW,
 )
@@ -45,7 +45,7 @@ def _copy_public_samples() -> Path:
             target = SMOKE_DIR / "stage1" / "videos" / f"SAMPLE_S1_{label}_{index:03d}{path.suffix.lower()}"
             shutil.copy2(path, target)
 
-    for index, video_path in enumerate(sorted((STAGE2_RAW / "videos").glob("*")), 1):
+    for index, video_path in enumerate(sorted(CCD_STAGE2_RAW.glob("*")), 1):
         frame_dir = SMOKE_DIR / "stage2" / "images" / f"SAMPLE_S2_{index:03d}"
         frame_dir.mkdir()
         capture = cv2.VideoCapture(str(video_path))

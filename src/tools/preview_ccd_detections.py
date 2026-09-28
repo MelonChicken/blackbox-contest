@@ -6,14 +6,12 @@ import cv2
 import pandas as pd
 from ultralytics import YOLO
 
-from src.config import CCD_STAGE2_MANIFEST
+from src.config import CCD_STAGE2_MANIFEST, CCD_STAGE2_PROCESSED
 
 
 CCD_MANIFEST = CCD_STAGE2_MANIFEST / 'ego_candidates.csv'
 
-OUTPUT_DIR = Path(
-    "data/stage2/CCD-1500/preview/yolo"
-)
+OUTPUT_DIR = CCD_STAGE2_PROCESSED / "preview" / "yolo"
 
 MODEL_NAME = "yolo11n.pt"
 

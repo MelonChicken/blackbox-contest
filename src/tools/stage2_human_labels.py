@@ -52,7 +52,12 @@ def _resolve_video_path(raw_path: Any, dataset: str, video_id: str) -> Path:
     value = Path(str(raw_path).replace("\\", "/"))
     candidates = [value] if value.is_absolute() else [DATA_ROOT / value]
     if dataset == "ccd":
-        candidates.append(CCD_STAGE2_RAW / "videos" / f"{video_id}.mp4")
+        candidates.extend(
+            [
+                CCD_STAGE2_RAW / f"{video_id}.mp4",
+                CCD_STAGE2_RAW / "videos" / f"{video_id}.mp4",
+            ]
+        )
     else:
         candidates.extend(
             [
@@ -167,4 +172,3 @@ def print_human_label_summary(labels: pd.DataFrame) -> None:
     if not issues.empty:
         print("Excluded task labels requiring review:")
         print(issues[["dataset", "video_id", "label_issue"]].to_string(index=False))
-

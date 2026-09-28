@@ -5,31 +5,18 @@ from pathlib import Path
 import cv2
 import pandas as pd
 
-from src.config import CCD_STAGE2_MANIFEST
+from src.config import CCD_STAGE2_MANIFEST, CCD_STAGE2_PROCESSED, CCD_STAGE2_TOOL_DATA
 
 # ============================================================
 # Configuration
 # ============================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-
 MANIFEST_PATH = CCD_STAGE2_MANIFEST / 'ego_candidates.csv'
 
 
-TRACK_DIR  = Path(
-    "data/stage2/CCD-1500/tracks"
-)
+TRACK_DIR = CCD_STAGE2_TOOL_DATA / "tracks"
 
-OUTPUT_DIR = (
-    PROJECT_ROOT
-    / "data"
-    / "processed"
-    / "stage2"
-    / "CCD-1500"
-    / "preview"
-    / "tracks"
-)
+OUTPUT_DIR = CCD_STAGE2_PROCESSED / "preview" / "tracks"
 
 # 직접 확인하고 싶은 video id를 넣으면 됨
 VIDEO_IDS = [

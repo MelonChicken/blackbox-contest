@@ -25,7 +25,15 @@ Build the canonical manifests with:
 python -m src.stage2.manifest
 ```
 
-CCD and AIHub are split independently, using `source_id` groups, so adding AIHub rows does not change the deterministic CCD group split.
+This command regenerates entry/direction pseudo-labels from existing track CSVs before merging the human labels. It deliberately does not rerun YOLO tracking. Tracking is opt-in:
+
+```bash
+python -m src.stage2.manifest --with-tracking
+```
+
+Use `--skip-pseudo-labels` only to reuse an already audited pseudo-label CSV. Manifest generation validates duplicate IDs, frame ranges, entry-before-collision chronology, allowed class values, and group leakage. It also prints task supervision counts grouped by label source.
+
+CCD and AIHub are split independently using `source_id` groups. The deterministic splitter evaluates multiple group splits and selects one that preserves sparse task and class support without source leakage.
 
 ## Official validation score
 
@@ -44,12 +52,13 @@ The highest `val_stage2_score` checkpoint is saved as `model/stage2/best.pt`. Al
 ## Training
 
 ```bash
-python -m src.stage2.train
+python -m src.stage2.train --epochs 8 --warmup-epochs 3 --patience 2
 ```
 
-Missing labels do not contribute to loss. Default loss weights are `1.0` for collision and entry and `0.5` for direction and avoidance. Checkpoint selection always follows the official score rather than frame MAE.
+During the warm-up phase, the backbone and collision head are frozen while the entry, direction, and avoidance heads learn from task-balanced samples. Joint fine-tuning then unfreezes the last two backbone blocks. Missing labels do not contribute to loss; pseudo-label losses are capped at `0.5` of human-label weight. Direction and avoidance use class-balanced cross entropy. Default task weights are `1.0` for collision and entry and `0.5` for direction and avoidance. Checkpoint selection always follows the official score rather than frame MAE, and joint training stops after two non-improving epochs by default.
+
+The defaults can also be controlled with `STAGE2_EPOCHS`, `STAGE2_HEAD_WARMUP_EPOCHS`, and `STAGE2_EARLY_STOPPING_PATIENCE`. Pass `--no-balanced-sampling` for a controlled ablation.
 
 ## Inference contract
 
 Stage 2 inference uses all four model heads. It returns sampled source-frame numbers for collision and entry, `LEFT` or `RIGHT` for entry side, and `0` or `1` for evasion space. Argmax frame outputs are always drawn from the decoded video range.
-

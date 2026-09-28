@@ -25,7 +25,7 @@ python -m src.stage1.train
 
 python -m src.stage2.manifest
 python -m src.stage2.cache
-python -m src.stage2.train
+python -m src.stage2.train --epochs 8 --warmup-epochs 3 --patience 2
 
 python -m src.stage3.manifest
 python -m src.stage3.cache
@@ -81,5 +81,7 @@ The checkpoint stores the selected frame positions, so submission inference supp
 ## Stage 2 Labels and Scoring
 
 Stage 2 loads reviewed label files from `data/processed/stage2/CCD_lane_labeling/` by default. On the server this resolves to `/data/processed/stage2/CCD_lane_labeling/`; set `STAGE2_HUMAN_LABEL_ROOT` to override it. Human `NEW_*` labels override pseudo-labels on a per-task basis.
+
+The normal manifest command reuses existing vehicle-track CSVs and rebuilds entry/direction pseudo-labels; it does not rerun YOLO. Use `python -m src.stage2.manifest --with-tracking` only when the tracking artifacts themselves must be regenerated. Training uses task-balanced sampling, confidence-weighted pseudo-label loss, classification class weights, a frozen-backbone head warm-up, and score-based early stopping by default.
 
 Model selection follows the competition metric: collision and entry use Accuracy@0.3 seconds with per-video FPS, direction and evasion use macro-F1, and the four scores are weighted `0.35`, `0.35`, `0.15`, and `0.15`. See `docs/stage2_training_pipeline.md` for the data and training contract.

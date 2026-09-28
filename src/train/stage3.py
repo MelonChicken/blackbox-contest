@@ -187,7 +187,16 @@ def _loss(accel, steer, batch, accel_weight=None, steer_weight=None):
     # Autocast can return BF16 logits while class weights remain FP32.
     # Compute cross entropy in FP32 for matching dtypes and stable reduction.
     loss_accel = nn.functional.cross_entropy(accel.float(), batch["accel_label"].to(DEVICE), weight=accel_weight)
-    loss_steer = nn.functional.cross_entropy(steer.float(), batch["steer_label"].to(DEVICE), weight=steer_weight)
+    accel_target = batch["accel_label"].to(DEVICE)
+    steer_target = batch["steer_label"].to(DEVICE)
+    steer_mask = accel_target != ACCEL_TO_ID["STOPPED"]
+    if bool(steer_mask.any()):
+        loss_steer = nn.functional.cross_entropy(
+            steer.float()[steer_mask], steer_target[steer_mask], weight=steer_weight
+        )
+    else:
+        # Preserve a differentiable zero if a batch consists entirely of STOPPED frames.
+        loss_steer = steer.float().sum() * 0.0
     total = (STAGE3_LOSS_WEIGHTS["accel"] * loss_accel) + (STAGE3_LOSS_WEIGHTS["steer"] * loss_steer)
     return total, loss_accel.detach(), loss_steer.detach()
 
@@ -196,6 +205,27 @@ def _selection_score(accel_f1: float, steer_f1: float) -> float:
     accel_w = float(STAGE3_SELECTION_WEIGHTS["accel"])
     steer_w = float(STAGE3_SELECTION_WEIGHTS["steer"])
     return ((accel_w * accel_f1) + (steer_w * steer_f1)) / max(1e-12, accel_w + steer_w)
+
+
+def _official_task_metrics(
+    accel_pred: list[int],
+    accel_target: list[int],
+    steer_pred: list[int],
+    steer_target: list[int],
+) -> dict:
+    """Stage 3 metrics, excluding GT STOPPED frames from the steer task."""
+    stopped = ACCEL_TO_ID["STOPPED"]
+    steer_pairs = [
+        (pred, target)
+        for pred, target, accel_gt in zip(steer_pred, steer_target, accel_target)
+        if accel_gt != stopped
+    ]
+    masked_steer_pred = [pred for pred, _ in steer_pairs]
+    masked_steer_target = [target for _, target in steer_pairs]
+    return {
+        "accel": _classification_metrics(accel_pred, accel_target, 4),
+        "steer": _classification_metrics(masked_steer_pred, masked_steer_target, 3),
+    }
 
 
 def _validate(model, loader, accel_weight=None, steer_weight=None):
@@ -211,8 +241,9 @@ def _validate(model, loader, accel_weight=None, steer_weight=None):
             steer_pred.extend(steer.argmax(1).cpu().tolist())
             accel_target.extend(batch["accel_label"].tolist())
             steer_target.extend(batch["steer_label"].tolist())
-    accel_metrics = _classification_metrics(accel_pred, accel_target, 4)
-    steer_metrics = _classification_metrics(steer_pred, steer_target, 3)
+    task_metrics = _official_task_metrics(accel_pred, accel_target, steer_pred, steer_target)
+    accel_metrics = task_metrics["accel"]
+    steer_metrics = task_metrics["steer"]
     return {"loss": total_loss / max(1, len(loader)), "accel": accel_metrics, "steer": steer_metrics, "selection": _selection_score(accel_metrics["macro_f1"], steer_metrics["macro_f1"])}
 
 
@@ -400,10 +431,12 @@ def fit_stage3():
             progress.set_postfix(loss=f"{float(loss.detach().cpu()):.4f}")
         steps = max(1, len(train_loader))
         train_loss = total_loss / steps; train_accel_loss = total_accel_loss / steps; train_steer_loss = total_steer_loss / steps
-        train_metrics = {
-            "accel": _classification_metrics(train_accel_pred, train_accel_target, 4),
-            "steer": _classification_metrics(train_steer_pred, train_steer_target, 3),
-        }
+        train_metrics = _official_task_metrics(
+            train_accel_pred,
+            train_accel_target,
+            train_steer_pred,
+            train_steer_target,
+        )
         train_metrics["selection"] = _selection_score(train_metrics["accel"]["macro_f1"], train_metrics["steer"]["macro_f1"])
         print(f"[Stage 3] Epoch {epoch + 1}/{STAGE3_EPOCHS} | train_loss={train_loss:.5f} | train_accel_loss={train_accel_loss:.5f} | train_steer_loss={train_steer_loss:.5f}")
         metrics = _validate_all(model, val_loaders, accel_class_weights, steer_class_weights) if val_loaders else {"overall": {"loss": float("nan"), "accel": {"accuracy": float("nan"), "macro_f1": float("nan")}, "steer": {"accuracy": float("nan"), "macro_f1": float("nan")}, "selection": float("nan")}}

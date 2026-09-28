@@ -34,6 +34,7 @@ from src.train.stage3 import (
     _loader,
     _loss,
     _model_outputs,
+    _official_task_metrics,
     _print_metrics_table,
     _selection_score,
     _stride_manifest,
@@ -48,6 +49,8 @@ HISTORY_KEYS = [
     "selection", "comma_val_accel_accuracy", "comma_val_accel_macro_f1", "comma_val_steer_accuracy",
     "comma_val_steer_macro_f1", "comma_selection",
 ]
+
+OBJECTIVE_VERSION = "official_stage3_stopped_mask_v1"
 
 
 def _datasets():
@@ -124,6 +127,7 @@ def _checkpoint_payload(model: Stage3VJEPA, epoch: int, train_loss: float, metri
         "dataset": "comma2k19",
         "selection_metric_name": "overall.selection",
         "selection_metric": float(metrics["overall"]["selection"]),
+        "objective_version": OBJECTIVE_VERSION,
         "input_num_frames": STAGE3_VJEPA_INPUT_FRAMES,
         "source_num_frames": STAGE3_NUM_FRAMES,
         "frame_positions": list(STAGE3_VJEPA_FRAME_POSITIONS),
@@ -174,14 +178,23 @@ def fit_stage3_vjepa():
                 print(f"Skip incompatible resume checkpoint: {resume_path}")
                 continue
             model.head.load_state_dict(checkpoint["head"], strict=True)
-            if "optimizer" in checkpoint:
+            same_objective = checkpoint.get("objective_version") == OBJECTIVE_VERSION
+            if same_objective and "optimizer" in checkpoint:
                 opt.load_state_dict(checkpoint["optimizer"])
             start_epoch = int(checkpoint.get("epoch", 0))
             restored_history = checkpoint.get("history", {})
             history = {key: list(restored_history.get(key, [])) for key in HISTORY_KEYS}
-            best = float(checkpoint.get("selection_metric", -1.0))
-            best_epoch = start_epoch
-            best_metrics = checkpoint.get("metrics")
+            if same_objective:
+                best = float(checkpoint.get("selection_metric", -1.0))
+                best_epoch = start_epoch
+                best_metrics = checkpoint.get("metrics")
+            else:
+                # Keep the learned head and epoch position, but reset optimizer and
+                # model selection because earlier checkpoints used an incompatible metric/loss.
+                best = -1.0
+                best_epoch = 0
+                best_metrics = None
+                print("Objective changed: reset optimizer and best-score tracking")
             print(f"Resumed V-JEPA head from {resume_path} at completed epoch {start_epoch}")
             break
 
@@ -214,10 +227,12 @@ def fit_stage3_vjepa():
         train_loss = total_loss / steps
         train_accel_loss = total_accel_loss / steps
         train_steer_loss = total_steer_loss / steps
-        train_metrics = {
-            "accel": _classification_metrics(train_accel_pred, train_accel_target, 4),
-            "steer": _classification_metrics(train_steer_pred, train_steer_target, 3),
-        }
+        train_metrics = _official_task_metrics(
+            train_accel_pred,
+            train_accel_target,
+            train_steer_pred,
+            train_steer_target,
+        )
         train_metrics["selection"] = _selection_score(train_metrics["accel"]["macro_f1"], train_metrics["steer"]["macro_f1"])
         metrics = _validate_all(model, val_loaders, accel_class_weights, steer_class_weights) if val_loaders else {"overall": {"loss": float("nan"), "accel": {"accuracy": float("nan"), "macro_f1": float("nan")}, "steer": {"accuracy": float("nan"), "macro_f1": float("nan")}, "selection": float("nan")}}
         _print_metrics_table(metrics, prefix=f"epoch={epoch + 1} ")

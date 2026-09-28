@@ -4,7 +4,6 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
 
 from src.datasets.stage3_sampling import build_centered_clip_indices
 from src.inference.stage1 import _video_paths
@@ -30,14 +29,13 @@ def _stage3_frames(path: Path):
         if not ok:
             break
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(rgb)
-        width, height = image.size
-        scale = 224 / min(width, height)
-        image = image.resize((max(224, round(width * scale)), max(224, round(height * scale))))
-        width, height = image.size
+        height, width = rgb.shape[:2]
+        scale = 224 / min(height, width)
+        height, width = max(224, round(height * scale)), max(224, round(width * scale))
+        rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_AREA)
         x, y = (width - 224) // 2, (height - 224) // 2
-        image = image.crop((x, y, x + 224, y + 224))
-        frames.append(torch.from_numpy(np.asarray(image).copy()).permute(2, 0, 1).to(torch.uint8))
+        rgb = rgb[y:y + 224, x:x + 224]
+        frames.append(torch.from_numpy(rgb.copy()).permute(2, 0, 1).to(torch.uint8))
     capture.release()
     if not frames:
         raise ValueError(f"cannot decode video: {path.name}")

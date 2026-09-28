@@ -4,10 +4,11 @@ import tempfile
 from pathlib import Path
 
 import pandas as pd
+import torch
 
-from src.tools.build_ccd_stage2_manifest import _apply_human_labels
+from src.tools.build_ccd_stage2_manifest import _apply_human_labels, _balanced_group_split, validate_stage2_manifest
 from src.tools.stage2_human_labels import load_stage2_human_labels
-from src.train.stage2 import _frame_metrics, selection_metric
+from src.train.stage2 import _frame_metrics, _masked_cross_entropy, balanced_sample_weights, classification_loss_weights, selection_metric
 
 
 def test_accuracy_at_point_three_seconds_uses_video_fps() -> None:
@@ -127,3 +128,51 @@ def test_human_labels_override_pseudo_labels_and_append_aihub() -> None:
     assert int(row.direction) == 0
     assert int(row.avoidance) == 1
     assert row.direction_source == "human_manual"
+
+
+def test_balanced_sampling_boosts_auxiliary_and_minority_rows() -> None:
+    rows = pd.DataFrame(
+        [
+            {"entry_frame": -1, "direction": -1, "avoidance": -1},
+            {"entry_frame": 10, "direction": 0, "avoidance": 1},
+            {"entry_frame": -1, "direction": 1, "avoidance": 1},
+            {"entry_frame": -1, "direction": 1, "avoidance": 1},
+        ]
+    )
+    weights = balanced_sample_weights(rows)
+    assert weights[1] > weights[2] > weights[0]
+    class_weights = classification_loss_weights(rows)
+    assert class_weights["direction"][0] > class_weights["direction"][1]
+
+
+def test_pseudo_sample_weight_reduces_loss_contribution() -> None:
+    logits = torch.tensor([[0.0, 1.0]])
+    target = torch.tensor([0])
+    human = _masked_cross_entropy(logits, target, sample_weight=torch.tensor([1.0]))
+    pseudo = _masked_cross_entropy(logits, target, sample_weight=torch.tensor([0.5]))
+    assert torch.isclose(pseudo, human * 0.5)
+
+
+def test_group_split_has_no_source_leakage_and_keeps_sparse_labels() -> None:
+    rows = []
+    for group in range(20):
+        rows.append(
+            {
+                "video_id": f"v{group:02d}",
+                "video_path": f"v{group:02d}.mp4",
+                "source_id": f"s{group:02d}",
+                "collision_frame": 20,
+                "entry_frame": 10 if group % 3 == 0 else -1,
+                "direction": group % 2 if group % 3 == 0 else -1,
+                "avoidance": group % 2 if group % 4 == 0 else -1,
+                "dataset": "ccd",
+                "n_frames": 50,
+            }
+        )
+    frame = pd.DataFrame(rows)
+    validate_stage2_manifest(frame)
+    train, val = _balanced_group_split(frame)
+    assert not (set(train.source_id) & set(val.source_id))
+    assert (val.entry_frame >= 0).any()
+    assert (val.direction >= 0).any()
+    assert (val.avoidance >= 0).any()

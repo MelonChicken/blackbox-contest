@@ -9,14 +9,16 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from src.config import (
     DEVICE,
-    EPOCHS,
     SEED,
     STAGE2_BACKBONE,
+    STAGE2_EARLY_STOPPING_PATIENCE,
+    STAGE2_EPOCHS,
+    STAGE2_HEAD_WARMUP_EPOCHS,
     STAGE2_MODEL,
     STAGE2_TRAIN_MANIFEST,
     STAGE2_VAL_MANIFEST,
@@ -45,10 +47,14 @@ STAGE2_SCORE_WEIGHTS = {"collision": 0.35, "entry": 0.35, "direction": 0.15, "av
 STAGE2_INIT_CHECKPOINT: str | Path | None = STAGE2_MODEL / "archive" / "collision_only_best.pt"
 STAGE2_MIN_PSEUDO_LABEL_CONFIDENCE: float | None = None
 SELECTION_METRIC = "val_stage2_score"
+AUXILIARY_SAMPLE_BOOST = 2.0
+CLASS_WEIGHT_CLIP = 3.0
 
 
 def _active_tasks(tasks: tuple[str, ...] | list[str] | None = None) -> tuple[str, ...]:
-    selected = tuple(tasks or ACTIVE_STAGE2_TASKS)
+    selected = tuple(ACTIVE_STAGE2_TASKS if tasks is None else tasks)
+    if not selected:
+        raise ValueError("At least one Stage2 task must be active")
     unknown = sorted(set(selected) - set(TASK_ORDER))
     if unknown:
         raise ValueError(f"Unknown Stage2 task(s): {unknown}")
@@ -128,6 +134,20 @@ def _frame_count(path: str | Path) -> int:
         return int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else -1
     finally:
         cap.release()
+
+
+def _manifest_fps(row) -> float:
+    value = pd.to_numeric(getattr(row, "fps", None), errors="coerce")
+    if pd.notna(value) and float(value) > 0:
+        return float(value)
+    cap = cv2.VideoCapture(str(row.video_path))
+    try:
+        value = float(cap.get(cv2.CAP_PROP_FPS)) if cap.isOpened() else 0.0
+    finally:
+        cap.release()
+    if not np.isfinite(value) or value <= 0:
+        raise RuntimeError(f"Could not determine FPS for baseline: {row.video_path}")
+    return value
 
 
 def _valid_frame(df: pd.DataFrame, task: str) -> pd.DataFrame:
@@ -232,6 +252,8 @@ def _trivial_baseline_for_task(task: str, train: pd.DataFrame, val: pd.DataFrame
     median_pred = []
     rel_pred = []
     sampled_pred = []
+    fps_values = []
+    frame_counts = []
     for row in val.itertuples(index=False):
         n = _frame_count(row.video_path)
         sampled = sample_frame_indices(n, NUM_FRAMES)
@@ -239,11 +261,13 @@ def _trivial_baseline_for_task(task: str, train: pd.DataFrame, val: pd.DataFrame
         median_pred.append(median_frame)
         rel_pred.append(int(round(rel_mean * (n - 1))))
         sampled_pred.append(int(sampled[common_pos]))
+        fps_values.append(_manifest_fps(row))
+        frame_counts.append(n)
 
     return {
-        "median": _frame_metrics(median_pred, target),
-        "relative_position": _frame_metrics(rel_pred, target),
-        "most_common_sampled_position": _frame_metrics(sampled_pred, target),
+        "median": _frame_metrics(median_pred, target, fps_values, frame_counts),
+        "relative_position": _frame_metrics(rel_pred, target, fps_values, frame_counts),
+        "most_common_sampled_position": _frame_metrics(sampled_pred, target, fps_values, frame_counts),
         "common_sampled_position": {"position": float(common_pos)},
     }
 
@@ -262,9 +286,65 @@ def compute_trivial_baselines(
     return baselines
 
 
-def build_loaders(train_manifest: str | Path = STAGE2_TRAIN_MANIFEST, val_manifest: str | Path | None = STAGE2_VAL_MANIFEST) -> tuple[DataLoader, DataLoader | None]:
+def balanced_sample_weights(rows: pd.DataFrame) -> np.ndarray:
+    """Oversample sparse auxiliary labels and minority classification classes."""
+    weights = np.ones(len(rows), dtype=np.float64)
+    for task in ("entry", "direction", "avoidance"):
+        column = f"{task}_frame" if task == "entry" else task
+        values = pd.to_numeric(rows.get(column, MISSING_LABEL), errors="coerce").fillna(MISSING_LABEL).astype(int)
+        valid = values.ge(0)
+        weights[valid.to_numpy()] += AUXILIARY_SAMPLE_BOOST
+        if task in CLASSIFICATION_TASKS and bool(valid.any()):
+            counts = values[valid].value_counts()
+            largest = float(counts.max())
+            for cls, count in counts.items():
+                class_mask = valid & values.eq(int(cls))
+                weights[class_mask.to_numpy()] += np.sqrt(largest / float(count))
+    return weights
+
+
+def classification_loss_weights(rows: pd.DataFrame) -> dict[str, torch.Tensor]:
+    result = {}
+    for task in CLASSIFICATION_TASKS:
+        values = pd.to_numeric(rows.get(task, MISSING_LABEL), errors="coerce").fillna(MISSING_LABEL).astype(int)
+        counts = np.asarray([(values == cls).sum() for cls in (0, 1)], dtype=np.float64)
+        if bool((counts == 0).any()):
+            result[task] = torch.ones(2, dtype=torch.float32)
+            continue
+        weights = np.sqrt(counts.sum() / (2.0 * counts))
+        weights = np.clip(weights / weights.mean(), 1.0 / CLASS_WEIGHT_CLIP, CLASS_WEIGHT_CLIP)
+        result[task] = torch.as_tensor(weights, dtype=torch.float32)
+    return result
+
+
+def build_loaders(
+    train_manifest: str | Path = STAGE2_TRAIN_MANIFEST,
+    val_manifest: str | Path | None = STAGE2_VAL_MANIFEST,
+    balanced_sampling: bool = True,
+) -> tuple[DataLoader, DataLoader | None]:
     train_dataset = Stage2Dataset(train_manifest, num_frames=NUM_FRAMES, image_size=IMAGE_SIZE, min_pseudo_label_confidence=STAGE2_MIN_PSEUDO_LABEL_CONFIDENCE)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
+    sampler = None
+    if balanced_sampling:
+        sample_weights = balanced_sample_weights(pd.DataFrame(train_dataset.rows))
+        generator = torch.Generator().manual_seed(SEED)
+        sampler = WeightedRandomSampler(
+            torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(train_dataset),
+            replacement=True,
+            generator=generator,
+        )
+        print(
+            "[Stage 2] task-balanced sampling "
+            f"min={sample_weights.min():.2f} mean={sample_weights.mean():.2f} max={sample_weights.max():.2f}"
+        )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
+    )
     val_loader = None
     if val_manifest is not None and Path(val_manifest).exists():
         val_dataset = Stage2Dataset(val_manifest, num_frames=NUM_FRAMES, image_size=IMAGE_SIZE, min_pseudo_label_confidence=STAGE2_MIN_PSEUDO_LABEL_CONFIDENCE)
@@ -316,11 +396,25 @@ def build_optimizer(model: Stage2VideoMAE) -> torch.optim.Optimizer:
     return torch.optim.AdamW(groups, weight_decay=WEIGHT_DECAY)
 
 
-def _masked_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def _masked_cross_entropy(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    sample_weight: torch.Tensor | None = None,
+    class_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
     valid = target.ne(MISSING_LABEL)
     if not bool(valid.any()):
         return logits.sum() * 0.0
-    return F.cross_entropy(logits[valid], target[valid])
+    losses = F.cross_entropy(
+        logits[valid],
+        target[valid],
+        weight=class_weight.to(logits.device) if class_weight is not None else None,
+        reduction="none",
+    )
+    if sample_weight is None:
+        return losses.mean()
+    weights = sample_weight.to(logits.device)[valid].clamp_min(0.0)
+    return (losses * weights).sum() / max(1, int(valid.sum()))
 
 
 def compute_stage2_loss(
@@ -328,6 +422,7 @@ def compute_stage2_loss(
     batch: dict[str, torch.Tensor],
     active_tasks: tuple[str, ...] | list[str] | None = None,
     loss_weights: dict[str, float] | None = None,
+    class_weights: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     weights = loss_weights or LOSS_WEIGHTS
     losses = {}
@@ -337,7 +432,13 @@ def compute_stage2_loss(
         target = batch[_target_name(task)].to(logits.device)
         valid = _valid_target(target)
         counts[task] = int(valid.sum().detach().cpu())
-        losses[task] = _masked_cross_entropy(logits, target)
+        sample_weight = batch.get(f"{task}_weight")
+        losses[task] = _masked_cross_entropy(
+            logits,
+            target,
+            sample_weight=sample_weight,
+            class_weight=(class_weights or {}).get(task),
+        )
 
     total = None
     for task, loss in losses.items():
@@ -363,13 +464,14 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     active_tasks: tuple[str, ...] | list[str] | None = None,
+    class_weights: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, float]:
     model.train()
     rows = []
     for batch in tqdm(loader, desc="stage2 train"):
         video = batch["video"].to(device, non_blocking=True)
         outputs = model(video)
-        loss, metrics = compute_stage2_loss(outputs, batch, active_tasks=active_tasks)
+        loss, metrics = compute_stage2_loss(outputs, batch, active_tasks=active_tasks, class_weights=class_weights)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
@@ -387,6 +489,7 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     active_tasks: tuple[str, ...] | list[str] | None = None,
+    class_weights: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     tasks = _active_tasks(active_tasks)
     model.eval()
@@ -400,7 +503,7 @@ def evaluate(
     for batch in tqdm(loader, desc="stage2 val"):
         video = batch["video"].to(device, non_blocking=True)
         outputs = model(video)
-        _, loss_metrics = compute_stage2_loss(outputs, batch, active_tasks=tasks)
+        _, loss_metrics = compute_stage2_loss(outputs, batch, active_tasks=tasks, class_weights=class_weights)
         loss_rows.append(loss_metrics)
 
         for task, rows in frame_rows.items():
@@ -563,6 +666,11 @@ def init_stage2_from_checkpoint(model: Stage2VideoMAE, checkpoint_path: str | Pa
 
 def build_training_model(init_checkpoint: str | Path | None = STAGE2_INIT_CHECKPOINT) -> Stage2VideoMAE:
     if init_checkpoint is not None:
+        init_checkpoint = Path(init_checkpoint)
+        if not init_checkpoint.is_file():
+            print(f"[Stage 2] init checkpoint missing, falling back to pretrained backbone: {init_checkpoint}")
+            init_checkpoint = None
+    if init_checkpoint is not None:
         checkpoint = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
         config = dict(DEFAULT_STAGE2_CONFIG)
         config.update(stage2_config_from_checkpoint(checkpoint))
@@ -574,8 +682,15 @@ def build_training_model(init_checkpoint: str | Path | None = STAGE2_INIT_CHECKP
     return build_stage2_model(config, use_pretrained=True)
 
 
-def _print_metrics(epoch: int, train_metrics: dict[str, float], val_metrics: dict[str, Any], active_tasks: tuple[str, ...]) -> None:
-    print(f"[Stage 2] Epoch {epoch}/{max(1, EPOCHS)} active_tasks={'+'.join(active_tasks)}")
+def _print_metrics(
+    epoch: int,
+    total_epochs: int,
+    phase: str,
+    train_metrics: dict[str, float],
+    val_metrics: dict[str, Any],
+    active_tasks: tuple[str, ...],
+) -> None:
+    print(f"[Stage 2] Epoch {epoch}/{max(1, total_epochs)} phase={phase} train_tasks={'+'.join(active_tasks)}")
     print("Train supervised:")
     for task in active_tasks:
         print(f"  {task}: {int(train_metrics.get(f'{task}_supervised_count', 0))}")
@@ -602,7 +717,28 @@ def _print_metrics(epoch: int, train_metrics: dict[str, float], val_metrics: dic
     print(f"{SELECTION_METRIC}={val_metrics[SELECTION_METRIC]:.5f}")
 
 
-def fit_stage2(active_tasks: tuple[str, ...] | list[str] | None = None) -> None:
+def _configure_training_phase(model: Stage2VideoMAE, *, warmup: bool) -> None:
+    for parameter in model.parameters():
+        parameter.requires_grad = True
+    if warmup:
+        for parameter in model.backbone.parameters():
+            parameter.requires_grad = False
+        for parameter in model.collision_head.parameters():
+            parameter.requires_grad = False
+        print("[Stage 2] phase=head_warmup backbone=FROZEN collision_head=FROZEN")
+    else:
+        model.freeze_backbone(unfreeze_last_n=UNFREEZE_LAST_N)
+        print(f"[Stage 2] phase=joint_finetune backbone_last_blocks={UNFREEZE_LAST_N}")
+
+
+def fit_stage2(
+    active_tasks: tuple[str, ...] | list[str] | None = None,
+    *,
+    epochs: int = STAGE2_EPOCHS,
+    warmup_epochs: int = STAGE2_HEAD_WARMUP_EPOCHS,
+    patience: int = STAGE2_EARLY_STOPPING_PATIENCE,
+    balanced_sampling: bool = True,
+) -> None:
     set_seed(SEED)
     device = torch.device(DEVICE)
     active_tasks = _active_tasks(active_tasks)
@@ -620,27 +756,58 @@ def fit_stage2(active_tasks: tuple[str, ...] | list[str] | None = None) -> None:
         for name, values in task_baselines.items():
             print(name, values)
 
-    train_loader, val_loader = build_loaders()
+    epochs = max(1, int(epochs))
+    auxiliary_tasks = tuple(task for task in active_tasks if task != "collision")
+    warmup_epochs = max(0, min(int(warmup_epochs), max(0, epochs - 1))) if auxiliary_tasks else 0
+    patience = max(0, int(patience))
+    train_loader, val_loader = build_loaders(balanced_sampling=balanced_sampling)
+    train_rows = pd.DataFrame(train_loader.dataset.rows)
+    class_weights = classification_loss_weights(train_rows)
+    for task, weights in class_weights.items():
+        print(f"[Stage 2] {task} class weights={weights.tolist()}")
     model = build_training_model().to(device)
-    model.freeze_backbone(unfreeze_last_n=UNFREEZE_LAST_N)
+    _configure_training_phase(model, warmup=warmup_epochs > 0)
     optimizer = build_optimizer(model)
 
     best_value = float("-inf")
+    stale_epochs = 0
+    current_phase = "head_warmup" if warmup_epochs > 0 else "joint_finetune"
     history: list[dict[str, Any]] = []
-    for epoch in range(1, max(1, EPOCHS) + 1):
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, active_tasks=active_tasks)
+    for epoch in range(1, epochs + 1):
+        phase = "head_warmup" if epoch <= warmup_epochs else "joint_finetune"
+        if phase != current_phase:
+            current_phase = phase
+            stale_epochs = 0
+            _configure_training_phase(model, warmup=False)
+            optimizer = build_optimizer(model)
+        train_tasks = auxiliary_tasks if phase == "head_warmup" else active_tasks
+        train_metrics = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            active_tasks=train_tasks,
+            class_weights=class_weights,
+        )
         if val_loader is not None:
-            val_metrics = evaluate(model, val_loader, device, active_tasks=active_tasks)
+            val_metrics = evaluate(model, val_loader, device, active_tasks=active_tasks, class_weights=class_weights)
         else:
             val_metrics = {"val_total_loss": train_metrics["total_loss"], SELECTION_METRIC: -train_metrics["total_loss"]}
-        row = {"epoch": float(epoch), **{f"train_{k}": v for k, v in train_metrics.items()}, **val_metrics}
+        row = {"epoch": float(epoch), "phase": phase, **{f"train_{k}": v for k, v in train_metrics.items()}, **val_metrics}
         history.append(row)
-        _print_metrics(epoch, train_metrics, val_metrics, active_tasks)
+        _print_metrics(epoch, epochs, phase, train_metrics, val_metrics, train_tasks)
         save_stage2_checkpoint(last_checkpoint, model, epoch=epoch, metrics=val_metrics, history=history, active_tasks=active_tasks)
         if float(val_metrics[SELECTION_METRIC]) > best_value:
             best_value = float(val_metrics[SELECTION_METRIC])
+            stale_epochs = 0
             save_stage2_checkpoint(best_checkpoint, model, epoch=epoch, metrics=val_metrics, history=history, active_tasks=active_tasks)
             print(f"saved best checkpoint: {best_checkpoint} {SELECTION_METRIC}={best_value:.5f}")
+        elif phase == "joint_finetune":
+            stale_epochs += 1
+            print(f"[Stage 2] early-stopping counter={stale_epochs}/{patience}")
+            if patience and stale_epochs >= patience:
+                print(f"[Stage 2] early stopping at epoch {epoch}; best {SELECTION_METRIC}={best_value:.5f}")
+                break
 
 
 def _parse_tasks(value: str) -> tuple[str, ...]:
@@ -650,13 +817,23 @@ def _parse_tasks(value: str) -> tuple[str, ...]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train Stage2 VideoMAE multi-task ablations.")
     parser.add_argument("--tasks", default=",".join(ACTIVE_STAGE2_TASKS), help="Comma-separated tasks, e.g. collision,direction")
+    parser.add_argument("--epochs", type=int, default=STAGE2_EPOCHS)
+    parser.add_argument("--warmup-epochs", type=int, default=STAGE2_HEAD_WARMUP_EPOCHS)
+    parser.add_argument("--patience", type=int, default=STAGE2_EARLY_STOPPING_PATIENCE)
+    parser.add_argument("--no-balanced-sampling", action="store_true")
     parser.add_argument("--print-split", action="store_true", help="Only print Stage2 task/split supervision counts.")
     args = parser.parse_args()
     tasks = _parse_tasks(args.tasks)
     if args.print_split:
         print_stage2_task_summary(active_tasks=tasks)
         return
-    fit_stage2(active_tasks=tasks)
+    fit_stage2(
+        active_tasks=tasks,
+        epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+        patience=args.patience,
+        balanced_sampling=not args.no_balanced_sampling,
+    )
 
 
 if __name__ == "__main__":

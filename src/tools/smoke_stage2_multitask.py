@@ -10,7 +10,7 @@ from transformers import VideoMAEConfig
 
 from src.datasets.stage2_dataset import Stage2Dataset
 from src.models.stage2_videomae import Stage2VideoMAE
-from src.train.stage2 import build_optimizer, compute_stage2_loss
+from src.train.stage2 import _configure_training_phase, build_optimizer, compute_stage2_loss
 
 
 def _tiny_config() -> dict:
@@ -92,6 +92,14 @@ def _dataset_missing_label_check() -> None:
 
 def main() -> None:
     _dataset_missing_label_check()
+    phase_model = Stage2VideoMAE.from_config(_tiny_config(), use_pretrained=False)
+    _configure_training_phase(phase_model, warmup=True)
+    assert not any(parameter.requires_grad for parameter in phase_model.backbone.parameters())
+    assert not any(parameter.requires_grad for parameter in phase_model.collision_head.parameters())
+    assert all(parameter.requires_grad for parameter in phase_model.entry_head.parameters())
+    _configure_training_phase(phase_model, warmup=False)
+    assert any(parameter.requires_grad for parameter in phase_model.backbone.parameters())
+    assert all(parameter.requires_grad for parameter in phase_model.collision_head.parameters())
     cd = _run(("collision", "direction"))
     ce = _run(("collision", "entry"))
     ced = _run(("collision", "entry", "direction"))

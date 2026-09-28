@@ -131,6 +131,17 @@ def _label(row: pd.Series, name: str) -> int:
     return int(value)
 
 
+def _task_weight(row: pd.Series, task: str, target: int) -> float:
+    if target == MISSING_LABEL:
+        return 0.0
+    source = str(row.get(f"{task}_source", "")).lower()
+    if "pseudo" not in source:
+        return 1.0
+    confidence = pd.to_numeric(row.get(f"{task}_confidence"), errors="coerce")
+    confidence = 0.5 if pd.isna(confidence) else float(confidence)
+    return float(np.clip(confidence, 0.25, 0.5))
+
+
 def _video_fps(row: pd.Series, video_path: Path) -> float:
     value = pd.to_numeric(row.get("fps"), errors="coerce")
     if pd.notna(value) and float(value) > 0:
@@ -167,6 +178,8 @@ class Stage2Dataset(Dataset):
 
         collision_frame = _label(row, "collision_frame")
         entry_frame = _label(row, "entry_frame")
+        direction = _label(row, "direction")
+        avoidance = _label(row, "avoidance")
         return {
             "video": video,
             "video_path": str(video_path),
@@ -179,6 +192,10 @@ class Stage2Dataset(Dataset):
                 original_frame_to_sample_index(collision_frame, sampled_indices), dtype=torch.long
             ),
             "entry_index": torch.tensor(original_frame_to_sample_index(entry_frame, sampled_indices), dtype=torch.long),
-            "direction": torch.tensor(_label(row, "direction"), dtype=torch.long),
-            "avoidance": torch.tensor(_label(row, "avoidance"), dtype=torch.long),
+            "direction": torch.tensor(direction, dtype=torch.long),
+            "avoidance": torch.tensor(avoidance, dtype=torch.long),
+            "collision_weight": torch.tensor(_task_weight(row, "collision", collision_frame), dtype=torch.float32),
+            "entry_weight": torch.tensor(_task_weight(row, "entry", entry_frame), dtype=torch.float32),
+            "direction_weight": torch.tensor(_task_weight(row, "direction", direction), dtype=torch.float32),
+            "avoidance_weight": torch.tensor(_task_weight(row, "avoidance", avoidance), dtype=torch.float32),
         }
